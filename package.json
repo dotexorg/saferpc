@@ -1,0 +1,73 @@
+{
+  "name": "@dotex/erpc",
+  "version": "0.1.0",
+  "description": "Encrypted RPC over any transport with X25519 key exchange, XSalsa20-Poly1305, and msgpack serialization",
+  "type": "module",
+  "files": [
+    "esm",
+    "cjs",
+    "src"
+  ],
+  "scripts": {
+    "build": "npm run build:clean && tsc && tsc -p tsconfig.cjs.json",
+    "build:clean": "rm -rf esm cjs 2> /dev/null; true",
+    "lint": "prettier --check 'src/**/*.{js,ts}' 'test/**/*.{js,ts}'",
+    "format": "prettier --write 'src/**/*.{js,ts}' 'test/**/*.{js,ts}'",
+    "test": "node test/index.js"
+  },
+  "author": "Dotex (https://dotex.org/about)",
+  "homepage": "https://github.com/dotexorg/erpc",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/dotexorg/erpc.git"
+  },
+  "license": "MIT",
+  "dependencies": {
+    "@msgpack/msgpack": "^3.1.3",
+    "@noble/ciphers": "^2.1.1",
+    "@noble/curves": "^2.0.1",
+    "@noble/hashes": "^2.0.1",
+    "zod": "^4.3.6"
+  },
+  "devDependencies": {
+    "prettier": "^3.3.2",
+    "typescript": "5.x.x"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "main": "./cjs/index.js",
+  "types": "./esm/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./esm/index.d.ts",
+      "import": "./esm/index.js",
+      "require": "./cjs/index.js"
+    },
+    "./common": {
+      "types": "./esm/common.d.ts",
+      "import": "./esm/common.js",
+      "require": "./cjs/common.js"
+    },
+    "./client": {
+      "types": "./esm/client.d.ts",
+      "import": "./esm/client.js",
+      "require": "./cjs/client.js"
+    },
+    "./server": {
+      "types": "./esm/server.d.ts",
+      "import": "./esm/server.js",
+      "require": "./cjs/server.js"
+    }
+  },
+  "sideEffects": false,
+  "keywords": [
+    "erpc",
+    "rpc",
+    "encrypted",
+    "messaging",
+    "x25519",
+    "msgpack",
+    "typescript"
+  ]
+}
