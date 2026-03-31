@@ -1,5 +1,7 @@
 # eRPC
 
+![eRPC](erpc.png)
+
 **Encrypted** Remote Procedure Calls over any bidirectional channel. Every call is end-to-end encrypted (PSK + X25519 key exchange, XSalsa20-Poly1305 AEAD) with type-safe contracts, zero-config retry, and forward secrecy. Works everywhere JavaScript runs.
 
 ## Install
