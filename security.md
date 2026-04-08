@@ -36,33 +36,27 @@ The PSK is **never sent over the wire**. It's used as the HKDF salt, so even if 
 
 The handshake is lazy — it starts automatically on the first `api` call.
 
-```
-Client (idle)                          Server (waiting)
-    │                                       │
-    │  api.foo() — lazy trigger             │
-    │                                       │
-    │  ── Phase 1: Hello ──────────────►    │
-    │  [0x00, { pub, nonce, epoch }]        │
-    │                                       │
-    │  handshaking                     pending
-    │                                       │
-    │    ◄────────── Phase 2: Reply ──      │
-    │    [0x00, { pub, proof, epoch }]      │
-    │                                       │
-    │  Client verifies proof (PSK check)    │
-    │  Derives session key                  │
-    │                                       │
-    │  ready                           pending
-    │                                       │
-    │  ── Phase 3: First RPC ──────────►    │
-    │  [0x01, encrypted payload]            │
-    │                                       │
-    │                                  ready (confirmed)
-    │                                       │
-    │    ◄────────── RPC Response ──────    │
-    │    [0x01, encrypted payload]          │
-    │                                       │
-    │  api.foo() resolves                   │
+```mermaid
+sequenceDiagram
+    participant Client as Client (idle)
+    participant Server as Server (waiting)
+
+    Note over Client: api.foo() — lazy trigger
+
+    Client->>Server: Phase 1: Hello<br/>[0x00, { pub, nonce, epoch }]
+    Note left of Client: handshaking
+    Note right of Server: pending
+
+    Server->>Client: Phase 2: Reply<br/>[0x00, { pub, proof, epoch }]
+    Note left of Client: Client verifies proof (PSK check)<br/>Derives session key
+    Note left of Client: ready
+    Note right of Server: pending
+
+    Client->>Server: Phase 3: First RPC<br/>[0x01, encrypted payload]
+    Note right of Server: ready (confirmed)
+
+    Server->>Client: RPC Response<br/>[0x01, encrypted payload]
+    Note left of Client: api.foo() resolves
 ```
 
 **Three phases:**
@@ -75,37 +69,23 @@ Client (idle)                          Server (waiting)
 
 ### Server
 
-```
-              new hello
-    ┌─────────────────────────────────────────┐
-    │                                         │
-    ▼           hello received         1st valid TAG_MSG
-┌────────┐  ─────────────────►  ┌─────────┐  ──────────►  ┌───────┐
-│waiting │                      │ pending │                │ ready │
-└────────┘  ◄─────────────────  └─────────┘                └───────┘
-                 timeout /                                     │
-                 error                                         │
-    ▲                                                          │
-    │               new hello (client re-handshaking)          │
-    └──────────────────────────────────────────────────────────┘
+```mermaid
+stateDiagram-v2
+    waiting --> pending : hello received
+    pending --> ready : 1st valid TAG_MSG
+    pending --> waiting : timeout / error
+    ready --> waiting : new hello (client re-handshaking)
+    waiting --> waiting : new hello
 ```
 
 ### Client
 
-```
-    ┌──────────────────────────────────────────────────┐
-    │              timeout / send error                 │
-    │              (auto-reset, epoch check)            │
-    │                                                   │
-    │  api call     hello sent        server reply OK   │
-    ▼  ────────►                      ──────────────►   │
-┌──────┐        ┌──────────────┐                    ┌───────┐
-│ idle │        │ handshaking  │                    │ ready │
-└──────┘        └──────────────┘                    └───────┘
-    ▲                  │
-    │    hs timeout /  │
-    │    hs error      │
-    └──────────────────┘
+```mermaid
+stateDiagram-v2
+    idle --> handshaking : api call / hello sent
+    handshaking --> ready : server reply OK
+    handshaking --> idle : hs timeout / hs error
+    ready --> idle : timeout / send error (auto-reset, epoch check)
 ```
 
 ## Replay Within a Session

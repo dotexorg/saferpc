@@ -147,15 +147,17 @@ The `context` factory is called **on every request**, so the context is always f
 
 When an RPC call fails due to a timeout or send error, the client automatically retries once with a fresh handshake:
 
-```
-api.foo("x")
-  │
-  ├─ sendRequest() → timeout (server died)
-  │
-  ├─ epoch === sentEpoch? → YES → reset() (zero keys, state → idle)
-  ├─ ensureHandshake() → new handshake (epoch++)
-  │   └─ hello → reply → ready
-  └─ sendRequest() again → success → api.foo() resolves
+```mermaid
+sequenceDiagram
+    participant C as api.foo("x")
+    participant S as Server
+
+    C->>S: sendRequest() → timeout (server died)
+    Note over C: epoch === sentEpoch? → YES<br/>→ reset() (zero keys, state → idle)
+    C->>S: ensureHandshake() → new handshake (epoch++)
+    S->>C: hello → reply → ready
+    C->>S: sendRequest() again → success
+    Note over C: api.foo() resolves
 ```
 
 Concurrent calls that fail at the same time **share a single handshake** via epoch check — reset happens only once.
@@ -171,25 +173,26 @@ Concurrent calls that fail at the same time **share a single handshake** via epo
 
 The server accepts a new hello even when already in `ready` state. This enables transparent session refresh:
 
-```
-Client (ready)         Server (ready)
-    │                      │
-    │  Session dies         │
-    │                      │
-    │  reset()             │
-    │  state → idle        │
-    │                      │
-    │  ── new hello ──►    │
-    │                      │  resetHandshake()
-    │                      │  state → waiting → pending
-    │                      │
-    │  ◄── reply ────      │
-    │  state → ready       │
-    │                      │
-    │  ── retry RPC ──►    │
-    │                      │  state → ready (confirmed)
-    │  ◄── response ──     │
-    │  Call resolves        │
+```mermaid
+sequenceDiagram
+    participant Client as Client (ready)
+    participant Server as Server (ready)
+
+    Note over Client,Server: Session dies
+
+    Note left of Client: reset()<br/>state → idle
+
+    Client->>Server: new hello
+    Note right of Server: resetHandshake()<br/>state → waiting → pending
+
+    Server->>Client: reply
+    Note left of Client: state → ready
+
+    Client->>Server: retry RPC
+    Note right of Server: state → ready (confirmed)
+
+    Server->>Client: response
+    Note left of Client: Call resolves
 ```
 
 ## Cleanup
