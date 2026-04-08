@@ -2,6 +2,8 @@
 
 Just two peers talking securely. Define your API as typed procedures - and every call is end-to-end encrypted. No TLS termination. No certificates. No API keys. No auth middleware.
 
+![eRPC](erpc.png)
+
 eRPC is an encrypted RPC library for any two counterparties over any bidirectional channel. WebSocket, postMessage, MessagePort, chrome.runtime, BroadcastChannel - if it can carry bytes, eRPC encrypts and types them. The handshake happens on the first call, transparently. Session drops are recovered automatically. Your code just calls functions.
 
 Think tRPC, but transport-agnostic and encrypted by default. No HTTP assumption. No server/client hierarchy. An iframe can serve procedures to its parent. A service worker can be the server. A browser tab can call into an extension's background script. Both sides are equal — both can expose and call procedures.
