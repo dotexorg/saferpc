@@ -71,7 +71,7 @@ const result = await api.greet({ name: "World" });
 console.log(result.message); // "Hello, World!"
 ```
 
-That's it. The handshake, encryption, serialization, validation — all handled for you. If the session drops, the client [retries automatically](advanced.md).
+That's it. The handshake, encryption, serialization, validation — all handled for you. If the session drops, the client [retries automatically](api.md).
 
 ## Full Example
 
@@ -123,4 +123,4 @@ destroyClient();
 destroyServer();
 ```
 
-For the full list of options available to `server()` and `client()`, see the [API Reference](api.md). To add authentication or other pre-handler logic, check out [middleware](advanced.md).
+For the full list of options available to `server()` and `client()`, see the [API Reference](api.md). To add authentication or other pre-handler logic, check out [middleware](api.md).

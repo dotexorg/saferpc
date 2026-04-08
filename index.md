@@ -1,5 +1,13 @@
 # Encrypted RPC (eRPC)
 
+<!-- NAV
+- [Encrypted RPC](index.md)
+- [Getting Started](getting-started.md)
+- [Security](security.md)
+- [Integrations](integrations.md)
+- [API](api.md)
+-->
+
 Just two peers talking securely. Define your API as typed procedures - and every call is end-to-end encrypted. No TLS termination. No certificates. No API keys. No auth middleware.
 
 ![eRPC](erpc.png)
@@ -52,6 +60,6 @@ eRPC takes the same approach but goes further:
 2. On the first call, a [handshake](security.md) runs automatically — ephemeral X25519 keys are exchanged, and a session key is derived using the PSK as HKDF salt
 3. The server proves it knows the PSK via an HMAC proof; the client proves it implicitly by encrypting valid messages
 4. All calls are encrypted with XSalsa20-Poly1305 AEAD using the session key
-5. If the session drops, the client [resets and re-handshakes transparently](advanced.md) — your call retries once automatically
+5. If the session drops, the client [resets and re-handshakes transparently](api.md) — your call retries once automatically
 
 No certificates. No token refresh. No auth middleware. Just a shared secret and a channel. See the [Getting Started](getting-started.md) guide to set it up in under 5 minutes.
