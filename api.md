@@ -12,10 +12,10 @@ import { chain } from "@dotex/erpc/common";
 const d = chain();
 
 const procedure = d
-  .use(middlewareFn)          // add middleware
-  .input(zodSchema)           // validate and type input
-  .output(zodSchema)          // validate and type output
-  .handler(async ({ ctx, input }) => result);  // terminal handler
+  .use(middlewareFn) // add middleware
+  .input(zodSchema) // validate and type input
+  .output(zodSchema) // validate and type output
+  .handler(async ({ ctx, input }) => result); // terminal handler
 ```
 
 `.handler()` terminates the chain and returns a frozen `Procedure` object.
@@ -36,13 +36,13 @@ const { destroy } = server(router, channel, {
 
 ### Server Options
 
-| Parameter | Type | Default | Description |
-|-----------|------|---------|-------------|
-| `psk` | `Uint8Array` | **required** | Pre-shared key, minimum 32 bytes |
-| `context` | `() => Ctx \| Promise<Ctx>` | — | Per-request context factory |
-| `handshakeTimeout` | `number` | `5000` | Handshake timeout (ms) |
-| `maxMessageBytes` | `number` | `1048576` | Max message size (1 MB) |
-| `onError` | `(err: unknown) => void` | — | Callback for handshake/send errors |
+| Parameter          | Type                        | Default      | Description                        |
+| ------------------ | --------------------------- | ------------ | ---------------------------------- |
+| `psk`              | `Uint8Array`                | **required** | Pre-shared key, minimum 32 bytes   |
+| `context`          | `() => Ctx \| Promise<Ctx>` | —            | Per-request context factory        |
+| `handshakeTimeout` | `number`                    | `5000`       | Handshake timeout (ms)             |
+| `maxMessageBytes`  | `number`                    | `1048576`    | Max message size (1 MB)            |
+| `onError`          | `(err: unknown) => void`    | —            | Callback for handshake/send errors |
 
 ## `client<Router>(channel, options)`
 
@@ -59,13 +59,13 @@ const { api, destroy } = client<typeof router>(clientChannel, {
 
 ### Client Options
 
-| Parameter | Type | Default | Description |
-|-----------|------|---------|-------------|
-| `psk` | `Uint8Array` | **required** | Pre-shared key, minimum 32 bytes |
-| `timeout` | `number` | `10000` | Per-call timeout (ms) |
-| `maxPending` | `number` | `256` | Max concurrent in-flight calls |
-| `handshakeTimeout` | `number` | `5000` | Handshake timeout (ms) |
-| `maxMessageBytes` | `number` | `1048576` | Max message size (1 MB) |
+| Parameter          | Type         | Default      | Description                      |
+| ------------------ | ------------ | ------------ | -------------------------------- |
+| `psk`              | `Uint8Array` | **required** | Pre-shared key, minimum 32 bytes |
+| `timeout`          | `number`     | `10000`      | Per-call timeout (ms)            |
+| `maxPending`       | `number`     | `256`        | Max concurrent in-flight calls   |
+| `handshakeTimeout` | `number`     | `5000`       | Handshake timeout (ms)           |
+| `maxMessageBytes`  | `number`     | `1048576`    | Max message size (1 MB)          |
 
 The `api` proxy triggers the handshake lazily on first call. Client creation is synchronous — no `await` needed.
 
