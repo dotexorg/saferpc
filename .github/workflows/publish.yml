@@ -1,0 +1,46 @@
+# name: Publish to npm
+
+# on:
+#   release:
+#     types: [published]
+#   workflow_dispatch:
+#     inputs:
+#       tag:
+#         description: "npm dist-tag (e.g. latest, next)"
+#         required: false
+#         default: latest
+
+# permissions:
+#   contents: read
+#   id-token: write
+
+# jobs:
+#   publish:
+#     name: Publish
+#     runs-on: ubuntu-latest
+#     environment: npm-publish
+#     steps:
+#       - uses: actions/checkout@v4
+#       - uses: actions/setup-node@v4
+#         with:
+#           node-version: 22
+#           cache: npm
+#           registry-url: https://registry.npmjs.org
+#       - run: npm ci
+#       - run: npm run lint
+#       - run: npm run test:typecheck
+#       - run: npm test
+#       - run: npm run build
+#       - name: Verify package version matches release tag
+#         if: github.event_name == 'release'
+#         run: |
+#           PKG_VERSION="$(node -p "require('./package.json').version")"
+#           TAG_VERSION="${GITHUB_REF_NAME#v}"
+#           if [ "$PKG_VERSION" != "$TAG_VERSION" ]; then
+#             echo "package.json version ($PKG_VERSION) does not match release tag ($TAG_VERSION)" >&2
+#             exit 1
+#           fi
+#       - name: Publish
+#         run: npm publish --access public --provenance --tag "${{ github.event.inputs.tag || 'latest' }}"
+#         env:
+#           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}

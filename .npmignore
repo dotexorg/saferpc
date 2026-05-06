@@ -1,0 +1,31 @@
+# package.json `files` already allowlists what ships (esm, cjs, src).
+# This file is a safety net for things that could end up inside those dirs.
+
+# Tests / fixtures
+**/*.test.ts
+**/*.test.js
+**/*.spec.ts
+**/*.spec.js
+**/__tests__/
+**/__mocks__/
+**/__fixtures__/
+
+# TypeScript build artifacts we don't want shipped
+**/*.tsbuildinfo
+
+# Editor / OS junk
+.DS_Store
+Thumbs.db
+**/.DS_Store
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Logs and local state
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+.env
+.env.*
