@@ -1,10 +1,10 @@
 {
-  "extends": "./tsconfig.json",
+  "extends": "./tsconfig.base.json",
   "compilerOptions": {
     "outDir": "cjs",
     "module": "commonjs",
     "moduleResolution": "node10",
-    "rewriteRelativeImportExtensions": false,
-    "allowImportingTsExtensions": false
+    "verbatimModuleSyntax": false,
+    "ignoreDeprecations": "6.0"
   }
 }

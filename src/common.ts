@@ -8,16 +8,16 @@
 
 import { type ZodType } from "zod";
 import type { z } from "zod";
-import { xsalsa20poly1305 } from "@noble/ciphers/salsa";
+import { xsalsa20poly1305 } from "@noble/ciphers/salsa.js";
 import { encode, decode, ExtensionCodec } from "@msgpack/msgpack";
-import { concatBytes, randomBytes } from "@noble/ciphers/utils";
-import { hkdf } from "@noble/hashes/hkdf";
-import { sha256 } from "@noble/hashes/sha2";
-import { hmac } from "@noble/hashes/hmac";
+import { concatBytes, randomBytes } from "@noble/ciphers/utils.js";
+import { hkdf } from "@noble/hashes/hkdf.js";
+import { sha256 } from "@noble/hashes/sha2.js";
+import { hmac } from "@noble/hashes/hmac.js";
 
 // Re-export crypto primitives needed by both server.ts and client.ts
-export { x25519 } from "@noble/curves/ed25519";
-export { concatBytes } from "@noble/ciphers/utils";
+export { x25519 } from "@noble/curves/ed25519.js";
+export { concatBytes } from "@noble/ciphers/utils.js";
 
 // ─── Constants ────────────────────────────────────────────
 
@@ -33,12 +33,24 @@ const MAX_DEPTH = 32;
 const KDF_INFO = new TextEncoder().encode("drpc-v1");
 
 /**
- * Empty ExtensionCodec — rejects ALL msgpack extension types including
- * the default Timestamp (-1). This prevents type confusion attacks where
- * a malicious payload uses extension types to inject Date, Map, or Set
- * objects that bypass sanitize().
+ * Hardened ExtensionCodec — rejects ALL msgpack extension types including
+ * the built-in Timestamp (type -1). This prevents type-confusion attacks
+ * where a malicious payload uses ext types to inject Date / Map / Set /
+ * other non-plain host objects that would surprise handlers.
+ *
+ * Implementation: msgpack-javascript hard-codes the Timestamp decoder, so
+ * we explicitly register a throwing decoder for type -1 to override it.
+ * Unregistered ext types bypass our codec and surface as ExtData; sanitize()
+ * rejects those via its non-plain-object check.
  */
 const SAFE_CODEC = new ExtensionCodec();
+SAFE_CODEC.register({
+  type: -1,
+  encode: () => null,
+  decode: () => {
+    throw new RPCError("INVALID_DATA", "Timestamp extension rejected");
+  },
+});
 
 // ─── Security utilities ──────────────────────────────────
 
@@ -62,6 +74,14 @@ export function sanitize(v: unknown, depth: number = 0): unknown {
       out[i] = sanitize(v[i], depth + 1);
     }
     return out;
+  }
+  // Reject non-plain objects (Date, Map, Set, ExtData, etc.). Any object
+  // whose prototype is neither Object.prototype nor null is suspicious —
+  // it likely came in via a msgpack ext type or a JS host object that
+  // could surprise downstream handlers.
+  const proto = Object.getPrototypeOf(v);
+  if (proto !== Object.prototype && proto !== null) {
+    throw new RPCError("INVALID_DATA", "Non-plain object rejected");
   }
   const out: Record<string, unknown> = Object.create(null);
   const keys = Object.keys(v as Record<string, unknown>);
@@ -127,10 +147,13 @@ export function createDecryptor(sessionKey: Uint8Array) {
     const cipher = xsalsa20poly1305(sessionKey, nonce);
     const encoded = cipher.decrypt(ct);
     const data = mpDecode(encoded);
+    // NOTE: msgpack-javascript v3 returns Uint8Array (bin) fields as
+    // zero-copy views into `encoded`. Zeroing `encoded` or `payload` here
+    // would clobber any binary field on the returned object. The plaintext
+    // remains in the caller's hands; callers that need stricter memory
+    // hygiene should sanitize and zero their own buffers after use.
     zero(nonce);
     zero(ct);
-    zero(encoded);
-    zero(payload);
     return sanitize(data);
   };
 }

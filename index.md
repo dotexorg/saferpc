@@ -2,10 +2,10 @@
 
 <!-- NAV
 - [Encrypted RPC](index.md)
-- [Getting Started](getting-started.md)
-- [Security](security.md)
-- [Integrations](integrations.md)
-- [API](api.md)
+- [Getting Started](spec/getting-started.md)
+- [Security](spec/security.md)
+- [Integrations](spec/integrations.md)
+- [API](spec/api.md)
 -->
 
 Just two peers talking securely. Define your API as typed procedures - and every call is end-to-end encrypted. No TLS termination. No certificates. No API keys. No auth middleware.

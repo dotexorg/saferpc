@@ -30,7 +30,7 @@ import {
   type Ctx,
   type Router,
   type Channel,
-} from "./common";
+} from "./common.ts";
 
 // ─── Server types ─────────────────────────────────────────
 

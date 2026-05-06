@@ -37,12 +37,12 @@ export {
   type Router,
   type Channel,
   type Chain,
-} from "./common";
+} from "./common.ts";
 
 export {
   client,
   RemoteRPCError,
   type Client,
   type ClientOptions,
-} from "./client";
-export { server, type ServeOptions } from "./server";
+} from "./client.ts";
+export { server, type ServeOptions } from "./server.ts";

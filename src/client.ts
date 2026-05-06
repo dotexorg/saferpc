@@ -7,7 +7,7 @@
  * via epoch to avoid redundant resets.
  */
 
-import { randomBytes } from "@noble/ciphers/utils";
+import { randomBytes } from "@noble/ciphers/utils.js";
 
 import {
   x25519,
@@ -30,7 +30,7 @@ import {
   RPCError,
   type Router,
   type Channel,
-} from "./common";
+} from "./common.ts";
 
 // ─── Client constants ─────────────────────────────────────
 
@@ -214,10 +214,20 @@ export function client<T extends Router>(
 
     const currentEpoch = epoch;
 
-    handshakePromise = new Promise<void>(function hsExecutor(resolve, reject) {
+    // Hold the promise locally — over a synchronous transport, channel.send
+    // may run the entire handshake round-trip and call failHandshake() before
+    // we return. failHandshake() nulls `handshakePromise`, so we'd otherwise
+    // return null. Returning a local reference keeps the rejected promise
+    // reachable for the awaiter.
+    const promise = new Promise<void>(function hsExecutor(resolve, reject) {
       handshakeResolve = resolve;
       handshakeReject = reject;
     });
+    handshakePromise = promise;
+    // Pre-attach a noop catch so a synchronous rejection (sync transports)
+    // does not surface as an unhandled rejection before the caller's
+    // `await` can attach its own handler.
+    promise.catch(() => {});
 
     hsTimer = setTimeout(function onHsTimeout() {
       if (state !== "handshaking" || epoch !== currentEpoch) return;
@@ -236,7 +246,7 @@ export function client<T extends Router>(
       failHandshake(err);
     });
 
-    return handshakePromise;
+    return promise;
   }
 
   function ensureHandshake(): Promise<void> {
