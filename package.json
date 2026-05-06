@@ -77,6 +77,9 @@
     }
   },
   "sideEffects": false,
+  "publishConfig": {
+    "access": "public"
+  },
   "keywords": [
     "erpc",
     "rpc",
