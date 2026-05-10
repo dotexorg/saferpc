@@ -1,17 +1,19 @@
 # Integrations
 
-eRPC works over any bidirectional channel. Below are ready-made adapters for common transports. Each implements the `Channel` interface:
+eRPC needs one thing from the transport: it must move `Uint8Array` in both directions. That's the whole contract.
 
 ```typescript
 interface Channel {
   send(data: Uint8Array): void | Promise<void>;
-  receive(cb: (data: Uint8Array) => void): () => void;
+  receive(cb: (data: Uint8Array) => void): () => void; // returns unsubscribe
 }
 ```
 
+Everything below is a one-screen adapter that satisfies that interface. Each one is a few lines of glue around a native transport. None of them need to know what eRPC does.
+
 ## WebSocket
 
-The most common case — client-server communication over WebSocket.
+The most common case — browser or service talking to a server over WS.
 
 ```typescript
 function wsChannel(ws: WebSocket): Channel {
@@ -30,9 +32,41 @@ function wsChannel(ws: WebSocket): Channel {
 }
 ```
 
-## postMessage (Window / iframe)
+Make sure `ws.binaryType = "arraybuffer"` on the browser side.
 
-For communication between a window and an iframe, or between windows.
+```typescript
+// Server (Node.js, ws package)
+import { WebSocketServer } from "ws";
+import { server } from "@dotex/erpc";
+
+const serverSecret = crypto.getRandomValues(new Uint8Array(32));
+const wss = new WebSocketServer({ port: 8080 });
+
+wss.on("connection", (ws) => {
+  const { destroy } = server(router, wsChannel(ws), {
+    auth: { psk: () => serverSecret },
+    onError: console.error,
+  });
+  ws.on("close", destroy);
+});
+
+// Client (browser)
+const ws = new WebSocket("ws://localhost:8080");
+ws.binaryType = "arraybuffer";
+await new Promise((r) => (ws.onopen = r));
+
+const { api } = client<typeof router>(wsChannel(ws), {
+  auth: { psk: () => serverSecret },
+});
+
+const user = await api.getUser({ id: "123" });
+```
+
+A WebSocket carries one logical eRPC session per connection. Reconnect = new handshake.
+
+## postMessage (window / iframe)
+
+Two windows on the same machine. Cross-origin if you want.
 
 ```typescript
 function postMessageChannel(target: Window, origin: string): Channel {
@@ -42,7 +76,7 @@ function postMessageChannel(target: Window, origin: string): Channel {
     },
     receive(cb) {
       const handler = (e: MessageEvent) => {
-        if (e.origin !== origin) return;
+        if (e.origin !== origin) return; // <-- critical
         if (e.data instanceof Uint8Array) cb(e.data);
       };
       window.addEventListener("message", handler);
@@ -52,16 +86,34 @@ function postMessageChannel(target: Window, origin: string): Channel {
 }
 ```
 
-> Always check `origin` — this protects against cross-window attacks.
+**Always check `origin`.** Skipping the check is how cross-window attacks happen. The wildcard `"*"` is fine for development but should never ship.
 
-## MessagePort (Worker / iframe)
+```typescript
+// Parent (server)
+const iframe = document.querySelector("iframe") as HTMLIFrameElement;
 
-For Web Workers, SharedWorkers, or iframes via `MessageChannel`.
+const { destroy } = server(
+  router,
+  postMessageChannel(iframe.contentWindow!, "https://widget.example.com"),
+  { auth: { psk: () => sharedSecret } },
+);
+
+// iframe (client)
+const { api } = client<typeof router>(
+  postMessageChannel(parent, "https://app.example.com"),
+  { auth: { psk: () => sharedSecret } },
+);
+```
+
+## MessagePort (Worker / SharedWorker / MessageChannel)
+
+Web Workers, SharedWorkers, and any code path that hands you a `MessagePort`.
 
 ```typescript
 function portChannel(port: MessagePort): Channel {
   return {
     send(data) {
+      // Transferable buffer — zero-copy
       port.postMessage(data, [data.buffer]);
     },
     receive(cb) {
@@ -74,16 +126,34 @@ function portChannel(port: MessagePort): Channel {
 }
 ```
 
-> `[data.buffer]` in `postMessage` marks the buffer as transferable — zero-copy transfer.
+```typescript
+// Main thread
+const worker = new Worker("worker.js");
+const { port1, port2 } = new MessageChannel();
+worker.postMessage({ port: port2 }, [port2]);
 
-## Chrome Extension Port
+const { api } = client<typeof router>(portChannel(port1), {
+  auth: { psk: () => sharedSecret },
+});
 
-For communication between content scripts, background/service workers, and popups in browser extensions.
+// worker.js
+self.onmessage = (e) => {
+  const port = e.data.port as MessagePort;
+  server(router, portChannel(port), { auth: { psk: () => sharedSecret } });
+};
+```
+
+SharedWorker is the same shape, except `self.onconnect` gives you the port and you can serve multiple tabs from one worker.
+
+## Chrome extension port
+
+Content scripts ↔ background service worker ↔ popup. The native messaging is untyped JSON.
 
 ```typescript
 function extensionPortChannel(port: chrome.runtime.Port): Channel {
   return {
     send(data) {
+      // chrome.runtime ports don't carry Uint8Array — encode as plain array
       port.postMessage(Array.from(data));
     },
     receive(cb) {
@@ -95,11 +165,34 @@ function extensionPortChannel(port: chrome.runtime.Port): Channel {
 }
 ```
 
-> Chrome Extension ports don't support binary data directly, so `Uint8Array` is converted to a plain number array.
+The `Array.from` round-trip is the price of `chrome.runtime`. For high-throughput extensions, consider `chrome.runtime.connect` between a content script and an offscreen document and switch to MessagePort there.
+
+```typescript
+// background.js (service worker)
+chrome.runtime.onConnect.addListener((port) => {
+  if (port.name !== "erpc") return;
+  const { destroy } = server(router, extensionPortChannel(port), {
+    auth: { psk: () => getExtensionPSK() },
+    context: () => ({
+      tabId: port.sender?.tab?.id,
+      frameId: port.sender?.frameId,
+    }),
+  });
+  port.onDisconnect.addListener(destroy);
+});
+
+// content-script.js
+const port = chrome.runtime.connect({ name: "erpc" });
+const { api } = client<typeof router>(extensionPortChannel(port), {
+  auth: { psk: () => getExtensionPSK() },
+});
+```
+
+`getExtensionPSK()` is whatever your extension uses to derive a key both sides agree on — extension ID + version + a stored secret, for example.
 
 ## BroadcastChannel
 
-For communication between tabs of the same origin or between workers.
+Tabs of the same origin talking to each other. One channel, many participants.
 
 ```typescript
 function broadcastChannel(name: string): Channel {
@@ -119,6 +212,149 @@ function broadcastChannel(name: string): Channel {
 }
 ```
 
-## Custom Adapters
+eRPC is a 1:1 protocol, so to use BroadcastChannel you need to elect a single server tab (leader). Other tabs become clients. The leader holds the session state; clients re-handshake when leadership moves.
 
-Writing your own adapter is straightforward — implement `send` and `receive`. Works for TCP, UDP, serial ports, Bluetooth, or any other transport. The only requirement is a bidirectional channel that can carry `Uint8Array`.
+```typescript
+const isLeader = await electLeader();
+
+if (isLeader) {
+  server(router, broadcastChannel("tab-sync"), {
+    auth: { psk: () => getLeaderPSK() },
+  });
+}
+
+const { api } = client<typeof router>(broadcastChannel("tab-sync"), {
+  auth: { psk: () => getLeaderPSK() },
+});
+```
+
+## TCP socket (Node.js)
+
+Raw TCP doesn't preserve message boundaries, so the adapter frames every payload with a 4-byte length prefix.
+
+```typescript
+import net from "net";
+
+function tcpChannel(socket: net.Socket): Channel {
+  let buffer = new Uint8Array(0);
+
+  return {
+    send(data) {
+      const len = new Uint8Array(4);
+      new DataView(len.buffer).setUint32(0, data.length, false);
+      socket.write(Buffer.concat([len, data]));
+    },
+    receive(cb) {
+      const handler = (chunk: Buffer) => {
+        buffer = new Uint8Array([...buffer, ...chunk]);
+        while (buffer.length >= 4) {
+          const length = new DataView(
+            buffer.buffer,
+            buffer.byteOffset,
+            4,
+          ).getUint32(0, false);
+          if (buffer.length < 4 + length) break;
+          const message = buffer.slice(4, 4 + length);
+          buffer = buffer.slice(4 + length);
+          cb(message);
+        }
+      };
+      socket.on("data", handler);
+      return () => socket.off("data", handler);
+    },
+  };
+}
+```
+
+```typescript
+const tcpServer = net.createServer((socket) => {
+  const { destroy } = server(router, tcpChannel(socket), {
+    auth: { psk: () => sharedSecret },
+    onError: console.error,
+  });
+  socket.on("close", destroy);
+});
+tcpServer.listen(8080);
+
+const socket = net.connect({ port: 8080, host: "localhost" });
+const { api } = client<typeof router>(tcpChannel(socket), {
+  auth: { psk: () => sharedSecret },
+});
+```
+
+## WebRTC DataChannel
+
+Peer-to-peer. Often paired with mutual signature auth because there's no shared infrastructure.
+
+```typescript
+function webRTCChannel(dc: RTCDataChannel): Channel {
+  return {
+    send(data) {
+      dc.send(data);
+    },
+    receive(cb) {
+      const handler = (e: MessageEvent) => {
+        if (e.data instanceof ArrayBuffer) cb(new Uint8Array(e.data));
+      };
+      dc.addEventListener("message", handler);
+      return () => dc.removeEventListener("message", handler);
+    },
+  };
+}
+```
+
+```typescript
+const { api } = client<typeof router>(webRTCChannel(dataChannel), {
+  auth: {
+    sign: async (transcript) => signWithMyDeviceKey(transcript),
+    verify: async (proof, transcript) => verifyPeerKey(proof, transcript),
+  },
+});
+```
+
+## Server-Sent Events + fetch
+
+Asymmetric transports work too — you only need a `send` and a `receive`, not a single duplex socket. Here the client sends over `fetch` and receives over SSE.
+
+```typescript
+function sseChannel(url: string): Channel {
+  let cb: ((data: Uint8Array) => void) | null = null;
+  let es: EventSource | null = null;
+
+  return {
+    async send(data) {
+      await fetch(`${url}/send`, {
+        method: "POST",
+        body: data,
+        headers: { "Content-Type": "application/octet-stream" },
+      });
+    },
+    receive(handler) {
+      cb = handler;
+      es = new EventSource(url);
+      es.onmessage = (e) => {
+        if (!cb) return;
+        // server sends base64 or array — adapt as needed
+        cb(new Uint8Array(JSON.parse(e.data)));
+      };
+      return () => {
+        cb = null;
+        es?.close();
+        es = null;
+      };
+    },
+  };
+}
+```
+
+The server side needs to keep an in-memory map from session to SSE stream so it knows where to send replies. The adapter is more involved than the duplex transports, but the eRPC code on top is identical.
+
+## Custom transports
+
+The rules don't change:
+
+1. `send` accepts `Uint8Array` and gets it to the other side.
+2. `receive(cb)` calls `cb` with each incoming `Uint8Array`. It returns an unsubscribe function.
+3. The transport is allowed to drop, duplicate, or reorder messages. eRPC will time out and retry. It will not behave correctly if your transport silently corrupts bytes — wrap it in something that fails noisily if you can't trust it.
+
+That's the whole API surface. Encryption, framing, retry, key management — all on the eRPC side. Your adapter doesn't need to care.

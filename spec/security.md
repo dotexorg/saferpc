@@ -1,40 +1,107 @@
 # Security
 
-## Threat Model
+eRPC treats the transport as hostile. Everything below describes what that means, what eRPC actually guarantees, and how to configure auth so those guarantees hold.
 
-eRPC treats the transport channel as **untrusted**. An attacker may:
+## Threat model
+
+The transport channel is **untrusted**. The attacker may:
 
 - Read all messages (eavesdrop)
 - Inject messages (forge)
 - Replay captured messages
 - Drop or reorder messages
 
-eRPC does **not** protect against denial of service — if the attacker drops all messages, communication is impossible.
+eRPC does **not** protect against denial of service. If the attacker drops every byte, communication is impossible. There's no fix for that at this layer.
 
-## Security Properties
+eRPC also does not protect against a compromised endpoint. If the attacker runs code on either side, encryption is irrelevant.
+
+## What you get
 
 | Property | Mechanism |
 |----------|-----------|
 | Confidentiality | XSalsa20-Poly1305 AEAD per message |
-| Authentication | PSK mixed into HKDF key derivation |
-| Server identity | HMAC proof in handshake reply |
-| Client identity | Implicit — wrong PSK produces invalid ciphertext |
+| Authentication (session) | PSK mixed into HKDF + optional asymmetric signatures |
+| Server identity | HMAC proof in handshake reply (+ optional signature) |
+| Client identity | Implicit (wrong PSK ⇒ invalid ciphertext) + optional signature |
 | Forward secrecy | Fresh ephemeral X25519 keys per session |
-| Replay (handshake) | Random nonce bound into HMAC proof |
-| Replay (session) | Random 24-byte nonces per message |
-| Stale responses | Epoch counter in hello/reply |
+| Replay across handshakes | Random nonce + epoch counter + transcript-bound signatures |
+| Replay across peers | Domain-separated transcript prefixes |
+| Replay within a session | Random 24-byte nonces per message (probabilistic) |
+| Stale responses | Epoch counter echoed in reply |
 | Prototype pollution | `sanitize()` strips `__proto__`, `constructor`, `prototype` |
-| Type confusion | msgpack extension types disabled |
+| Type confusion | msgpack extension types disabled (including Timestamp) |
+| Memory hygiene | Ephemeral keys zeroed on reset/destroy |
 
-## PSK (Pre-Shared Key)
+The HMAC proof is computed over `serverPub || clientPub || clientNonce` keyed with the session key. The session key derives from the X25519 shared secret with the PSK as HKDF salt, so the proof verifies only if the client knows the PSK. Without the PSK, the attacker can run the X25519 exchange but produces a different session key, and the proof check fails.
 
-The PSK is **never sent over the wire**. It's used as the HKDF salt, so even if an attacker observes the full X25519 exchange, they cannot derive the session key without knowing the PSK.
+## Authentication modes
 
-**Reusing a PSK across sessions is safe.** Each session generates fresh ephemeral X25519 keys. Different ephemeral keys mean a different raw shared secret and a different session key — even with the same PSK salt.
+Three modes. At least one of `psk` or asymmetric auth (`sign` / `verify`) must be configured. Neither configured is a hard error — the handshake would be unauthenticated and an active MITM could impersonate either peer.
+
+### Mode A — PSK only
+
+```typescript
+// Static PSK
+auth: { psk: () => sharedSecret }
+
+// Session-derived PSK
+auth: {
+  psk: () => deriveSessionPSK(sessionToken, deviceSecret),
+}
+```
+
+Use when both endpoints are controlled by the same entity, secrets can be rotated, and individual revocation isn't required. PSK is cheap — no signature operations on the hot path.
+
+### Mode B — Asymmetric only
+
+Client signs, server verifies. Or both sign and both verify (mutual auth).
+
+```typescript
+// Client
+auth: {
+  sign: async (transcript) => signWithDeviceKey(transcript),
+}
+
+// Server
+auth: {
+  verify: async (proof, transcript) => {
+    const principal = await verifyDeviceSignature(proof, transcript);
+    return { auth: principal };
+  },
+}
+```
+
+Use when one side is a public client (browser, mobile app, IoT device), when there are no shared secrets to safely distribute, or when you need per-device identity and revocation.
+
+### Mode C — Both (defense-in-depth)
+
+```typescript
+auth: {
+  psk: () => deriveSessionPSK(sessionId, deploymentSecret),
+  sign: (transcript) => signWithDeviceKey(transcript),
+  verify: (proof, transcript) => verifyDeviceSignature(proof, transcript),
+}
+```
+
+Use when you want session binding *and* identity proof. An attacker now has to compromise two independent things — the derivation secret and the device key — and still cannot read past sessions because of forward secrecy.
+
+## PSK vs. asymmetric: what each gives you
+
+| Property | Session-derived PSK | Asymmetric |
+|---|---|---|
+| Identity granularity | Per session | Per key/device |
+| Revocation | Rotate root secret (affects all) | Revoke individual keys |
+| Compromise blast radius | All sessions sharing the root | The compromised device only |
+| Forward secrecy | ✅ (ephemeral ECDH) | ✅ (ephemeral ECDH) |
+| Replay protection | ✅ (epoch + nonce + key binding) | ✅ (transcript bound) |
+| Cost | Low (HMAC only) | Higher (signature ops) |
+| Complexity | Simple | More moving parts |
+
+Forward secrecy comes from the ephemeral X25519 exchange in both modes. Even if a long-term secret leaks, past session ciphertexts remain unreadable — the ephemeral private keys were zeroed when the session ended.
 
 ## Handshake
 
-The handshake is lazy — it starts automatically on the first `api` call.
+Lazy. The client starts the handshake on the first RPC call, not at construction. Three phases.
 
 ```mermaid
 sequenceDiagram
@@ -43,53 +110,286 @@ sequenceDiagram
 
     Note over Client: api.foo() — lazy trigger
 
-    Client->>Server: Phase 1: Hello<br/>[0x00, { pub, nonce, epoch }]
+    Client->>Server: Phase 1: Hello<br/>[0x00, { pub, nonce, epoch, auth? }]
     Note left of Client: handshaking
-    Note right of Server: pending
+    Note right of Server: verify auth (if configured)<br/>pending
 
-    Server->>Client: Phase 2: Reply<br/>[0x00, { pub, proof, epoch }]
-    Note left of Client: Client verifies proof (PSK check)<br/>Derives session key
-    Note left of Client: ready
-    Note right of Server: pending
+    Server->>Client: Phase 2: Reply<br/>[0x00, { pub, proof, epoch, auth? }]
+    Note left of Client: verify proof + auth<br/>derive session key<br/>ready
 
-    Client->>Server: Phase 3: First RPC<br/>[0x01, encrypted payload]
+    Client->>Server: Phase 3: First encrypted RPC<br/>[0x01, encrypted payload]
     Note right of Server: ready (confirmed)
 
-    Server->>Client: RPC Response<br/>[0x01, encrypted payload]
+    Server->>Client: Encrypted response<br/>[0x01, encrypted payload]
     Note left of Client: api.foo() resolves
 ```
 
-**Three phases:**
+1. **Hello.** Client sends ephemeral public key, a fresh 32-byte nonce, an epoch counter, and (if signing) a signature over the hello transcript.
+2. **Reply.** Server verifies any client auth, runs ECDH, derives the session key with the PSK as HKDF salt, and sends back its public key plus an HMAC proof and (if signing) a signature over the reply transcript.
+3. **First RPC.** Client verifies the reply, derives the same session key, and sends its first encrypted call. The server transitions to `ready` only when this first message decrypts cleanly — successful decryption is the client's implicit proof.
 
-1. **Hello** — the client sends its ephemeral public key, a random nonce, and an epoch counter
-2. **Reply** — the server responds with its public key and an HMAC proof, confirming knowledge of the PSK
-3. **First RPC** — the client sends an encrypted call. The server transitions to `ready` only upon successful decryption — this implicitly proves the client also knows the PSK
+The server can accept a new hello even in `ready` state. That's the re-handshake path: when a client times out and resets, it sends a fresh hello, the server resets its session state, and a new key is negotiated transparently.
 
-## State Machines
+## Transcript format
+
+Signatures sign over canonical transcripts built by eRPC, not user data. Two domains:
+
+```text
+HELLO transcript:
+  "erpc-hs-hello-v1\0"   (17 bytes, magic prefix)
+  epoch                  (4 bytes, big-endian uint32)
+  client_pub             (32 bytes, X25519)
+  client_nonce           (32 bytes)
+
+REPLY transcript:
+  "erpc-hs-reply-v1\0"   (17 bytes, magic prefix)
+  epoch                  (4 bytes, big-endian uint32)
+  client_pub             (32 bytes)
+  client_nonce           (32 bytes)
+  server_pub             (32 bytes)
+```
+
+The two prefixes plus the epoch plus the per-handshake nonce defeat:
+
+- Replay across direction (hello vs. reply use different prefixes)
+- Replay across handshake attempts (epoch differs each time)
+- Substitution attacks (an active MITM cannot swap either ephemeral public key without invalidating the signature)
+
+## State machines
 
 ### Server
 
 ```mermaid
 stateDiagram-v2
-    waiting --> pending : hello received
+    waiting --> pending : hello received + auth verified
     pending --> ready : 1st valid TAG_MSG
-    pending --> waiting : timeout / error
+    pending --> waiting : timeout / error / auth failure
     ready --> waiting : new hello (client re-handshaking)
     waiting --> waiting : new hello
 ```
+
+The server survives failures. Bad PSK, bad signature, timeout — it resets to `waiting` and accepts the next hello. Only an explicit `destroy()` is permanent.
 
 ### Client
 
 ```mermaid
 stateDiagram-v2
     idle --> handshaking : api call / hello sent
-    handshaking --> ready : server reply OK
-    handshaking --> idle : hs timeout / hs error
+    handshaking --> ready : server reply OK + auth verified
+    handshaking --> idle : hs timeout / hs error / auth failure
     ready --> idle : timeout / send error (auto-reset, epoch check)
 ```
 
-## Replay Within a Session
+The client resets on session failure and retries once on the next call. See [API: Auto-Retry](api.md).
 
-eRPC uses random nonces (not counters) for XSalsa20-Poly1305. With 24-byte (192-bit) random nonces, collision probability is negligible. However, a captured ciphertext **can** be replayed if the attacker can inject into the channel while the session is alive — the replayed message will decrypt and execute again.
+## Auth processing order
 
-For non-idempotent operations, add application-level idempotency keys.
+The order matters. eRPC runs auth **before** materializing any session keys, so a failed verification never leaks ECDH artifacts.
+
+**Server (on hello):**
+
+1. Parse the hello frame.
+2. If `verify` is configured, extract the `auth` payload, build the hello transcript, call `verify(payload, transcript)`. Store any returned `auth` data for the session.
+3. Compute the X25519 shared secret.
+4. Call `psk()` (or use empty PSK if not configured) and derive the session key.
+5. If `sign` is configured, sign the reply transcript and embed the result.
+6. Send the reply with the HMAC proof.
+
+**Client (on reply):**
+
+1. Parse the reply frame.
+2. If `verify` is configured, extract `auth`, build the reply transcript, call `verify(payload, transcript)`.
+3. Compute the shared secret, derive the session key.
+4. Verify the HMAC proof.
+5. Transition to `ready`.
+
+A throw at any step rejects the handshake. The client resets to `idle`; the server resets to `waiting`. Failed verifications never silently downgrade.
+
+## Wire-level frames
+
+Two tags:
+
+- `0x00` — handshake frame (hello or reply)
+- `0x01` — encrypted RPC message
+
+Hello (client → server):
+
+```typescript
+{ pub: Uint8Array, nonce: Uint8Array, epoch: number, auth?: Uint8Array }
+```
+
+Reply (server → client):
+
+```typescript
+{ pub: Uint8Array, proof: Uint8Array, epoch: number, auth?: Uint8Array }
+```
+
+The optional `auth` field carries the signature payload. Peers without `verify` ignore incoming `auth`. Peers with `verify` reject frames lacking it. PSK-only deployments don't need to know `auth` exists.
+
+## Constants and limits
+
+| Constant | Value | Notes |
+|---|---|---|
+| `NONCE_LEN` | 24 | XSalsa20-Poly1305 per-message nonce |
+| `KEY_LEN` | 32 | Symmetric key, X25519 pub/priv, **and the client hello nonce** |
+| `MAX_HELLO_BYTES` | 65,536 | Sized for typical signature payloads |
+| `MAX_AUTH_BYTES` | 32,768 | Hard cap on `auth` payload |
+| `MAX_MSG_BYTES` | 1,048,576 | Per encrypted RPC frame (configurable) |
+| `HANDSHAKE_TIMEOUT` | 5,000 ms | Default |
+| PSK minimum | 32 bytes | Validated when `psk()` returns |
+| Encryption nonce | 24 bytes | Random, XSalsa20-Poly1305 |
+
+## Safe PSK patterns
+
+```typescript
+// Static PSK from a secrets vault — server-to-server
+auth: {
+  psk: async () => await vault.getSecret("erpc-server-key"),
+}
+
+// Session-derived from an authenticated token + device secret
+auth: {
+  psk: async () => deriveSessionPSK(
+    await getValidatedSession(),
+    await getSecureDeviceSecret(),
+  ),
+}
+
+// Time-bucketed rotation
+auth: {
+  psk: () => deriveSessionPSK(
+    String(Math.floor(Date.now() / 3_600_000)), // hourly bucket
+    rotatingMasterSecret,
+  ),
+}
+```
+
+## Unsafe PSK patterns
+
+```typescript
+// ❌ Hard-coded constant — leaks the moment your bundle leaks
+auth: { psk: () => new TextEncoder().encode("secret123") }
+
+// ❌ Predictable session ID — attacker just guesses it
+auth: { psk: () => deriveSessionPSK("user-123", secret) }
+
+// ❌ All-zero or weak derivation material — no security at all
+auth: { psk: () => deriveSessionPSK(sessionId, new Uint8Array(32)) }
+
+// ❌ Secret material in client-side bundle
+auth: {
+  psk: () => deriveSessionPSK(sessionId, new TextEncoder().encode(API_KEY)),
+}
+```
+
+The shared pattern in the unsafe list: the attacker can reproduce the derivation either because the input is guessable or because the secret is in the wrong place.
+
+## Built-in signature helpers
+
+eRPC ships ready-made helpers for the common cases. All are imported from the root entry point.
+
+```typescript
+import {
+  createEd25519ClientAuth,
+  createEd25519ServerAuth,
+  createECDSAClientAuth,
+  createECDSAServerAuth,
+  createJWTClientAuth,
+  createJWTServerAuth,
+  generateEd25519Keypair,
+  generateECDSAKeypair,
+} from "@dotex/erpc";
+```
+
+### Ed25519 (recommended)
+
+```typescript
+import { createEd25519ClientAuth, createEd25519ServerAuth } from "@dotex/erpc";
+
+const clientAuth = createEd25519ClientAuth({
+  privateKey: devicePrivateKey,
+  deviceId: "device-123",
+});
+
+const serverAuth = createEd25519ServerAuth({
+  getPublicKey: async (deviceId) => getDevicePublicKey(deviceId),
+});
+
+// Client
+auth: { ...clientAuth }
+
+// Server
+auth: { ...serverAuth }
+```
+
+### ECDSA P-256 (WebCrypto)
+
+```typescript
+import { createECDSAClientAuth, createECDSAServerAuth } from "@dotex/erpc";
+
+const clientAuth = createECDSAClientAuth({
+  privateKey: ecdsaPrivateKey,
+  identifier: "device-123",
+});
+
+const serverAuth = createECDSAServerAuth({
+  getPublicKey: async (id) => getDevicePublicKey(id),
+});
+```
+
+### JWT (bearer-style, client-side credential)
+
+```typescript
+import { createJWTClientAuth, createJWTServerAuth } from "@dotex/erpc";
+
+const clientAuth = createJWTClientAuth({
+  getToken: () => localStorage.getItem("jwt"),
+});
+
+const serverAuth = createJWTServerAuth({
+  verifyToken: async (jwt) => {
+    const payload = await validateJWT(jwt);
+    return { userId: payload.sub, permissions: payload.permissions };
+  },
+});
+```
+
+JWTs are not cryptographic proofs over the transcript — they're bearer tokens transported inside the auth payload. A leaked JWT lets the attacker authenticate until expiry. Combine with PSK for transcript binding when this matters.
+
+## Replay within a session
+
+eRPC uses random 24-byte nonces (not counters) for XSalsa20-Poly1305. The collision probability is negligible — but **a captured ciphertext can be replayed by an attacker who can inject into a live channel**. The replayed message will decrypt and execute again.
+
+For non-idempotent operations, add an application-level idempotency key inside the procedure input, or maintain a request-ID set on the server keyed by the verified principal.
+
+This is the only known replay window in the protocol. A counter-based scheme would close it but introduces a stronger ordering requirement on the transport, which is not always available (BroadcastChannel, lossy WebRTC, etc.).
+
+## Recommended configurations
+
+**Public web app (browser ↔ server):** asymmetric auth. No shared secrets in the bundle.
+
+```typescript
+auth: { sign: async (t) => signWithSessionJWT(t) }
+```
+
+**Mobile app ↔ backend:** device certificates or platform attestation.
+
+```typescript
+auth: { sign: async (t) => getDeviceAttestation(t) }
+```
+
+**Microservices (server ↔ server):** session-derived PSK from a service-mesh identity.
+
+```typescript
+auth: { psk: async () => deriveSessionPSK(await serviceToken(), clusterSecret) }
+```
+
+**High-security environment:** both PSK and asymmetric, with hardware key storage on at least one side.
+
+```typescript
+auth: {
+  psk: () => deriveSessionPSK(sessionToken, hsmSecret),
+  sign: (t) => signWithHardwareKey(t),
+  verify: (p, t) => verifyWithPKI(p, t),
+}
+```

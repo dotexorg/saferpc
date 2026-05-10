@@ -17,6 +17,7 @@ import {
   KEY_LEN,
   MAX_HELLO_BYTES,
   MAX_MSG_BYTES,
+  MAX_AUTH_BYTES,
   HANDSHAKE_TIMEOUT,
   zero,
   sanitize,
@@ -26,10 +27,15 @@ import {
   computeProof,
   createEncryptor,
   createDecryptor,
-  validatePSK,
+  validateAuthConfig,
+  EMPTY_PSK,
+  buildHelloTranscript,
+  buildReplyTranscript,
   RPCError,
   type Router,
   type Channel,
+  type AuthOptions,
+  type Authenticator,
 } from "./common.ts";
 
 // ─── Client constants ─────────────────────────────────────
@@ -68,8 +74,11 @@ export type Client<T extends Router> = {
 };
 
 export interface ClientOptions {
-  /** Pre-shared key for authentication. REQUIRED. Minimum 32 bytes. */
-  psk: Uint8Array;
+  /**
+   * Authentication configuration. At least one of `psk` OR asymmetric
+   * auth (`sign`/`verify`) MUST be configured.
+   */
+  auth?: AuthOptions;
   /** Per-RPC-call timeout. Default: 10000ms. */
   timeout?: number;
   /** Max concurrent pending RPC calls. Default: 256. */
@@ -81,6 +90,12 @@ export interface ClientOptions {
    */
   handshakeTimeout?: number;
   maxMessageBytes?: number;
+
+  // Backward compatibility - old API
+  /** @deprecated Use auth.psk instead */
+  psk?: Uint8Array;
+  /** @deprecated Use auth.sign/auth.verify instead */
+  authenticator?: Authenticator;
 }
 
 // ─── Client ──────────────────────────────────────────────
@@ -96,9 +111,38 @@ export function client<T extends Router>(
     throw new TypeError("client() channel.receive must be a function");
   }
 
-  validatePSK(opts.psk);
-
-  const psk = opts.psk;
+  // Handle backward compatibility - convert old API to new API
+  let auth: AuthOptions;
+  if (opts.auth) {
+    auth = opts.auth;
+  } else if (opts.psk || opts.authenticator) {
+    // Legacy API - convert to new format
+    auth = {};
+    if (opts.psk) {
+      // Validate PSK at construction time for legacy API compatibility
+      if (opts.psk.length < KEY_LEN) {
+        throw new TypeError(`PSK must be at least ${KEY_LEN} bytes`);
+      }
+      const pskBytes = opts.psk;
+      auth.psk = () => new Uint8Array(pskBytes);
+    }
+    if (opts.authenticator) {
+      const authenticator = opts.authenticator as Authenticator;
+      if (authenticator.produce) {
+        auth.sign = authenticator.produce;
+      }
+      if (authenticator.verify) {
+        auth.verify = authenticator.verify;
+      }
+    }
+  } else {
+    throw new TypeError(
+      "Either 'auth' or legacy 'psk'/'authenticator' options must be provided"
+    );
+  }
+  
+  // Validate the final auth configuration
+  validateAuthConfig(auth);
   const timeout = opts.timeout !== undefined ? opts.timeout : DEFAULT_TIMEOUT;
   const maxPending =
     opts.maxPending !== undefined ? opts.maxPending : MAX_PENDING;
@@ -213,6 +257,8 @@ export function client<T extends Router>(
     state = "handshaking";
 
     const currentEpoch = epoch;
+    const myPub = publicKey;
+    const myNonce = clientNonce;
 
     // Hold the promise locally — over a synchronous transport, channel.send
     // may run the entire handshake round-trip and call failHandshake() before
@@ -234,14 +280,45 @@ export function client<T extends Router>(
       failHandshake(new RPCError("HANDSHAKE", "Handshake timeout"));
     }, hsTimeout);
 
-    const helloPayload = mpEncode({
-      pub: publicKey,
-      nonce: clientNonce,
-      epoch: currentEpoch,
-    });
-    const hello = concatBytes(new Uint8Array([TAG_HELLO]), helloPayload);
-    zero(helloPayload);
-    Promise.resolve(channel.send(hello)).catch(function onSendError(err) {
+    // Authenticator.produce can be async (e.g. WebCrypto.sign). Wrap the
+    // remainder of hello construction in a coroutine and route any failure
+    // through failHandshake so the API surface stays the same.
+    (async function buildAndSendHello() {
+      let authPayload: Uint8Array | null = null;
+      if (auth.sign !== undefined) {
+        const transcript = buildHelloTranscript(currentEpoch, myPub, myNonce);
+        const signed = await auth.sign(transcript);
+        if (state !== "handshaking" || epoch !== currentEpoch) return;
+        if (
+          !(signed instanceof Uint8Array) ||
+          signed.length === 0 ||
+          signed.length > MAX_AUTH_BYTES
+        ) {
+          throw new RPCError(
+            "HANDSHAKE",
+            "auth.sign returned invalid payload",
+          );
+        }
+        authPayload = signed;
+      }
+
+      const helloMsg: Record<string, unknown> = {
+        pub: myPub,
+        nonce: myNonce,
+        epoch: currentEpoch,
+      };
+      if (authPayload !== null) helloMsg["auth"] = authPayload;
+
+      const helloPayload = mpEncode(helloMsg);
+      const hello = concatBytes(new Uint8Array([TAG_HELLO]), helloPayload);
+      zero(helloPayload);
+      try {
+        await channel.send(hello);
+      } catch (err: unknown) {
+        if (state !== "handshaking" || epoch !== currentEpoch) return;
+        failHandshake(err);
+      }
+    })().catch(function onProduceError(err: unknown) {
       if (state !== "handshaking" || epoch !== currentEpoch) return;
       failHandshake(err);
     });
@@ -278,7 +355,11 @@ export function client<T extends Router>(
       const pub = publicKey;
       const nonce = clientNonce;
 
-      try {
+      // Authenticator.verify can be async (e.g. WebCrypto.verify) so
+      // run the entire reply path in a coroutine. The epoch guard
+      // makes sure a stale reply doesn't promote a destroyed/reset
+      // session.
+      (async function processReply() {
         const raw = sanitize(mpDecode(data.subarray(1)));
         if (typeof raw !== "object" || raw === null) {
           throw new RPCError("HANDSHAKE", "Invalid hello");
@@ -286,9 +367,9 @@ export function client<T extends Router>(
         // TODO: Strict
         const hello = raw as Record<string, unknown> as any;
 
-        // Epoch check — drop stale replies from previous attempts
+        // Epoch check — drop stale replies from previous attempts.
         const replyEpoch = typeof hello.epoch === "number" ? hello.epoch : 0;
-        if (replyEpoch !== currentEpoch) return;
+        if (replyEpoch !== currentEpoch) return; // stale, silently drop
 
         const serverPub = hello.pub;
         if (
@@ -303,9 +384,43 @@ export function client<T extends Router>(
           throw new RPCError("HANDSHAKE", "Invalid proof");
         }
 
+        // ── Server-side auth verification ─────────────────
+        // If `verify` is configured, the server MUST embed an `auth`
+        // payload bound to the canonical reply transcript. Run BEFORE
+        // accepting the session — a failed verification never reaches
+        // the encryption-state transition.
+        if (auth.verify !== undefined) {
+          const replyAuth = hello.auth;
+          if (!(replyAuth instanceof Uint8Array)) {
+            throw new RPCError(
+              "HANDSHAKE",
+              "auth.verify configured but reply.auth missing or invalid",
+            );
+          }
+          if (replyAuth.length === 0 || replyAuth.length > MAX_AUTH_BYTES) {
+            throw new RPCError("HANDSHAKE", "reply.auth size out of range");
+          }
+          const transcript = buildReplyTranscript(
+            currentEpoch,
+            pub,
+            nonce,
+            serverPub,
+          );
+          await auth.verify(replyAuth, transcript);
+          // Epoch guard: handshake might have been reset / destroyed
+          // while verify was awaiting (e.g. user destroy()).
+          if (state !== "handshaking" || epoch !== currentEpoch) return;
+        }
+
         const rawShared = x25519.getSharedSecret(priv, serverPub);
-        sessionKey = deriveSessionKey(rawShared, psk);
+        // Get PSK or use empty PSK if not configured
+        const pskBytes = auth.psk !== undefined ? await auth.psk() : EMPTY_PSK;
+        if (pskBytes.length < KEY_LEN) {
+          throw new RPCError("HANDSHAKE", `PSK must be at least ${KEY_LEN} bytes`);
+        }
+        sessionKey = deriveSessionKey(rawShared, pskBytes);
         zero(rawShared);
+        if (pskBytes !== EMPTY_PSK) zero(pskBytes);
 
         const expected = computeProof(sessionKey, serverPub, pub, nonce);
         if (!constTimeEqual(proof, expected)) {
@@ -324,10 +439,10 @@ export function client<T extends Router>(
         handshakeReject = null;
         state = "ready";
         if (res !== null) res();
-      } catch (err: unknown) {
-        if (epoch !== currentEpoch) return;
+      })().catch(function onReplyError(err: unknown) {
+        if (state === "closed" || epoch !== currentEpoch) return;
         failHandshake(err);
-      }
+      });
       return;
     }
 

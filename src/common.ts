@@ -26,11 +26,31 @@ export const KEY_LEN = 32;
 export const TAG_HELLO = 0x00;
 export const TAG_MSG = 0x01;
 export const MAX_MSG_BYTES = 1_048_576;
-export const MAX_HELLO_BYTES = 256;
+/**
+ * Hello frames carry the optional `auth` payload produced by the
+ * application's authenticator (e.g. a JWT + signature). 64 KiB is
+ * sized for typical credential + signature combinations; bump if
+ * your authenticator embeds larger material.
+ */
+export const MAX_HELLO_BYTES = 65_536;
 export const HANDSHAKE_TIMEOUT = 5_000;
+/**
+ * Hard cap on `auth` payload bytes embedded in hello / reply.
+ * Independent of MAX_HELLO_BYTES because the auth payload is only
+ * one component of the hello.
+ */
+export const MAX_AUTH_BYTES = 32_768;
 
 const MAX_DEPTH = 32;
 const KDF_INFO = new TextEncoder().encode("drpc-v1");
+
+/**
+ * Domain-separated transcript prefixes. The handshake transcript is the
+ * canonical byte string the application's authenticator signs / verifies
+ * over. Keep these tight, versioned, and never reused across domains.
+ */
+const TRANSCRIPT_HELLO_MAGIC = new TextEncoder().encode("erpc-hs-hello-v1\0");
+const TRANSCRIPT_REPLY_MAGIC = new TextEncoder().encode("erpc-hs-reply-v1\0");
 
 /**
  * Hardened ExtensionCodec — rejects ALL msgpack extension types including
@@ -124,6 +144,30 @@ export function computeProof(
   return result;
 }
 
+/**
+ * Derive a session-bound PSK from a session identifier and secret using HKDF.
+ * This provides better security than static PSKs by binding each session
+ * to a specific session token/identifier.
+ *
+ * @param sessionId Session identifier (e.g., JWT, session token)
+ * @param secret Secret key material (device secret, server secret, etc.)
+ * @returns 32-byte derived PSK
+ */
+export function deriveSessionPSK(
+  sessionId: string,
+  secret: Uint8Array,
+): Uint8Array {
+  if (typeof sessionId !== "string" || sessionId.length === 0) {
+    throw new TypeError("sessionId must be a non-empty string");
+  }
+  if (!(secret instanceof Uint8Array) || secret.length < KEY_LEN) {
+    throw new TypeError(`secret must be at least ${KEY_LEN} bytes`);
+  }
+  const sessionBytes = new TextEncoder().encode(sessionId);
+  const info = new TextEncoder().encode("erpc-session-v1");
+  return hkdf(sha256, secret, sessionBytes, info, KEY_LEN);
+}
+
 // ─── Encrypted message helpers ───────────────────────────
 
 export function createEncryptor(sessionKey: Uint8Array) {
@@ -158,14 +202,130 @@ export function createDecryptor(sessionKey: Uint8Array) {
   };
 }
 
-// ─── PSK validation ──────────────────────────────────────
+// ─── Handshake transcript ────────────────────────────────
+//
+// The transcript is the canonical byte string the application's
+// authenticator signs (on `produce`) and verifies (on `verify`).
+//
+// Two transcripts:
+//   HELLO  — what the client commits to before knowing the server's pub
+//   REPLY  — what the server commits to after seeing the client's hello
+//
+// Both bind the per-handshake `epoch`, the client's ephemeral pub and
+// nonce. The REPLY transcript additionally binds the server's
+// ephemeral pub, so a server-side signature locks both sides of the
+// ECDH exchange. An active MITM cannot substitute either ephemeral
+// public key without invalidating the corresponding signature.
 
+function encodeEpoch(epoch: number): Uint8Array {
+  // 4-byte big-endian unsigned. Epochs increment per handshake attempt
+  // and are short-lived; 32-bit is sufficient.
+  if (
+    typeof epoch !== "number" ||
+    !Number.isInteger(epoch) ||
+    epoch < 0 ||
+    epoch > 0xffffffff
+  ) {
+    throw new RPCError("INVALID_DATA", "Invalid epoch");
+  }
+  const out = new Uint8Array(4);
+  const dv = new DataView(out.buffer);
+  dv.setUint32(0, epoch, false);
+  return out;
+}
+
+export function buildHelloTranscript(
+  epoch: number,
+  clientPub: Uint8Array,
+  clientNonce: Uint8Array,
+): Uint8Array {
+  if (!(clientPub instanceof Uint8Array) || clientPub.length !== KEY_LEN) {
+    throw new RPCError("INVALID_DATA", "Invalid clientPub for transcript");
+  }
+  if (!(clientNonce instanceof Uint8Array) || clientNonce.length !== KEY_LEN) {
+    throw new RPCError("INVALID_DATA", "Invalid clientNonce for transcript");
+  }
+  return concatBytes(
+    TRANSCRIPT_HELLO_MAGIC,
+    encodeEpoch(epoch),
+    clientPub,
+    clientNonce,
+  );
+}
+
+export function buildReplyTranscript(
+  epoch: number,
+  clientPub: Uint8Array,
+  clientNonce: Uint8Array,
+  serverPub: Uint8Array,
+): Uint8Array {
+  if (!(clientPub instanceof Uint8Array) || clientPub.length !== KEY_LEN) {
+    throw new RPCError("INVALID_DATA", "Invalid clientPub for transcript");
+  }
+  if (!(clientNonce instanceof Uint8Array) || clientNonce.length !== KEY_LEN) {
+    throw new RPCError("INVALID_DATA", "Invalid clientNonce for transcript");
+  }
+  if (!(serverPub instanceof Uint8Array) || serverPub.length !== KEY_LEN) {
+    throw new RPCError("INVALID_DATA", "Invalid serverPub for transcript");
+  }
+  return concatBytes(
+    TRANSCRIPT_REPLY_MAGIC,
+    encodeEpoch(epoch),
+    clientPub,
+    clientNonce,
+    serverPub,
+  );
+}
+
+// ─── PSK / Authenticator config validation ───────────────
+
+/**
+ * Empty salt used in HKDF when no PSK is configured. HKDF with an
+ * all-zero salt is well-defined per RFC 5869 and provides no
+ * authentication on its own — pair with `Authenticator` to get
+ * a usable session.
+ */
+export const EMPTY_PSK: Uint8Array = new Uint8Array(KEY_LEN);
+
+/**
+ * Validate the auth configuration. At least one of:
+ *
+ *   - `psk` function is configured, OR
+ *   - asymmetric auth (`sign` or `verify`) is configured, OR
+ *   - BOTH are configured (defense-in-depth)
+ *
+ * Configuring NEITHER is a hard error: the resulting handshake would
+ * be unauthenticated and any active MITM on the transport could
+ * impersonate either peer.
+ */
+export function validateAuthConfig(auth: AuthOptions): void {
+  if (typeof auth !== "object" || auth === null) {
+    throw new TypeError("auth must be an object");
+  }
+
+  const hasPsk = typeof auth.psk === "function";
+  const hasSign = typeof auth.sign === "function";
+  const hasVerify = typeof auth.verify === "function";
+  const hasAsymmetric = hasSign || hasVerify;
+
+  if (!hasPsk && !hasAsymmetric) {
+    throw new TypeError(
+      "At least one of `auth.psk` or asymmetric auth (`auth.sign`/`auth.verify`) must be configured. " +
+        "An eRPC handshake with neither would be unauthenticated.",
+    );
+  }
+}
+
+/**
+ * Validate PSK bytes (backward compatibility helper)
+ * @deprecated Use auth.psk function instead
+ */
 export function validatePSK(psk: Uint8Array): void {
   if (!(psk instanceof Uint8Array)) {
-    throw new TypeError("psk must be a Uint8Array");
+    throw new TypeError("PSK must be a Uint8Array");
   }
   if (psk.length < KEY_LEN) {
-    throw new TypeError(`psk must be at least ${KEY_LEN} bytes`);
+    throw new TypeError(`PSK must be at least ${KEY_LEN} bytes`);
   }
 }
 
@@ -219,6 +379,78 @@ export interface Channel {
   send(data: Uint8Array): void | Promise<void>;
   receive(cb: (data: Uint8Array) => void): () => void;
 }
+
+// ─── Authentication (PSK + asymmetric handshake authentication) ─
+
+/**
+ * Result of `AuthOptions.verify` on the server side. The optional
+ * `auth` is merged into RPC handler context for the lifetime of
+ * the session that handshake established.
+ *
+ * On the client side the return value is unused (success ↔ no throw).
+ */
+export type VerifyResult = { auth?: Ctx } | void;
+
+/**
+ * Authentication configuration for eRPC. At least one of `psk` OR
+ * asymmetric auth (`sign`/`verify`) MUST be configured.
+ *
+ * Three modes:
+ * 1. PSK-only: { psk: () => secret }
+ * 2. Asymmetric-only: { sign: ..., verify?: ... }
+ * 3. Both (defense-in-depth): { psk: () => secret, sign: ..., verify?: ... }
+ */
+export interface AuthOptions {
+  /**
+   * Pre-shared key function. Returns PSK bytes mixed into session key
+   * derivation. Called once per handshake attempt.
+   *
+   * Use session-derived PSKs for better security:
+   * ```typescript
+   * psk: () => deriveSessionPSK(sessionToken, deviceSecret)
+   * ```
+   *
+   * Minimum 32 bytes when returned.
+   */
+  psk?: () => Uint8Array | Promise<Uint8Array>;
+
+  /**
+   * Create proof of identity over handshake transcript. The returned
+   * payload is embedded in hello (client) or reply (server).
+   *
+   * Typically a signature over the transcript with a private key.
+   *
+   * Called once per handshake attempt.
+   */
+  sign?: (transcript: Uint8Array) => Uint8Array | Promise<Uint8Array>;
+
+  /**
+   * Verify counterparty's proof of identity. Throw to reject the
+   * handshake; return/resolve to accept.
+   *
+   * If configured, the counterparty MUST provide a proof (else
+   * handshake fails). If omitted, any counterparty proof is ignored.
+   *
+   * On the server side, `auth` (if returned) is merged into
+   * RPC handler context for the session.
+   *
+   * Called once per handshake attempt.
+   */
+  verify?: (
+    proof: Uint8Array,
+    transcript: Uint8Array,
+  ) => VerifyResult | Promise<VerifyResult>;
+}
+
+// Backward compatibility
+export type AuthVerifyResult = VerifyResult;
+export type Authenticator = {
+  produce?: (transcript: Uint8Array) => Uint8Array | Promise<Uint8Array>;
+  verify?: (
+    payload: Uint8Array,
+    transcript: Uint8Array,
+  ) => AuthVerifyResult | Promise<AuthVerifyResult>;
+};
 
 // ─── Chain builder ────────────────────────────────────────
 
