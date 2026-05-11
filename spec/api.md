@@ -2,17 +2,21 @@
 
 Strict reference for every exported symbol. For an end-to-end walkthrough see [Getting Started](getting-started.md). For threat model and crypto details see [Security](security.md). For the wire format see [Protocol](protocol.md).
 
-All examples below import from the root entry point:
+## Import paths
 
 ```typescript
+// Root entry — everything
 import {
   chain, server, client,
   RPCError, RemoteRPCError,
   deriveSessionPSK,
 } from "@dotex/erpc";
-```
 
-Subpaths `@dotex/erpc/common`, `@dotex/erpc/server`, and `@dotex/erpc/client` are also published for tree-shaking.
+// Subpaths for tree-shaking
+import { ... } from "@dotex/erpc/common";
+import { ... } from "@dotex/erpc/server";
+import { ... } from "@dotex/erpc/client";
+```
 
 ---
 
@@ -42,11 +46,11 @@ interface Chain<TCtx = {}, TIn = unknown, TOut = unknown> {
 ### Method semantics
 
 | Method | Effect | Notes |
-|---|---|---|
-| `.use(fn)` | Adds a middleware. `fn` must call `next()` exactly once. | `next(extra)` merges `extra` into ctx for downstream steps. |
-| `.input(schema)` | Validates incoming input with Zod. | On failure throws `RPCError("INPUT_VALIDATION", ...)` with `r.error.flatten()` as `data`. |
-| `.output(schema)` | Validates handler output with Zod. | On failure throws `RPCError("OUTPUT_VALIDATION", ...)`. Runs *after* the handler. |
-| `.handler(fn)` | Terminates the chain. | Returns a frozen `Procedure`. |
+|--------|--------|-------|
+| `.use(fn)` | Adds middleware that can extend context | `fn` must call `next()` exactly once. `next(extra)` merges `extra` into ctx. |
+| `.input(schema)` | Validates incoming input with Zod | On failure throws `RPCError("INPUT_VALIDATION", ...)`. |
+| `.output(schema)` | Validates handler output with Zod | On failure throws `RPCError("OUTPUT_VALIDATION", ...)`. Runs *after* handler. |
+| `.handler(fn)` | Terminates the chain | Returns a frozen `Procedure`. |
 
 `schema` is anything with a `.safeParse()` method (a Zod schema in practice).
 
@@ -57,6 +61,7 @@ interface Procedure {
   readonly _steps: ReadonlyArray<Step>;
   readonly _handler: HandlerFn;
 }
+
 type Router = Record<string, Procedure>;
 ```
 
@@ -79,16 +84,16 @@ Subscribes to `channel` and serves the given router. Returns synchronously.
 ### `ServerOptions`
 
 | Field | Type | Default | Required |
-|---|---|---|---|
+|-------|------|---------|----------|
 | `auth` | `AuthOptions` | — | ✅ (or legacy `psk` / `authenticator`) |
 | `context` | `(ctx: { auth?: Ctx }) => Ctx \| Promise<Ctx>` | — | — |
 | `handshakeTimeout` | `number` (ms) | `5000` | — |
 | `maxMessageBytes` | `number` | `1_048_576` | — |
 | `onError` | `(err: unknown) => void` | — | — |
 
-`context` is called per request. The `auth` argument carries whatever `auth.verify` returned for the current session (see below). When `context` is omitted, the request context is the verified `auth` data (or `{}` if none).
+`context` is called per request. The `auth` argument carries whatever `auth.verify` returned for the current session. When `context` is omitted, the request context is the verified auth data (or `{}` if none).
 
-`onError` is called on handshake failures and non-fatal internal errors. The server does **not** destroy on handshake failure — it resets and accepts the next hello. Use `onError` for logging.
+`onError` is called on handshake failures and non-fatal internal errors. The server does **not** destroy on handshake failure — it resets and accepts the next hello.
 
 ### `AuthOptions`
 
@@ -108,8 +113,8 @@ type VerifyResult = { auth?: Ctx } | void;
 At least one of `psk` or asymmetric (`sign` / `verify`) must be set. Configuring neither throws a `TypeError` at construction.
 
 | Field | Called | Notes |
-|---|---|---|
-| `psk` | Per handshake attempt | Returned bytes must be ≥ 32. Empty PSK is used internally only when `psk` is omitted but asymmetric auth is configured. |
+|-------|--------|-------|
+| `psk` | Per handshake attempt | Returned bytes must be ≥ 32. Empty PSK used when `psk` is omitted but asymmetric auth is configured. |
 | `sign` | Per handshake attempt, if set | Signature payload, ≤ 32 KiB. |
 | `verify` | Per handshake attempt, if set | Throw to reject. Returned `auth` is bound to the resulting session. |
 
@@ -128,7 +133,7 @@ waiting → pending → ready
 ```
 
 - `waiting`: accepting hellos, no session.
-- `pending`: hello processed, reply sent. Server transitions to `ready` only on a successful decrypt of the first `TAG_MSG`.
+- `pending`: hello processed, reply sent. Transitions to `ready` only on successful decrypt of the first `TAG_MSG`.
 - `ready`: session confirmed. Routes RPCs.
 - A new hello in any state resets the server and starts over.
 - `destroy()` is permanent: zeros all keys, unsubscribes from the channel, drops references.
@@ -149,7 +154,7 @@ Returns synchronously. The handshake is lazy: it starts on the first `api` call.
 ### `ClientOptions`
 
 | Field | Type | Default | Required |
-|---|---|---|---|
+|-------|------|---------|----------|
 | `auth` | `AuthOptions` | — | ✅ (or legacy `psk` / `authenticator`) |
 | `timeout` | `number` (ms) | `10_000` | — |
 | `maxPending` | `number` | `256` | — |
@@ -158,7 +163,7 @@ Returns synchronously. The handshake is lazy: it starts on the first `api` call.
 
 `maxPending` caps concurrent in-flight calls. Past the cap, calls reject with `RPCError("CLIENT", "Too many pending requests")`.
 
-`timeout` is per call. On timeout the client throws `RPCError("TIMEOUT", "Timed out: <procedure>")` and triggers an auto-retry (see below).
+`timeout` is per call. On timeout the client throws `RPCError("TIMEOUT", "Timed out: <procedure>")` and triggers an auto-retry.
 
 ### `Client<T>`
 
@@ -189,26 +194,22 @@ idle → handshaking → ready
 
 When an RPC call fails (timeout or send error) on an established session, the client automatically retries once with a fresh handshake.
 
-```mermaid
-sequenceDiagram
-    participant C as api.foo("x")
-    participant S as Server
-
-    C->>S: sendRequest() → timeout (server died)
-    Note over C: epoch === sentEpoch? → YES<br/>→ reset() (zero keys, state → idle)
-    C->>S: ensureHandshake() → new handshake (epoch++)
-    S->>C: hello → reply → ready
-    C->>S: sendRequest() again → success
-    Note over C: api.foo() resolves
+```
+api.foo("x") → sendRequest() → timeout (server died)
+epoch === sentEpoch? → YES → reset() (zero keys, state → idle)
+ensureHandshake() → new handshake (epoch++)
+hello → reply → ready
+sendRequest() again → success
+api.foo() resolves
 ```
 
 ### Retry rules
 
 | Failure | Retried? |
-|---|---|
+|---------|----------|
 | `RemoteRPCError` (server returned an error) | No |
 | `destroy()` was called | No |
-| Local `RPCError("TIMEOUT" \| send error)` | Yes, exactly once |
+| Local `RPCError("TIMEOUT" | send error)` | Yes, exactly once |
 
 Concurrent calls coordinate via the epoch counter. Only the first failing call triggers `reset()`; subsequent calls notice the epoch advanced and share the new handshake. No infinite loops.
 
@@ -218,26 +219,20 @@ Concurrent calls coordinate via the epoch counter. Only the first failing call t
 
 The server accepts a new hello in `ready` state. This is what enables transparent recovery:
 
-```mermaid
-sequenceDiagram
-    participant Client as Client (ready)
-    participant Server as Server (ready)
+```
+Client (ready)                     Server (ready)
 
-    Note over Client,Server: Session dies (transport hiccup)
-
-    Note left of Client: reset() → idle
-
-    Client->>Server: new hello
-    Note right of Server: resetHandshake()<br/>state → waiting → pending
-    Server->>Client: reply
-    Note left of Client: state → ready
-    Client->>Server: retry RPC
-    Note right of Server: state → ready (confirmed)
-    Server->>Client: response
-    Note left of Client: call resolves
+reset() → idle
+        ── new hello ──►           resetHandshake()
+                                   state → waiting → pending
+        ◀── reply ────
+state → ready
+        ── retry RPC ──►          state → ready (confirmed)
+        ◀── response ──
+call resolves
 ```
 
-The epoch counter increments on each handshake. Stale responses from a dead session are silently dropped when their epoch doesn't match.
+The epoch counter increments on each handshake. Stale responses from a dead session are silently dropped when their epoch does not match.
 
 ---
 
@@ -278,18 +273,18 @@ class RemoteRPCError extends RPCError {}
 ### Standard local error codes
 
 | Code | Thrown when |
-|---|---|
+|------|-------------|
 | `TIMEOUT` | RPC call exceeded `timeout` ms |
 | `SESSION` | `destroy()` called or session closed |
 | `CLIENT` | Client-side guardrail tripped (e.g., `maxPending` exceeded) |
 | `HANDSHAKE` | Handshake failed or timed out, auth payload malformed |
 | `INPUT_VALIDATION` | `.input(schema)` rejected the input |
 | `OUTPUT_VALIDATION` | `.output(schema)` rejected the handler output |
-| `INVALID_DATA` | Wire-level data was rejected by `sanitize()` |
+| `INVALID_DATA` | Wire-level data rejected by `sanitize()` |
 | `INTERNAL` | Defensive — should not be reachable |
 | `MIDDLEWARE` | Middleware misuse (`next()` called twice, bad `extra` arg) |
 
-Handlers may throw `RPCError(...)` with any code they like — those codes become `RemoteRPCError.code` on the client.
+Handlers may throw `RPCError(...)` with any code — those codes become `RemoteRPCError.code` on the client.
 
 ### Pattern
 
@@ -302,7 +297,6 @@ try {
   } else if (err instanceof RPCError) {
     // local failure — TIMEOUT, SESSION, etc.
   } else {
-    // a thrown non-RPCError, surface it
     throw err;
   }
 }
@@ -374,13 +368,13 @@ import {
 } from "@dotex/erpc";
 ```
 
-| Helper | Signature | Returns |
-|---|---|---|
-| `createJWTClientAuth({ getToken })` | — | `{ sign }` — embeds JWT + timestamp in the hello auth payload |
-| `createEd25519ClientAuth({ privateKey, deviceId })` | WebCrypto Ed25519 | `{ sign }` |
-| `createECDSAClientAuth({ privateKey, identifier })` | WebCrypto ECDSA P-256 | `{ sign }` |
-| `generateEd25519Keypair()` | — | `{ privateKey: Uint8Array, publicKey: Uint8Array }` |
-| `generateECDSAKeypair()` | — | `{ privateKey: CryptoKey, publicKey: CryptoKey }` |
+| Helper | Returns |
+|--------|---------|
+| `createJWTClientAuth({ getToken })` | `{ sign }` — embeds JWT + timestamp in the hello auth payload |
+| `createEd25519ClientAuth({ privateKey, deviceId })` | `{ sign }` |
+| `createECDSAClientAuth({ privateKey, identifier })` | `{ sign }` |
+| `generateEd25519Keypair()` | `{ privateKey: Uint8Array, publicKey: Uint8Array }` |
+| `generateECDSAKeypair()` | `{ privateKey: CryptoKey, publicKey: CryptoKey }` |
 
 ### Server-side
 
@@ -395,11 +389,11 @@ import {
 ```
 
 | Helper | Use |
-|---|---|
-| `createJWTServerAuth({ verifyToken })` | Verifies the JWT carried by `createJWTClientAuth`. Returns `{ auth: { userId, ... } }` on success. |
-| `createEd25519ServerAuth({ getPublicKey })` | Verifies an Ed25519 signature against a device's public key. |
-| `createECDSAServerAuth({ getPublicKey })` | Verifies an ECDSA P-256 signature. |
-| `createCertificateServerAuth({ validateChain })` | Verifies a certificate chain + signature. |
+|--------|-----|
+| `createJWTServerAuth({ verifyToken })` | Verifies JWT from `createJWTClientAuth`. Returns `{ auth: { userId, ... } }`. |
+| `createEd25519ServerAuth({ getPublicKey })` | Verifies Ed25519 signature against a device's public key. |
+| `createECDSAServerAuth({ getPublicKey })` | Verifies ECDSA P-256 signature. |
+| `createCertificateServerAuth({ validateChain })` | Verifies certificate chain + signature. |
 | `createMultifactorServerAuth({ factors })` | Combines multiple verifiers; all must pass. |
 
 All return partial `AuthOptions` (`{ verify }` or `{ sign, verify }`).
@@ -417,7 +411,7 @@ import {
   MAX_MSG_BYTES,    // 1_048_576
   MAX_HELLO_BYTES,  // 65_536
   MAX_AUTH_BYTES,   // 32_768
-  HANDSHAKE_TIMEOUT, // 5000
+  HANDSHAKE_TIMEOUT,// 5000
   EMPTY_PSK,        // Uint8Array(32) of zeros
 } from "@dotex/erpc";
 ```
@@ -428,7 +422,7 @@ Exported for adapter authors. Application code does not normally need these.
 
 ## Cleanup
 
-Always call `destroy()` when you're done with a session.
+Always call `destroy()` when you are done with a session.
 
 ```typescript
 const { destroy: destroyServer } = server(router, channel, { auth });

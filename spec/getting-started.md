@@ -12,7 +12,7 @@ Peer dependency: a Zod-compatible schema library. eRPC uses `zod` for input/outp
 
 ## Define procedures
 
-A procedure has an input schema, an output schema, and a handler. Each one is a chain that ends in `.handler()`.
+A procedure has an input schema, an output schema, and a handler. Build one with `chain()`:
 
 ```typescript
 import { chain } from "@dotex/erpc";
@@ -30,11 +30,11 @@ const router = {
 };
 ```
 
-The router is a plain object — keys are procedure names, values are procedures. It's shared between server and client as a **type**. The client infers the entire API surface from `typeof router` without ever importing the runtime code.
+The router is a plain object — keys are procedure names, values are procedures. Share it between server and client as a **type**. The client infers the entire API surface from `typeof router` without ever importing the runtime code.
 
 ## Configure authentication
 
-eRPC requires at least one authentication method. Choose based on your deployment.
+eRPC requires at least one authentication method.
 
 ### PSK (shared secret)
 
@@ -111,7 +111,7 @@ const { api, destroy: destroyClient } = client<typeof router>(clientChannel, {
 });
 ```
 
-Construction is **synchronous**. The handshake is lazy — it runs on the first call, not when the client is created. This means no top-level `await`, which matters in edge runtimes.
+Construction is **synchronous**. The handshake is lazy — it runs on the first call, not when the client is created. No top-level `await`.
 
 ## Make calls
 
@@ -120,7 +120,7 @@ const result = await api.greet({ name: "World" });
 console.log(result.message); // "Hello, World!"
 ```
 
-That's all. Handshake, encryption, msgpack serialization, schema validation — handled. If the session drops, the client retries once with a fresh handshake. See [API: Auto-Retry](api.md).
+Handshake, encryption, msgpack serialization, schema validation — handled. If the session drops, the client retries once with a fresh handshake. See [API: Auto-Retry](api.md).
 
 ## End-to-end example
 
@@ -167,7 +167,7 @@ destroyServer();
 
 ## Middleware and context
 
-Middleware runs before the handler. It can extend the context that the handler sees. Chain middleware with `.use()`.
+Middleware runs before the handler. It can extend the context that the handler receives. Chain middleware with `.use()`:
 
 ```typescript
 import { chain, RPCError } from "@dotex/erpc";
@@ -190,7 +190,7 @@ const router = {
 };
 ```
 
-Set the base context on the server. The factory is called per request, so the context is always fresh, and verified auth data is passed through:
+Set the base context on the server. The factory is called per request, so the context is always fresh:
 
 ```typescript
 server(router, channel, {
@@ -202,12 +202,12 @@ server(router, channel, {
 });
 ```
 
-## Errors
+## Error handling
 
 Two error types:
 
 - `RPCError` — local failure (timeout, session lost, validation error, handshake failure)
-- `RemoteRPCError` — error returned from the remote peer (subclass of `RPCError`, carries `code`, `message`, `data`)
+- `RemoteRPCError` — error returned from the remote peer (carries `code`, `message`, `data`)
 
 ```typescript
 import { RPCError, RemoteRPCError } from "@dotex/erpc";
@@ -216,7 +216,7 @@ try {
   const result = await api.greet({ name: "World" });
 } catch (err) {
   if (err instanceof RemoteRPCError) {
-    // The remote peer threw — code/message/data come from there
+    // The remote peer threw
     if (err.code === "UNAUTHORIZED") await refreshCredentials();
   } else if (err instanceof RPCError) {
     // Local failure — timeout, network, handshake
@@ -227,13 +227,13 @@ try {
 }
 ```
 
-## When to pick which auth mode
+## Choosing an auth mode
 
 **PSK** when you control both endpoints — server-to-server, internal services, parent ↔ iframe of the same origin. Fast (no signature ops). Simple.
 
-**Asymmetric** when one side is untrusted or there is no shared secret — public web clients, mobile apps, IoT devices. Per-device revocation, no shared-secret distribution problem.
+**Asymmetric** when one side is untrusted or there is no shared secret — public web clients, mobile apps, IoT devices. Per-device revocation.
 
-**Both** when you want session binding *and* per-device identity — regulated environments, high-value systems, anything where one secret is one too few.
+**Both** when you want session binding *and* per-device identity — regulated environments, high-value systems.
 
 ## Next steps
 

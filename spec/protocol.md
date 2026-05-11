@@ -6,7 +6,7 @@ The reference implementation is TypeScript. This document is the contract; the c
 
 ## Goals and non-goals
 
-eRPC's design constraints, in order:
+Design constraints, in order:
 
 1. **Encrypted by default.** No "plaintext mode."
 2. **Lazy.** No work happens until the application makes a call. `client()` and `server()` return synchronously.
@@ -19,7 +19,7 @@ Non-goals: in-protocol streaming RPCs, multiplexing over a single channel, forma
 ## Primitives
 
 | Primitive | Algorithm | Notes |
-|---|---|---|
+|-----------|-----------|-------|
 | Key exchange | X25519 | 32-byte keys |
 | Symmetric encryption | XSalsa20-Poly1305 (AEAD) | 24-byte nonce, 32-byte key, 16-byte tag |
 | Hash | SHA-256 | — |
@@ -29,10 +29,10 @@ Non-goals: in-protocol streaming RPCs, multiplexing over a single channel, forma
 
 All wire numbers are network-byte-order (big-endian) unless explicitly noted.
 
-## Constants
+## Constant reference
 
 | Name | Value | Purpose |
-|---|---|---|
+|------|-------|---------|
 | `NONCE_LEN` | 24 | XSalsa20-Poly1305 nonce length (per encrypted message) |
 | `KEY_LEN` | 32 | Symmetric session key length, X25519 key length, **client hello nonce length** |
 | `TAG_HELLO` | `0x00` | First byte of a handshake frame |
@@ -106,7 +106,7 @@ A frame whose total length exceeds `MAX_MSG_BYTES` **must** be dropped. A frame 
 
 ## Handshake
 
-The handshake is one round-trip. It is initiated by the client. It is **lazy**: the client does not send anything until the application makes its first RPC call.
+The handshake is one round-trip initiated by the client. It is **lazy**: the client does not send anything until the application makes its first RPC call.
 
 ```mermaid
 sequenceDiagram
@@ -147,17 +147,15 @@ The client then sends:
 
 ### Step 2 — Server processes hello
 
-The server:
-
-1. Verifies the frame length and tag.
-2. Decodes msgpack, sanitizes the result (see Sanitization), checks shape.
-3. If `verify` is configured: requires `auth` to be present, builds the hello transcript from the received fields, calls `verify(auth, transcript)`. On failure, resets handshake state.
-4. Computes the ECDH shared secret: `raw = X25519(s_priv, c_pub)`.
-5. Calls `psk()` if configured. If `psk()` returns fewer than `KEY_LEN` bytes, fail the handshake. If `psk()` is not configured, use `EMPTY_PSK`.
-6. Derives the session key: `session_key = HKDF(SHA-256, IKM=raw, salt=psk, info=KDF_INFO, L=KEY_LEN)`.
-7. Zeroes `raw` and the PSK bytes.
-8. Computes the proof: `proof = HMAC-SHA-256(session_key, s_pub || c_pub || c_nonce)`.
-9. If `sign` is configured, builds the **reply transcript** and signs it:
+1. Verify frame length and tag.
+2. Decode msgpack, sanitize, check shape.
+3. If `verify` is configured: require `auth`, build hello transcript, call `verify(auth, transcript)`. On failure, reset handshake state.
+4. Compute ECDH shared secret: `raw = X25519(s_priv, c_pub)`.
+5. Call `psk()` if configured. If fewer than `KEY_LEN` bytes, fail. If not configured, use `EMPTY_PSK`.
+6. Derive session key: `session_key = HKDF(SHA-256, IKM=raw, salt=psk, info=KDF_INFO, L=KEY_LEN)`.
+7. Zero `raw` and PSK bytes.
+8. Compute proof: `proof = HMAC-SHA-256(session_key, s_pub || c_pub || c_nonce)`.
+9. If `sign` is configured, build **reply transcript** and sign it:
 
 ```
 reply_transcript :=
@@ -168,8 +166,8 @@ reply_transcript :=
     s_pub
 ```
 
-10. Sets encryptor/decryptor and transitions state to `pending`.
-11. Sends:
+10. Set encryptor/decryptor, transition state to `pending`.
+11. Send:
 
 ```
 0x00 || msgpack({ pub: s_pub, proof: proof, epoch: epoch, auth: signed? })
@@ -179,26 +177,24 @@ The server **does not** transition to `ready` yet. It does so on the first succe
 
 ### Step 3 — Client processes reply
 
-The client:
-
-1. Verifies the frame length and tag.
-2. Decodes msgpack, sanitizes, checks shape.
-3. Drops the frame silently if `reply.epoch !== this_epoch` (stale reply).
-4. If `verify` is configured: requires `auth`, builds the reply transcript, calls `verify(auth, transcript)`. On failure, resets handshake state.
-5. Computes the ECDH shared secret: `raw = X25519(c_priv, s_pub)`.
-6. Calls `psk()` if configured; otherwise uses `EMPTY_PSK`. Validates ≥ `KEY_LEN` bytes.
-7. Derives `session_key` with the same HKDF call as the server.
-8. Recomputes the expected proof: `expected = HMAC-SHA-256(session_key, s_pub || c_pub || c_nonce)`.
-9. Compares `expected` to `proof` in **constant time**. Mismatch ⇒ fail the handshake.
-10. Sets encryptor/decryptor, zeroes `expected` and intermediate buffers, transitions state to `ready`.
+1. Verify frame length and tag.
+2. Decode msgpack, sanitize, check shape.
+3. Silently drop if `reply.epoch !== this_epoch` (stale reply).
+4. If `verify` is configured: require `auth`, build reply transcript, call `verify(auth, transcript)`. On failure, reset handshake state.
+5. Compute ECDH shared secret: `raw = X25519(c_priv, s_pub)`.
+6. Call `psk()` if configured; otherwise use `EMPTY_PSK`. Validate ≥ `KEY_LEN` bytes.
+7. Derive `session_key` with the same HKDF call as the server.
+8. Recompute expected proof: `expected = HMAC-SHA-256(session_key, s_pub || c_pub || c_nonce)`.
+9. Compare `expected` to `proof` in **constant time**. Mismatch ⇒ fail.
+10. Set encryptor/decryptor, zero intermediate buffers, transition to `ready`.
 
 ### Step 4 — First encrypted message
 
-The client encrypts and sends its first RPC request. On the server, successful decryption of the first `TAG_MSG` is the implicit proof that the client knows the PSK (and therefore the session key), and the server transitions from `pending` to `ready`.
+The client encrypts and sends its first RPC request. On the server, successful decryption of the first `TAG_MSG` is the implicit proof that the client knows the PSK, and the server transitions from `pending` to `ready`.
 
 ### Re-handshake
 
-A server in **any** state that receives a `TAG_HELLO` resets its handshake state and processes the new hello as in Step 2. The client side does the same on reset (see State machines). This is how transparent recovery works: a dead session results in a new hello, the server resets, and the new session is established without any cooperation from the application layer.
+A server in **any** state that receives a `TAG_HELLO` resets its handshake state and processes the new hello. The client side does the same on reset. This is how transparent recovery works: a dead session triggers a new hello, the server resets, and the new session is established without application-layer coordination.
 
 ## Key derivation
 
@@ -212,9 +208,9 @@ session_key = HKDF(
 )
 ```
 
-The PSK is the **salt** parameter, not the IKM. This is deliberate: the salt parameter is what HKDF specifically allows callers to mix in for domain separation and authentication.
+The PSK is the **salt** parameter, not the IKM. This is deliberate: the salt parameter is what HKDF uses for domain separation and authentication.
 
-If both endpoints derive the same `psk` and the X25519 exchange is intact, both arrive at the same `session_key`. An attacker who runs the X25519 exchange but lacks the PSK derives a *different* key (because the salt differs) and the HMAC proof in step 9/10 fails.
+If both endpoints derive the same `psk` and the X25519 exchange is intact, both arrive at the same `session_key`. An attacker who runs the X25519 exchange but lacks the PSK derives a different key and the HMAC proof fails.
 
 ### `deriveSessionPSK` (helper)
 
@@ -230,7 +226,7 @@ deriveSessionPSK(sessionId, secret) := HKDF(
 )
 ```
 
-This is application-layer key shaping. The protocol does not require its use.
+The protocol does not require its use.
 
 ## Proof
 
@@ -243,7 +239,7 @@ proof = HMAC-SHA-256(
 
 The proof binds the session key to the specific ephemeral keys and nonce of this handshake. It is sent by the server in the reply and verified by the client in constant time.
 
-The proof does **not** include the epoch directly. Replay across epochs is prevented by the fact that fresh ephemeral keys produce a different `raw`, a different `session_key`, and therefore a different proof.
+The proof does **not** include the epoch directly. Replay across epochs is prevented because fresh ephemeral keys produce a different `raw`, a different `session_key`, and therefore a different proof.
 
 ## Encryption
 
@@ -268,7 +264,7 @@ plaintext   = XSalsa20-Poly1305-decrypt(session_key, nonce, ciphertext, AD=∅)
 message     = sanitize(msgpack_decode(plaintext))
 ```
 
-A 24-byte random nonce gives 192 bits of entropy; the birthday bound makes collisions negligible for any realistic message volume. eRPC does **not** use a counter; this trades slightly higher nonce size for a stateless encoder and tolerance for out-of-order or duplicated transport delivery.
+A 24-byte random nonce gives 192 bits of entropy; collisions are negligible for any realistic message volume. eRPC does **not** use a counter — this trades slightly higher nonce size for stateless encoding and tolerance for out-of-order or duplicated transport delivery.
 
 ## RPC message format
 
@@ -310,12 +306,12 @@ After decryption, an RPC message is a msgpack-encoded map. Two kinds.
 The error map's fields:
 
 | Field | Meaning |
-|---|---|
+|-------|---------|
 | `c` | Error code. Strings like `"INPUT_VALIDATION"`, `"NOT_FOUND"`, `"UNAUTHORIZED"`, or any application-defined string. |
 | `m` | Human-readable message. Untrusted from the receiver's perspective. |
 | `d` | Optional structured data, sanitized before transmission. |
 
-Messages with the wrong `t`, missing/empty `id`, missing/empty `p`, or any unexpected type **must** be dropped silently. The protocol has no provision for "bad message" responses — they would be useful only to an attacker enumerating implementation behavior.
+Messages with wrong `t`, missing/empty `id`, missing/empty `p`, or any unexpected type **must** be dropped silently. The protocol has no provision for "bad message" responses — they would be useful only to an attacker enumerating implementation behavior.
 
 ## State machines
 
@@ -375,13 +371,13 @@ eRPC applies a strict sanitization pass to every decoded msgpack value, both inb
 3. Any object whose prototype is neither `Object.prototype` nor `null`. This rejects `Date`, `Map`, `Set`, `ExtData`, and any host object that arrived through an unexpected codec path.
 4. Object keys equal to `"__proto__"`, `"constructor"`, or `"prototype"` are stripped during traversal.
 
-`Uint8Array` (msgpack `bin`) is preserved. `BigInt64` is decoded as JavaScript `BigInt`. Plain objects are rebuilt with `Object.create(null)` so prototype chains can't be re-poisoned downstream.
+`Uint8Array` (msgpack `bin`) is preserved. `BigInt64` is decoded as JavaScript `BigInt`. Plain objects are rebuilt with `Object.create(null)` so prototype chains cannot be re-poisoned downstream.
 
 A port to a language without prototype pollution should still:
 
-- Reject extension types it doesn't know about.
+- Reject extension types it does not know about.
 - Limit recursion depth.
-- Reject inputs whose structure doesn't match the expected shape.
+- Reject inputs whose structure does not match the expected shape.
 
 ## Authorization data flow
 
@@ -390,8 +386,6 @@ When `auth.verify` is configured on the server, the value it returns is the veri
 - Stores it on the server session.
 - Passes it as `{ auth: verified }` to the `context` factory on every request.
 - Discards it on any reset (timeout, new hello, destroy).
-
-Concretely:
 
 ```
 server.verify(hello.auth, hello_transcript)
@@ -410,7 +404,7 @@ Clients can also configure `verify`; on the client side the return value is unus
 ## Failure modes
 
 | Failure | Server response | Client response |
-|---|---|---|
+|---------|----------------|-----------------|
 | Bad frame tag | Drop silently | Drop silently |
 | Frame > max size | Drop silently | Drop silently |
 | msgpack decode error | Reset, `onError` | Fail handshake |
@@ -426,9 +420,9 @@ Clients can also configure `verify`; on the client side the return value is unus
 
 "Drop silently" is deliberate. Any feedback at the wire level would help an attacker probe the implementation.
 
-## Compatibility and versioning
+## Compatibility
 
-- The `auth` field on hello and reply is **optional**. Peers that don't understand it ignore it; peers that need it reject frames that lack it. PSK-only deployments stay wire-compatible with mutual-auth deployments as long as neither side has `verify` configured.
+- The `auth` field on hello and reply is **optional**. Peers that do not understand it ignore it; peers that need it reject frames that lack it. PSK-only deployments stay wire-compatible with mutual-auth deployments as long as neither side has `verify` configured.
 - The transcript magic strings (`erpc-hs-hello-v1`, `erpc-hs-reply-v1`) and `KDF_INFO` (`drpc-v1`) are version markers. Any change to transcripts, key derivation inputs, or framing **must** bump these strings — otherwise an attacker could mix and match versions in a downgrade attack.
 - New fields can be added to the request/response messages (`t: 1` and `t: 2` maps). Implementations **must** ignore unknown fields. They **must not** accept messages with wrong `t` or missing required fields.
 
