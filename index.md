@@ -16,7 +16,7 @@
 - [Wire Protocol](spec/protocol.md)
 -->
 
-Two peers, one shared secret. Define your API as typed procedures — every call is end-to-end encrypted. Do not rely on TLS or other transport layers.
+Just two peers talking securely. Define your API as typed procedures - every call is end-to-end encrypted. No TLS, no transport-layer trust. Either peer can serve and call on the same channel.
 
 ![eRPC](erpc.png)
 
