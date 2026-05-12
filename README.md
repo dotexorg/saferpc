@@ -2,10 +2,9 @@
 
 [![npm](https://img.shields.io/npm/v/@dotex/erpc.svg)](https://www.npmjs.com/package/@dotex/erpc)
 [![license](https://img.shields.io/npm/l/@dotex/erpc.svg)](./LICENSE)
+[![types](https://img.shields.io/badge/types-TypeScript-blue.svg)](https://www.typescriptlang.org/)
 
-![eRPC](erpc.png)
-
-**Encrypted, typed RPC over any bidirectional channel.** Two peers, one shared secret (or one keypair), every call end-to-end encrypted. WebSocket, postMessage, MessagePort, `chrome.runtime`, BroadcastChannel — if it can carry bytes, eRPC encrypts and types them.
+**Encrypted, typed RPC over any bidirectional channel.** Two peers, one shared secret (or one keypair), every call end-to-end encrypted with XSalsa20-Poly1305 AEAD. WebSocket, `postMessage`, `MessagePort`, `chrome.runtime`, `BroadcastChannel`, WebRTC — if it can carry bytes, eRPC encrypts and types them.
 
 Think tRPC, but transport-agnostic and encrypted by default.
 
@@ -13,22 +12,44 @@ Think tRPC, but transport-agnostic and encrypted by default.
 npm install @dotex/erpc
 ```
 
+![eRPC](erpc.png)
+
+---
+
 - **Full docs:** <https://dotex.org/epic/erpc>
-- **Getting Started:** [spec/getting-started.md](./spec/getting-started.md)
-- **API Reference:** [spec/api.md](./spec/api.md)
-- **Wire Protocol:** [spec/protocol.md](./spec/protocol.md)
-- **Security:** [spec/security.md](./spec/security.md)
-- **Integrations:** [spec/integrations.md](./spec/integrations.md)
+- [Quickstart](./spec/getting-started.md) · [API](./spec/api.md) · [Wire Protocol](./spec/protocol.md) · [Security](./spec/security.md) · [Transports](./spec/integrations.md)
 
-## What you get
+---
 
-- Type-safe procedures with Zod input/output validation
-- X25519 key exchange, XSalsa20-Poly1305 AEAD, forward secrecy
-- Lazy handshake on first call, transparent auto-retry on session drop
-- PSK, asymmetric (Ed25519 / ECDSA / JWT), or both for defense-in-depth
-- Synchronous `client()` / `server()` — works in Cloudflare Workers, Deno Deploy, Vercel Edge, Service Workers, React Native, Node.js, browsers
-- Zero dependencies beyond `@noble/*` crypto, `@msgpack/msgpack`, and `zod`
-- Pure ESM + CJS dual build, tree-shakeable
+## Why eRPC
+
+|  | tRPC | eRPC |
+|---|---|---|
+| **Transport** | HTTP (mostly) | Anything that carries bytes |
+| **Encryption** | TLS at the edge | End-to-end, every message |
+| **Roles** | Server / client | Peer / peer (either side can serve) |
+| **Edge runtimes** | Mostly | Yes (synchronous init, no top-level `await`) |
+| **Auth** | App-level (middleware) | Built into the handshake |
+
+eRPC is designed for the cases tRPC wasn't:
+
+- Browser extensions (content script ↔ background ↔ popup)
+- iframes embedding third-party code over `postMessage`
+- Workers and SharedWorkers over `MessagePort`
+- Edge-to-edge services over WebSocket
+- Tab coordination over `BroadcastChannel`
+- Peer-to-peer WebRTC data channels
+
+## Features
+
+- **Typed procedures** with Zod input/output validation
+- **End-to-end encryption** — X25519 ECDH, XSalsa20-Poly1305 AEAD, HKDF-SHA-256, forward secrecy
+- **Lazy handshake** on first call, transparent auto-retry on session drop
+- **Three auth modes** — PSK, asymmetric (Ed25519 / ECDSA / JWT / cert / multifactor), or both for defense-in-depth
+- **All built-in auth helpers are transcript-bound** — captured payloads cannot be replayed into a new handshake
+- **Synchronous** `client()` / `server()` — works in Node.js, browsers, Service Workers, React Native, Vercel Edge, Cloudflare Workers, Deno Deploy.
+- **Tiny surface** — `@noble/*` crypto, `@msgpack/msgpack`, `zod` and nothing else
+- **Pure ESM + CJS dual build**, side-effect-free, tree-shakeable
 
 ## Quick start
 
@@ -68,7 +89,7 @@ const { message } = await api.greet({ name: "World" });
 console.log(message); // "Hello, World!"
 ```
 
-The `client()` and `server()` calls are **synchronous** — no top-level `await`. The handshake happens lazily on the first procedure call. If the session drops, the next call retries once with a fresh handshake.
+`client()` and `server()` are **synchronous** — no top-level `await`. The handshake happens lazily on the first procedure call. If the session drops, the next call retries once with a fresh handshake.
 
 ## Channel — the only transport contract
 
@@ -79,9 +100,7 @@ interface Channel {
 }
 ```
 
-Anything that satisfies this can host an eRPC session. Adapters for WebSocket, postMessage, MessagePort, Chrome extension ports, BroadcastChannel, WebRTC, TCP, and SSE live in [spec/integrations.md](./spec/integrations.md).
-
-A minimal WebSocket adapter:
+Anything that satisfies this can host an eRPC session. A minimal WebSocket adapter:
 
 ```typescript
 function wsChannel(ws: WebSocket): Channel {
@@ -97,6 +116,8 @@ function wsChannel(ws: WebSocket): Channel {
   };
 }
 ```
+
+Ready-made adapters for WebSocket, postMessage, MessagePort, Chrome extension ports, BroadcastChannel, WebRTC, TCP, and SSE: [spec/integrations.md](./spec/integrations.md).
 
 ## Authentication
 
@@ -120,7 +141,7 @@ auth: {
 }
 ```
 
-Ready-made helpers ship for Ed25519, ECDSA P-256, and JWT bearer tokens. See [spec/security.md](./spec/security.md) for the threat model, transcript format, and the trade-offs between each mode.
+Ready-made helpers ship for Ed25519, ECDSA P-256, JWT, certificate-based, and multifactor auth. See [spec/security.md](./spec/security.md) for the threat model, transcript format, and the trade-offs between each mode.
 
 ## Errors
 
@@ -139,25 +160,6 @@ try {
   }
 }
 ```
-
-## Why eRPC
-
-| | tRPC | eRPC |
-|---|---|---|
-| Transport | HTTP (mostly) | Anything that carries bytes |
-| Encryption | TLS at the edge | End-to-end, every message |
-| Roles | Server / client | Peer / peer (either side can serve) |
-| Edge runtimes | Mostly | Yes (synchronous init, no top-level await) |
-| Auth | App-level (middleware) | Built into the handshake |
-
-eRPC is designed for the cases tRPC wasn't:
-
-- Browser extensions (content script ↔ background ↔ popup)
-- iframes embedding third-party code over `postMessage`
-- Workers and SharedWorkers over `MessagePort`
-- Edge-to-edge services over WebSocket
-- Tab coordination over `BroadcastChannel`
-- Peer-to-peer WebRTC data channels
 
 ## Package layout
 
@@ -185,10 +187,16 @@ import { chain, RPCError } from "@dotex/erpc/common";
 ## Compatibility
 
 - **Node.js** 18+
-- **Browsers** (modern, WebCrypto required for the WebCrypto-based auth helpers)
-- **Cloudflare Workers**, **Durable Objects**, **Deno Deploy**, **Vercel Edge**
+- **Modern browsers** (WebCrypto required only for the ECDSA/cert helpers)
 - **Service Workers**, **Web Workers**, **SharedWorkers**
 - **React Native**
+- **Vercel Edge**, **Cloudflare Workers**, **Deno Deploy**
+
+## Project status
+
+eRPC is at `0.x` and has a stable wire protocol (`drpc-v1` HKDF info, `erpc-hs-{hello,reply}-v1` transcript prefixes). Test coverage exists for handshake attacks, replay, tampering, type confusion, prototype pollution, middleware misuse, and DoS limits — see `test/security/`.
+
+A 1.0 release will lock the public API surface.
 
 ## License
 

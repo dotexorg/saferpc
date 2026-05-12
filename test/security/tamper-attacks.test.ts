@@ -7,7 +7,13 @@
  */
 import { describe, it, expect } from "vitest";
 import { randomBytes } from "@noble/ciphers/utils.js";
-import { chain, client, server, RPCError, type Router } from "../../src/index.ts";
+import {
+  chain,
+  client,
+  server,
+  RPCError,
+  type Router,
+} from "../../src/index.ts";
 import { createMitmChannelPair } from "../helpers/channels.ts";
 
 describe("security / tamper attacks", () => {
@@ -22,9 +28,9 @@ describe("security / tamper attacks", () => {
         return "pong";
       }),
     };
-    const srv = server(router, a, { psk });
+    const srv = server(router, a, { auth: { psk: () => psk } });
     const { api, destroy } = client(b, {
-      psk,
+      auth: { psk: () => psk },
       timeout: 400,
       handshakeTimeout: 800,
     });
@@ -72,9 +78,9 @@ describe("security / tamper attacks", () => {
         return "pong";
       }),
     };
-    const srv = server(router, a, { psk });
+    const srv = server(router, a, { auth: { psk: () => psk } });
     const { api, destroy } = client(b, {
-      psk,
+      auth: { psk: () => psk },
       timeout: 400,
       handshakeTimeout: 800,
     });
@@ -119,8 +125,8 @@ describe("security / tamper attacks", () => {
         return "pong";
       }),
     };
-    const srv = server(router, a, { psk, onError: (e) => errors.push(e) });
-    const { api, destroy } = client(b, { psk, timeout: 1000 });
+    const srv = server(router, a, { auth: { psk: () => psk }, onError: (e) => errors.push(e) });
+    const { api, destroy } = client(b, { auth: { psk: () => psk }, timeout: 1000 });
 
     try {
       expect(await api.ping({})).toBe("pong");
@@ -150,8 +156,8 @@ describe("security / tamper attacks", () => {
           new Promise<string>((r) => setTimeout(() => r("real"), 100)),
       ),
     };
-    const srv = server(router, a, { psk });
-    const { api, destroy } = client(b, { psk, timeout: 500 });
+    const srv = server(router, a, { auth: { psk: () => psk } });
+    const { api, destroy } = client(b, { auth: { psk: () => psk }, timeout: 500 });
     try {
       const slow = api.slow({});
       setTimeout(() => {

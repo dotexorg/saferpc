@@ -49,8 +49,7 @@ describe("mpEncode / mpDecode", () => {
     const codec = new ExtensionCodec();
     codec.register({
       type: 0x42,
-      encode: (v) =>
-        v instanceof Evil ? new Uint8Array([0xee]) : null,
+      encode: (v) => (v instanceof Evil ? new Uint8Array([0xee]) : null),
       decode: () => ({ malicious: true }),
     });
     const blob = rawEncode(new Evil(), { extensionCodec: codec });
@@ -59,6 +58,8 @@ describe("mpEncode / mpDecode", () => {
     // surfaces, and sanitize() rejects it as a non-plain object.
     expect(typeof decoded).toBe("object");
     expect(decoded).not.toBeNull();
-    expect((decoded as { constructor: { name: string } }).constructor.name).toBe("ExtData");
+    expect(
+      (decoded as { constructor: { name: string } }).constructor.name,
+    ).toBe("ExtData");
   });
 });

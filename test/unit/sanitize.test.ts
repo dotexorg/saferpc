@@ -36,7 +36,9 @@ describe("sanitize / arrays", () => {
     ];
     const out = sanitize(malicious) as Array<Record<string, unknown>>;
     expect(out[0]!.ok).toBe("yes");
-    expect(Object.prototype.hasOwnProperty.call(out[0], "__proto__")).toBe(false);
+    expect(Object.prototype.hasOwnProperty.call(out[0], "__proto__")).toBe(
+      false,
+    );
   });
 
   it("preserves array order and length", () => {
@@ -56,7 +58,9 @@ describe("sanitize / objects + prototype pollution", () => {
     expect(out.a).toBe(1);
     expect(Object.getPrototypeOf(out)).toBeNull();
     expect(Object.prototype.hasOwnProperty.call(out, "__proto__")).toBe(false);
-    expect(Object.prototype.hasOwnProperty.call(out, "constructor")).toBe(false);
+    expect(Object.prototype.hasOwnProperty.call(out, "constructor")).toBe(
+      false,
+    );
     expect(Object.prototype.hasOwnProperty.call(out, "prototype")).toBe(false);
   });
 

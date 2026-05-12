@@ -46,6 +46,8 @@ const sharedSecret = crypto.getRandomValues(new Uint8Array(32));
 const auth = { psk: () => sharedSecret };
 ```
 
+`psk()` may return the same `Uint8Array` across calls — eRPC reads it and never mutates the buffer. Lifecycle is yours: zero it yourself if and when the secret should disappear from memory.
+
 For better security, derive a fresh PSK from a per-session identifier:
 
 ```typescript
@@ -73,6 +75,25 @@ const auth = {
   },
 };
 ```
+
+Or use the built-in Ed25519 helpers:
+
+```typescript
+import {
+  createEd25519ClientAuth,
+  createEd25519ServerAuth,
+} from "@dotex/erpc";
+
+// Client
+const auth = createEd25519ClientAuth({ privateKey, deviceId: "device-123" });
+
+// Server
+const auth = createEd25519ServerAuth({
+  getPublicKey: async (deviceId) => loadDevicePub(deviceId),
+});
+```
+
+All built-in helpers (Ed25519, ECDSA, JWT, certificate, multifactor) bind their proof to the canonical handshake transcript automatically. See [Security: Built-in signature helpers](security.md#built-in-signature-helpers).
 
 ### Both (defense-in-depth)
 

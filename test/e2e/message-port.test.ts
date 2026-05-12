@@ -29,9 +29,9 @@ describe("message-port (worker_threads.MessageChannel)", () => {
         })),
     };
 
-    const srv = server(router, portChannel(port1 as never), { psk });
+    const srv = server(router, portChannel(port1 as never), { auth: { psk: () => psk } });
     const { api, destroy } = client(portChannel(port2 as never), {
-      psk,
+      auth: { psk: () => psk },
       timeout: 2000,
     });
     try {
@@ -54,9 +54,9 @@ describe("message-port (worker_threads.MessageChannel)", () => {
         return i.a + i.b;
       }),
     };
-    const srv = server(router, portChannel(port1 as never), { psk });
+    const srv = server(router, portChannel(port1 as never), { auth: { psk: () => psk } });
     const { api, destroy } = client(portChannel(port2 as never), {
-      psk,
+      auth: { psk: () => psk },
       timeout: 5000,
     });
     try {
@@ -74,9 +74,9 @@ describe("message-port (worker_threads.MessageChannel)", () => {
   it("rejects an unknown procedure with RemoteRPCError(NOT_FOUND)", async () => {
     const psk = randomBytes(32);
     const { port1, port2 } = new MessageChannel();
-    const srv = server({} as Router, portChannel(port1 as never), { psk });
+    const srv = server({} as Router, portChannel(port1 as never), { auth: { psk: () => psk } });
     const { api, destroy } = client(portChannel(port2 as never), {
-      psk,
+      auth: { psk: () => psk },
       timeout: 1000,
     });
     try {

@@ -28,11 +28,11 @@ describe("security / handshake attacks", () => {
     const router: Router = { ping: chain().handler(async () => "pong") };
     const errors: unknown[] = [];
     const srv = server(router, a, {
-      psk: randomBytes(32),
+      auth: { psk: () => randomBytes(32) },
       onError: (e) => errors.push(e),
     });
     const { api, destroy } = client(b, {
-      psk: randomBytes(32),
+      auth: { psk: () => randomBytes(32) },
       timeout: 800,
       handshakeTimeout: 400,
     });
@@ -60,7 +60,7 @@ describe("security / handshake attacks", () => {
     const srv = server(
       { ping: chain().handler(async () => "pong") } as Router,
       a,
-      { psk, onError: (e) => errors.push(e) },
+      { auth: { psk: () => psk }, onError: (e) => errors.push(e) },
     );
 
     const huge = new Uint8Array(1024);
@@ -79,7 +79,7 @@ describe("security / handshake attacks", () => {
     // Clear errors before testing legitimate client
     errors.length = 0;
 
-    const { api, destroy } = client(b, { psk, timeout: 1000 });
+    const { api, destroy } = client(b, { auth: { psk: () => psk }, timeout: 1000 });
     try {
       expect(await api.ping({})).toBe("pong");
     } finally {
@@ -95,7 +95,7 @@ describe("security / handshake attacks", () => {
     const srv = server(
       { ping: chain().handler(async () => "pong") } as Router,
       a,
-      { psk, onError: (e) => errors.push(e as RPCError) },
+      { auth: { psk: () => psk }, onError: (e) => errors.push(e as RPCError) },
     );
 
     const badPayload = mpEncode({
@@ -109,7 +109,7 @@ describe("security / handshake attacks", () => {
     expect(errors.length).toBeGreaterThanOrEqual(1);
     expect(errors[0]!.code).toBe("HANDSHAKE");
 
-    const { api, destroy } = client(b, { psk, timeout: 1000 });
+    const { api, destroy } = client(b, { auth: { psk: () => psk }, timeout: 1000 });
     try {
       expect(await api.ping({})).toBe("pong");
     } finally {
@@ -125,7 +125,7 @@ describe("security / handshake attacks", () => {
     const srv = server(
       { ping: chain().handler(async () => "pong") } as Router,
       a,
-      { psk, onError: (e) => errors.push(e as RPCError) },
+      { auth: { psk: () => psk }, onError: (e) => errors.push(e as RPCError) },
     );
 
     mitm.injectToA(
@@ -136,7 +136,7 @@ describe("security / handshake attacks", () => {
     expect(errors.length).toBeGreaterThanOrEqual(1);
     expect(errors[0]!.code).toBe("HANDSHAKE");
 
-    const { api, destroy } = client(b, { psk, timeout: 1000 });
+    const { api, destroy } = client(b, { auth: { psk: () => psk }, timeout: 1000 });
     try {
       expect(await api.ping({})).toBe("pong");
     } finally {
@@ -152,14 +152,14 @@ describe("security / handshake attacks", () => {
     const srv = server(
       { ping: chain().handler(async () => "pong") } as Router,
       a,
-      { psk, onError: (e) => errors.push(e) },
+      { auth: { psk: () => psk }, onError: (e) => errors.push(e) },
     );
     mitm.injectToA(new Uint8Array(0));
     mitm.injectToA(new Uint8Array(0));
     await new Promise((r) => setTimeout(r, 30));
     expect(errors.length).toBe(0);
 
-    const { api, destroy } = client(b, { psk, timeout: 1000 });
+    const { api, destroy } = client(b, { auth: { psk: () => psk }, timeout: 1000 });
     try {
       expect(await api.ping({})).toBe("pong");
     } finally {
@@ -175,7 +175,7 @@ describe("security / handshake attacks", () => {
     const srv = server(
       { ping: chain().handler(async () => "pong") } as Router,
       a,
-      { psk, onError: (e) => errors.push(e) },
+      { auth: { psk: () => psk }, onError: (e) => errors.push(e) },
     );
     for (const tag of [0x02, 0x10, 0xff]) {
       mitm.injectToA(new Uint8Array([tag, 1, 2, 3]));
@@ -183,7 +183,7 @@ describe("security / handshake attacks", () => {
     await new Promise((r) => setTimeout(r, 30));
     expect(errors.length).toBe(0);
 
-    const { api, destroy } = client(b, { psk, timeout: 1000 });
+    const { api, destroy } = client(b, { auth: { psk: () => psk }, timeout: 1000 });
     try {
       expect(await api.ping({})).toBe("pong");
     } finally {
@@ -198,14 +198,14 @@ describe("security / handshake attacks", () => {
     const router: Router = {
       ping: chain().handler(async ({ input }) => ({ echo: input })),
     };
-    const srv = server(router, a, { psk });
+    const srv = server(router, a, { auth: { psk: () => psk } });
 
-    const c1 = client(b, { psk, timeout: 1000 });
+    const c1 = client(b, { auth: { psk: () => psk }, timeout: 1000 });
     const r1 = (await c1.api.ping({ n: 1 })) as { echo: { n: number } };
     expect(r1.echo.n).toBe(1);
     c1.destroy();
 
-    const c2 = client(b, { psk, timeout: 1000 });
+    const c2 = client(b, { auth: { psk: () => psk }, timeout: 1000 });
     try {
       const r2 = (await c2.api.ping({ n: 2 })) as { echo: { n: number } };
       expect(r2.echo.n).toBe(2);

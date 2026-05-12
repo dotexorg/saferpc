@@ -188,7 +188,11 @@ export function portChannel(port: {
           typeof data === "object" &&
           (data as { buffer?: unknown }).buffer instanceof ArrayBuffer
         ) {
-          const v = data as { buffer: ArrayBuffer; byteOffset: number; byteLength: number };
+          const v = data as {
+            buffer: ArrayBuffer;
+            byteOffset: number;
+            byteLength: number;
+          };
           cb(new Uint8Array(v.buffer, v.byteOffset, v.byteLength));
         }
       };

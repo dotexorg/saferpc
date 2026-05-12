@@ -55,7 +55,9 @@ describe("computeProof", () => {
     const differs = (other: Uint8Array): boolean =>
       base.some((v, i) => v !== other[i]);
 
-    expect(differs(computeProof(randomBytes(32), sPub, cPub, nonce))).toBe(true);
+    expect(differs(computeProof(randomBytes(32), sPub, cPub, nonce))).toBe(
+      true,
+    );
     expect(differs(computeProof(sk, randomBytes(32), cPub, nonce))).toBe(true);
     expect(differs(computeProof(sk, sPub, randomBytes(32), nonce))).toBe(true);
     expect(differs(computeProof(sk, sPub, cPub, randomBytes(32)))).toBe(true);

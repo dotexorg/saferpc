@@ -30,15 +30,27 @@ describe("RPCError", () => {
   });
 
   it("rejects non-string code", () => {
-    expect(() => new RPCError(42 as unknown as string, "msg")).toThrow(TypeError);
-    expect(() => new RPCError(null as unknown as string, "msg")).toThrow(TypeError);
-    expect(() => new RPCError(undefined as unknown as string, "msg")).toThrow(TypeError);
+    expect(() => new RPCError(42 as unknown as string, "msg")).toThrow(
+      TypeError,
+    );
+    expect(() => new RPCError(null as unknown as string, "msg")).toThrow(
+      TypeError,
+    );
+    expect(() => new RPCError(undefined as unknown as string, "msg")).toThrow(
+      TypeError,
+    );
   });
 
   it("rejects non-string message", () => {
-    expect(() => new RPCError("CODE", 123 as unknown as string)).toThrow(TypeError);
-    expect(() => new RPCError("CODE", null as unknown as string)).toThrow(TypeError);
-    expect(() => new RPCError("CODE", { msg: "x" } as unknown as string)).toThrow(TypeError);
+    expect(() => new RPCError("CODE", 123 as unknown as string)).toThrow(
+      TypeError,
+    );
+    expect(() => new RPCError("CODE", null as unknown as string)).toThrow(
+      TypeError,
+    );
+    expect(
+      () => new RPCError("CODE", { msg: "x" } as unknown as string),
+    ).toThrow(TypeError);
   });
 });
 

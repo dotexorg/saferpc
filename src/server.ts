@@ -18,6 +18,9 @@ import {
   HANDSHAKE_TIMEOUT,
   zero,
   sanitize,
+  isPlainBytes,
+  isEmptyPsk,
+  toPlainBytes,
   mpEncode,
   mpDecode,
   deriveSessionKey,
@@ -35,8 +38,9 @@ import {
   type Router,
   type Channel,
   type AuthOptions,
-  type Authenticator,
 } from "./common.ts";
+
+const MAX_ID_LEN = 64;
 
 // ─── Server types ─────────────────────────────────────────
 
@@ -45,7 +49,7 @@ export interface ServerOptions {
    * Authentication configuration. At least one of `psk` OR asymmetric
    * auth (`sign`/`verify`) MUST be configured.
    */
-  auth?: AuthOptions;
+  auth: AuthOptions;
   /**
    * Factory called per-request to create context for handlers.
    * MUST NOT hang — there is no server-side per-request timeout
@@ -74,16 +78,7 @@ export interface ServerOptions {
    * waiting and accepts the next hello. Use this for logging/monitoring.
    */
   onError?: (err: unknown) => void;
-
-  // Backward compatibility - old API
-  /** @deprecated Use auth.psk instead */
-  psk?: Uint8Array;
-  /** @deprecated Use auth.sign/auth.verify instead */
-  authenticator?: Authenticator;
 }
-
-// Backward compatibility
-export type ServeOptions = ServerOptions;
 
 // ─── Pipeline executor ───────────────────────────────────
 
@@ -208,38 +203,8 @@ export function server<T extends Router>(
     throw new TypeError("channel.receive must be a function");
   }
 
-  // Handle backward compatibility - convert old API to new API
-  let auth: AuthOptions;
-  if (opts.auth) {
-    auth = opts.auth;
-  } else if (opts.psk || opts.authenticator) {
-    // Legacy API - convert to new format
-    auth = {};
-    if (opts.psk) {
-      // Validate PSK at construction time for legacy API compatibility
-      if (opts.psk.length < KEY_LEN) {
-        throw new TypeError(`PSK must be at least ${KEY_LEN} bytes`);
-      }
-      const pskBytes = opts.psk;
-      auth.psk = () => new Uint8Array(pskBytes);
-    }
-    if (opts.authenticator) {
-      const authenticator = opts.authenticator as Authenticator;
-      if (authenticator.produce) {
-        auth.sign = authenticator.produce;
-      }
-      if (authenticator.verify) {
-        auth.verify = authenticator.verify;
-      }
-    }
-  } else {
-    throw new TypeError(
-      "Either 'auth' or legacy 'psk'/'authenticator' options must be provided"
-    );
-  }
-  
-  // Validate the final auth configuration
-  validateAuthConfig(auth);
+  validateAuthConfig(opts.auth);
+  const auth = opts.auth;
 
   const frozen: Router = Object.freeze(
     Object.assign(Object.create(null) as Router, router),
@@ -248,6 +213,13 @@ export function server<T extends Router>(
     opts.handshakeTimeout !== undefined
       ? opts.handshakeTimeout
       : HANDSHAKE_TIMEOUT;
+  if (
+    typeof hsTimeout !== "number" ||
+    !Number.isFinite(hsTimeout) ||
+    hsTimeout < 100
+  ) {
+    throw new TypeError("server() handshakeTimeout must be ≥ 100 ms");
+  }
   const maxBytes =
     opts.maxMessageBytes !== undefined ? opts.maxMessageBytes : MAX_MSG_BYTES;
   const onError = opts.onError ?? null;
@@ -311,20 +283,23 @@ export function server<T extends Router>(
   }
 
   let unsubscribe: (() => void) | null = channel.receive(function onMessage(
-    data: Uint8Array,
+    raw: Uint8Array,
   ) {
-    if (destroyed || data.length === 0) return;
+    if (destroyed || raw.length === 0) return;
+    // Normalize so the inbound buffer is a plain Uint8Array; Node's
+    // `Buffer` propagates its subclass through `subarray()` into msgpack
+    // `bin` fields, which would defeat downstream `isPlainBytes` checks.
+    const data = toPlainBytes(raw);
     const tag = data[0];
 
-    // Accept hello in any active state. In "pending" or "ready",
-    // reset the current session first — the client is re-handshaking.
+    // Every hello — regardless of current state — is a new attempt.
+    // Reset unconditionally so the epoch is bumped even when a previous
+    // attempt is still suspended at an `await`; in-flight stale coroutines
+    // will detect the mismatch via the epoch guard and bail.
     if (tag === TAG_HELLO) {
       if (data.length > MAX_HELLO_BYTES) return;
 
-      // Reset any existing session for the new handshake attempt.
-      if (state === "pending" || state === "ready") {
-        resetHandshake();
-      }
+      resetHandshake();
 
       const myEpoch = epoch;
 
@@ -339,150 +314,183 @@ export function server<T extends Router>(
       }, hsTimeout);
 
       (async function handleHello() {
-        // Capture keys locally — safe against future code changes
-        // that might add an await before key usage.
-        const myPriv = privateKey;
-        const myPub = publicKey;
+        // Snapshot ephemeral keys by value. resetHandshake() may zero the
+        // live buffers in place while we await; owning a copy means our
+        // derivation is correct regardless of races.
+        const myPriv = privateKey.slice();
+        const myPub = publicKey.slice();
 
-        const raw = sanitize(mpDecode(data.subarray(1)));
-        if (typeof raw !== "object" || raw === null) {
-          throw new RPCError("HANDSHAKE", "Invalid hello");
-        }
-        const hello = raw as Record<string, unknown> as any; // @TODO
+        // Local accumulators — only published to module-level state under
+        // the FINAL epoch guard below. Cleaned up in finally on any exit.
+        let rawShared: Uint8Array | null = null;
+        let localSessionKey: Uint8Array | null = null;
+        let localProof: Uint8Array | null = null;
+        let localAuthData: Ctx | null = null;
+        let localServerAuth: Uint8Array | null = null;
 
-        const clientPub = hello.pub;
-        if (
-          !(clientPub instanceof Uint8Array) ||
-          clientPub.length !== KEY_LEN
-        ) {
-          throw new RPCError("HANDSHAKE", "Invalid public key");
-        }
+        try {
+          const raw = sanitize(mpDecode(data.subarray(1)));
+          if (typeof raw !== "object" || raw === null) {
+            throw new RPCError("HANDSHAKE", "Invalid hello");
+          }
+          const hello = raw as Record<string, unknown>;
 
-        const nonce = hello.nonce;
-        if (!(nonce instanceof Uint8Array) || nonce.length !== KEY_LEN) {
-          throw new RPCError("HANDSHAKE", "Invalid nonce");
-        }
+          const clientPub = hello["pub"];
+          if (!isPlainBytes(clientPub) || clientPub.length !== KEY_LEN) {
+            throw new RPCError("HANDSHAKE", "Invalid public key");
+          }
 
-        // Client epoch — echoed in reply so client can discard
-        // stale responses from previous handshake attempts.
-        const clientEpoch = typeof hello.epoch === "number" ? hello.epoch : 0;
+          const nonce = hello["nonce"];
+          if (!isPlainBytes(nonce) || nonce.length !== KEY_LEN) {
+            throw new RPCError("HANDSHAKE", "Invalid nonce");
+          }
 
-        // ── Client-side auth verification ─────────────────
-        // If `verify` is configured, the client MUST embed an `auth`
-        // payload bound to the canonical hello transcript. Reject
-        // the handshake otherwise — and reject if the payload fails
-        // verification — BEFORE deriving any session state, so a
-        // failed verification does not silently leak ECDH artifacts.
-        if (auth.verify !== undefined) {
-          const helloAuth = hello.auth;
-          if (!(helloAuth instanceof Uint8Array)) {
-            throw new RPCError(
-              "HANDSHAKE",
-              "auth.verify configured but hello.auth missing or invalid",
+          // Strict epoch validation on the wire. `encodeEpoch` enforces
+          // the same predicate inside transcript building, but PSK-only
+          // paths never reach it — validate here so every path is strict.
+          const clientEpoch = hello["epoch"];
+          if (
+            typeof clientEpoch !== "number" ||
+            !Number.isInteger(clientEpoch) ||
+            clientEpoch < 0 ||
+            clientEpoch > 0xffffffff
+          ) {
+            throw new RPCError("HANDSHAKE", "Invalid epoch");
+          }
+
+          // ── Client-side auth verification ─────────────────
+          // If `verify` is configured, the client MUST embed an `auth`
+          // payload bound to the canonical hello transcript. Reject the
+          // handshake otherwise — and reject if the payload fails
+          // verification — BEFORE deriving any session state, so a failed
+          // verification does not silently leak ECDH artifacts.
+          if (auth.verify !== undefined) {
+            const helloAuth = hello["auth"];
+            if (!isPlainBytes(helloAuth)) {
+              throw new RPCError(
+                "HANDSHAKE",
+                "auth.verify configured but hello.auth missing or invalid",
+              );
+            }
+            if (helloAuth.length === 0 || helloAuth.length > MAX_AUTH_BYTES) {
+              throw new RPCError("HANDSHAKE", "hello.auth size out of range");
+            }
+            const transcript = buildHelloTranscript(
+              clientEpoch,
+              clientPub,
+              nonce,
             );
-          }
-          if (helloAuth.length === 0 || helloAuth.length > MAX_AUTH_BYTES) {
-            throw new RPCError("HANDSHAKE", "hello.auth size out of range");
-          }
-          const transcript = buildHelloTranscript(
-            clientEpoch,
-            clientPub,
-            nonce,
-          );
-          const verifyResult = await auth.verify(helloAuth, transcript);
-          // Epoch guard: if a new hello arrived during await (client retry
-          // or DoS), this attempt is stale — abort silently.
-          if (epoch !== myEpoch || destroyed) return;
-          if (verifyResult && typeof verifyResult === "object") {
-            const a = (verifyResult as { auth?: unknown }).auth;
-            if (a !== undefined) {
-              if (typeof a !== "object" || a === null) {
-                throw new RPCError(
-                  "HANDSHAKE",
-                  "auth.verify result must be an object",
-                );
+            const verifyResult = await auth.verify(helloAuth, transcript);
+            if (epoch !== myEpoch || destroyed) return;
+            if (verifyResult && typeof verifyResult === "object") {
+              const a = (verifyResult as { auth?: unknown }).auth;
+              if (a !== undefined) {
+                if (typeof a !== "object" || a === null) {
+                  throw new RPCError(
+                    "HANDSHAKE",
+                    "auth.verify result must be an object",
+                  );
+                }
+                localAuthData = sanitize(a) as Ctx;
               }
-              authData = sanitize(a) as Ctx;
             }
           }
-        }
-        // If `verify` is not configured, hello.auth is ignored even
-        // if the client embedded one. This preserves backward
-        // compatibility with PSK-only deployments.
+          // If `verify` is not configured, hello.auth is ignored even
+          // if the client embedded one. This preserves backward
+          // compatibility with PSK-only deployments.
 
-        const rawShared = x25519.getSharedSecret(myPriv, clientPub);
-        // Get PSK or use empty PSK if not configured
-        const pskBytes = auth.psk !== undefined ? await auth.psk() : EMPTY_PSK;
-        if (pskBytes.length < KEY_LEN) {
-          throw new RPCError("HANDSHAKE", `PSK must be at least ${KEY_LEN} bytes`);
-        }
-        sessionKey = deriveSessionKey(rawShared, pskBytes);
-        zero(rawShared);
-        if (pskBytes !== EMPTY_PSK) zero(pskBytes);
+          rawShared = x25519.getSharedSecret(myPriv, clientPub);
+          // Private key no longer needed; zero our copy immediately.
+          zero(myPriv);
 
-        const proof = computeProof(sessionKey, myPub, clientPub, nonce);
+          const pskBytes =
+            auth.psk !== undefined ? await auth.psk() : EMPTY_PSK;
+          if (epoch !== myEpoch || destroyed) return;
 
-        // ── Server-side auth production ──────────────────
-        // If `sign` is configured, sign over the canonical
-        // reply transcript (which binds BOTH ephemeral pubs) so the
-        // client can authenticate the server beyond what PSK alone
-        // provides. Computed BEFORE state transition so a failure
-        // here cleanly resets the handshake.
-        let serverAuth: Uint8Array | null = null;
-        if (auth.sign !== undefined) {
-          const replyTranscript = buildReplyTranscript(
-            clientEpoch,
-            clientPub,
-            nonce,
-            myPub,
-          );
-          const signed = await auth.sign(replyTranscript);
-          if (epoch !== myEpoch || destroyed) {
-            // Epoch advanced during await — drop everything.
-            zero(proof);
-            return;
-          }
-          if (
-            !(signed instanceof Uint8Array) ||
-            signed.length === 0 ||
-            signed.length > MAX_AUTH_BYTES
-          ) {
-            zero(proof);
+          if (!(pskBytes instanceof Uint8Array) || pskBytes.length < KEY_LEN) {
             throw new RPCError(
               "HANDSHAKE",
-              "auth.sign returned invalid payload",
+              `PSK must be a Uint8Array of at least ${KEY_LEN} bytes`,
             );
           }
-          serverAuth = signed;
+          if (auth.psk !== undefined && isEmptyPsk(pskBytes)) {
+            throw new RPCError(
+              "HANDSHAKE",
+              "Application returned an all-zero PSK",
+            );
+          }
+
+          // The caller owns the PSK buffer's lifecycle — do NOT mutate it.
+          // A `() => sharedSecret` pattern would break on the next handshake.
+          localSessionKey = deriveSessionKey(rawShared, pskBytes);
+          localProof = computeProof(localSessionKey, myPub, clientPub, nonce);
+
+          // ── Server-side auth production ──────────────────
+          // If `sign` is configured, sign over the canonical reply
+          // transcript (which binds BOTH ephemeral pubs) so the client
+          // can authenticate the server beyond what PSK alone provides.
+          // Computed BEFORE state transition so a failure here cleanly
+          // resets the handshake.
+          if (auth.sign !== undefined) {
+            const replyTranscript = buildReplyTranscript(
+              clientEpoch,
+              clientPub,
+              nonce,
+              myPub,
+            );
+            const signed = await auth.sign(replyTranscript);
+            if (epoch !== myEpoch || destroyed) return;
+            if (
+              !(signed instanceof Uint8Array) ||
+              signed.length === 0 ||
+              signed.length > MAX_AUTH_BYTES
+            ) {
+              throw new RPCError(
+                "HANDSHAKE",
+                "auth.sign returned invalid payload",
+              );
+            }
+            localServerAuth = signed;
+          }
+
+          // FINAL epoch guard. The block below is fully synchronous, so the
+          // module-level publishes (sessionKey, encrypt, decrypt, authData,
+          // state) cannot race against an incoming hello.
+          if (epoch !== myEpoch || destroyed) return;
+
+          sessionKey = localSessionKey;
+          localSessionKey = null; // ownership transferred — skip finally zero
+          encrypt = createEncryptor(sessionKey);
+          decrypt = createDecryptor(sessionKey);
+          authData = localAuthData;
+          state = "pending";
+
+          const replyMsg: Record<string, unknown> = {
+            pub: myPub,
+            proof: localProof,
+            epoch: clientEpoch,
+          };
+          if (localServerAuth !== null) replyMsg["auth"] = localServerAuth;
+
+          const replyPayload = mpEncode(replyMsg);
+          const reply = concatBytes(new Uint8Array([TAG_HELLO]), replyPayload);
+          zero(replyPayload);
+          zero(localProof);
+          localProof = null;
+
+          await channel.send(reply);
+          if (epoch !== myEpoch || destroyed) return;
+
+          // Timer continues running — waiting for first valid TAG_MSG
+          // to transition pending → ready. Total budget = hsTimeout.
+        } finally {
+          if (rawShared !== null) zero(rawShared);
+          if (localSessionKey !== null) zero(localSessionKey);
+          if (localProof !== null) zero(localProof);
+          // myPriv may already be zeroed (after ECDH); harmless to repeat.
+          zero(myPriv);
+          zero(myPub);
         }
-
-        // Set encrypt/decrypt BEFORE sending reply so synchronous
-        // transports (e.g. MessageChannel) can process the client's
-        // first TAG_MSG that arrives during channel.send().
-        // State → "pending": accept TAG_MSG but session not confirmed.
-        encrypt = createEncryptor(sessionKey);
-        decrypt = createDecryptor(sessionKey);
-        state = "pending";
-
-        const replyMsg: Record<string, unknown> = {
-          pub: myPub,
-          proof,
-          epoch: clientEpoch,
-        };
-        if (serverAuth !== null) replyMsg["auth"] = serverAuth;
-
-        const replyPayload = mpEncode(replyMsg);
-        const reply = concatBytes(new Uint8Array([TAG_HELLO]), replyPayload);
-        zero(replyPayload);
-        zero(proof);
-        await channel.send(reply);
-
-        // Epoch guard: if a new hello arrived during await (client retry),
-        // this attempt is stale — abort silently.
-        if (epoch !== myEpoch || destroyed) return;
-
-        // Timer continues running — waiting for first valid TAG_MSG
-        // to transition pending → ready. Total budget = hsTimeout.
       })().catch(function onHsError(err: unknown) {
         if (epoch !== myEpoch || destroyed) return;
         resetHandshake();
@@ -521,41 +529,58 @@ export function server<T extends Router>(
         }
 
         if (typeof raw !== "object" || raw === null) return;
-        const msg = raw as Record<string, unknown> as any; // @TODO
+        const msg = raw as Record<string, unknown>;
 
-        if (msg.t !== 1) return;
-        if (typeof msg.id !== "string" || (msg.id as string).length === 0) {
+        if (msg["t"] !== 1) return;
+        const rawId = msg["id"];
+        if (
+          typeof rawId !== "string" ||
+          rawId.length === 0 ||
+          rawId.length > MAX_ID_LEN
+        ) {
           return;
         }
-        if (typeof msg.p !== "string" || (msg.p as string).length === 0) {
+        const rawProc = msg["p"];
+        if (typeof rawProc !== "string" || rawProc.length === 0) {
           return;
         }
 
-        const id = msg.id as string;
-        const procedure = msg.p as string;
+        const id = rawId;
+        const procedure = rawProc;
         let res: Record<string, unknown>;
 
         try {
           if (!(procedure in frozen)) {
-            throw new RPCError("NOT_FOUND", "Unknown: " + procedure);
+            // Do NOT echo the attacker-controlled procedure name on the
+            // wire — keep it in onError-only data for debuggability.
+            throw new RPCError("NOT_FOUND", "Procedure not found", {
+              procedure,
+            });
           }
           const proc = frozen[procedure]!;
           // Snapshot auth data at request time so re-handshake mid-flight
           // does not race against an in-flight handler. The session is
           // bound to one handshake; if it resets, the response is dropped
           // by the epoch guard below.
-          const ctxArg = 
-            authData !== null ? { auth: authData } : {};
+          const ctxArg = authData !== null ? { auth: authData } : {};
           let ctx: Ctx;
           if (opts.context !== undefined) {
             ctx = await opts.context(ctxArg);
-          } else if ('auth' in ctxArg && ctxArg.auth !== undefined) {
+          } else if ("auth" in ctxArg && ctxArg.auth !== undefined) {
             ctx = Object.assign(Object.create(null), ctxArg.auth);
           } else {
             ctx = Object.create(null);
           }
-          const result = await execute(proc._steps, proc._handler, ctx, msg.i);
-          res = { t: 2, id, ok: true, d: result, e: null };
+          const result = await execute(
+            proc._steps,
+            proc._handler,
+            ctx,
+            msg["i"],
+          );
+          // Sanitise handler output before encoding. Catches accidental
+          // `Date`/`Map`/`Set`/host-object returns at a place where the
+          // error becomes a typed `INVALID_DATA`, not an opaque `INTERNAL`.
+          res = { t: 2, id, ok: true, d: sanitize(result), e: null };
         } catch (err: unknown) {
           if (err instanceof RPCError) {
             res = {

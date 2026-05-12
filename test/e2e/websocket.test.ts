@@ -25,12 +25,16 @@ interface ServerHandle {
   stop: () => Promise<void>;
 }
 
-function startServer(router: Router, psk: Uint8Array, port: number): ServerHandle {
+function startServer(
+  router: Router,
+  psk: Uint8Array,
+  port: number,
+): ServerHandle {
   const wss = new WebSocketServer({ host: "127.0.0.1", port });
   const sessions: Array<{ destroy: () => void }> = [];
   wss.on("connection", (sock: WebSocket) => {
     const ch = wsChannel(sock as never);
-    const s = server(router, ch, { psk });
+    const s = server(router, ch, { auth: { psk: () => psk } });
     sessions.push(s);
     sock.on("close", () => s.destroy());
   });
@@ -58,7 +62,7 @@ function connectClient(
     const sock = new WebSocket(url);
     sock.on("open", () => {
       const { api, destroy } = client(wsChannel(sock as never), {
-        psk,
+        auth: { psk: () => psk },
         ...opts,
       });
       resolve({

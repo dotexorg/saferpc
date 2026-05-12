@@ -41,9 +41,9 @@ describe("security / msgpack ext type rejection at the codec layer", () => {
     });
     const blob = rawEncode(new Evil(), { extensionCodec: codec });
     const decoded = mpDecode(blob);
-    expect((decoded as { constructor: { name: string } }).constructor.name).toBe(
-      "ExtData",
-    );
+    expect(
+      (decoded as { constructor: { name: string } }).constructor.name,
+    ).toBe("ExtData");
   });
 });
 
@@ -61,7 +61,7 @@ describe("security / type confusion in a live session", () => {
       }),
     };
     const srv = server(router, a, {
-      psk,
+      auth: { psk: () => psk },
       onError: (e) => errors.push(e),
     });
 

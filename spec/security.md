@@ -1,6 +1,6 @@
 # Security
 
-eRPC treats the transport as hostile. Everything below describes what that means, what eRPC actually guarantees, and how to configure auth so those guarantees hold.
+eRPC treats the transport as hostile. This page covers what that means, what eRPC actually guarantees, how to configure auth so those guarantees hold, and what is *not* covered. Wire-level mechanics (frame layout, handshake steps, state machines, key derivation) live in [Protocol](protocol.md).
 
 ## Threat model
 
@@ -11,9 +11,11 @@ The transport channel is **untrusted**. The attacker may:
 - Replay captured messages
 - Drop or reorder messages
 
-eRPC does **not** protect against denial of service. If the attacker drops every byte, communication is impossible. There is no fix for that at this layer.
+eRPC does **not** protect against:
 
-eRPC also does not protect against a compromised endpoint. If the attacker runs code on either side, encryption is irrelevant.
+- **Denial of service.** If the attacker drops every byte, communication is impossible. No fix at this layer.
+- **Compromised endpoints.** If the attacker runs code on either side, encryption is irrelevant.
+- **Timing side channels in your handlers.** eRPC's own comparisons are constant-time; your handler code is not unless you write it that way.
 
 ## Security properties
 
@@ -29,12 +31,13 @@ eRPC also does not protect against a compromised endpoint. If the attacker runs 
 | Replay within a session | Random 24-byte nonces per message (probabilistic) |
 | Stale responses | Epoch counter echoed in reply |
 | Prototype pollution | `sanitize()` strips `__proto__`, `constructor`, `prototype` |
-| Type confusion | msgpack extension types disabled (including Timestamp) |
+| Type confusion | msgpack extension types disabled (including Timestamp); inbound `bin` fields require exact `Uint8Array` prototype |
 | Memory hygiene | Ephemeral keys zeroed on reset/destroy |
+| Plaintext lifetime | Returned `Uint8Array` fields alias the encrypted payload (msgpack `bin` is zero-copy); copy them out if you need to zero them yourself |
 
 ## Authentication modes
 
-Three modes. At least one of `psk` or asymmetric auth (`sign` / `verify`) must be configured. Neither configured is a hard error — the handshake would be unauthenticated and an active MITM could impersonate either peer.
+At least one of `psk` or asymmetric auth (`sign` / `verify`) must be configured. Neither configured is a hard error at construction time — the handshake would be unauthenticated and an active MITM could impersonate either peer.
 
 ### PSK only
 
@@ -47,6 +50,8 @@ auth: {
 ```
 
 Use when both endpoints are controlled by the same entity, secrets can be rotated, and individual revocation is not required. PSK is cheap — no signature operations on the hot path.
+
+> The PSK buffer's lifecycle belongs to the caller. eRPC reads it during HKDF and never mutates it. Returning the same `Uint8Array` from `psk()` across handshakes is safe; if you want it zeroed, zero it yourself when the secret is no longer needed.
 
 ### Asymmetric only
 
@@ -79,7 +84,7 @@ auth: {
 
 Use when you want session binding *and* identity proof. An attacker must now compromise two independent things — the derivation secret and the device key — and still cannot read past sessions because of forward secrecy.
 
-### PSK vs asymmetric comparison
+### Comparison
 
 | Property | Session-derived PSK | Asymmetric |
 |----------|-------------------|------------|
@@ -91,137 +96,50 @@ Use when you want session binding *and* identity proof. An attacker must now com
 | Cost | Low (HMAC only) | Higher (signature ops) |
 | Complexity | Simple | More moving parts |
 
-Forward secrecy comes from the ephemeral X25519 exchange in both modes. Even if a long-term secret leaks, past session ciphertexts remain unreadable — the ephemeral private keys were zeroed when the session ended.
+Forward secrecy comes from the ephemeral X25519 exchange in either mode. Even if a long-term secret leaks, past session ciphertexts remain unreadable — the ephemeral private keys were zeroed when the session ended.
 
-## Handshake
+## Transcript format
 
-Lazy. The client starts the handshake on the first RPC call, not at construction. Three phases.
-
-```mermaid
-sequenceDiagram
-    participant Client as Client (idle)
-    participant Server as Server (waiting)
-
-    Note over Client: api.foo() — lazy trigger
-
-    Client->>Server: Phase 1: Hello<br/>[0x00, { pub, nonce, epoch, auth? }]
-    Note left of Client: handshaking
-    Note right of Server: verify auth (if configured)<br/>pending
-
-    Server->>Client: Phase 2: Reply<br/>[0x00, { pub, proof, epoch, auth? }]
-    Note left of Client: verify proof + auth<br/>derive session key<br/>ready
-
-    Client->>Server: Phase 3: First encrypted RPC<br/>[0x01, encrypted payload]
-    Note right of Server: ready (confirmed)
-
-    Server->>Client: Encrypted response<br/>[0x01, encrypted payload]
-    Note left of Client: api.foo() resolves
-```
-
-1. **Hello.** Client sends ephemeral public key, a fresh 32-byte nonce, an epoch counter, and (if signing) a signature over the hello transcript.
-2. **Reply.** Server verifies any client auth, runs ECDH, derives the session key with the PSK as HKDF salt, and sends back its public key plus an HMAC proof and (if signing) a signature over the reply transcript.
-3. **First RPC.** Client verifies the reply, derives the same session key, and sends its first encrypted call. The server transitions to `ready` only when this first message decrypts cleanly — successful decryption is the client's implicit proof.
-
-The server can accept a new hello even in `ready` state. That is the re-handshake path: when a client times out and resets, it sends a fresh hello, the server resets its session state, and a new key is negotiated transparently.
-
-### Auth processing order
-
-Auth runs **before** any session keys are materialized. Failed verification never leaks ECDH artifacts.
-
-**Server (on hello):**
-
-1. Parse the hello frame.
-2. If `verify` is configured: extract `auth` payload, build hello transcript, call `verify(payload, transcript)`. Store returned `auth` data for the session.
-3. Compute X25519 shared secret.
-4. Call `psk()` (or use empty PSK) and derive session key.
-5. If `sign` is configured: sign reply transcript and embed result.
-6. Send reply with HMAC proof.
-
-**Client (on reply):**
-
-1. Parse the reply frame.
-2. If `verify` is configured: extract `auth`, build reply transcript, call `verify(payload, transcript)`.
-3. Compute shared secret, derive session key.
-4. Verify HMAC proof in constant time.
-5. Transition to `ready`.
-
-A throw at any step rejects the handshake. The client resets to `idle`; the server resets to `waiting`. Failed verifications never silently downgrade.
-
-### Transcript format
-
-Signatures sign over canonical transcripts built by eRPC, not user data. Two domains:
+Signatures are taken over canonical byte strings built by eRPC. There are two, with domain-separated magic prefixes so a hello signature can never be replayed as a reply (or vice versa).
 
 ```
 HELLO transcript:
-  "erpc-hs-hello-v1\0"   (17 bytes, magic prefix)
+  "erpc-hs-hello-v1\0"   (17 bytes)
   epoch                  (4 bytes, big-endian uint32)
   client_pub             (32 bytes, X25519)
   client_nonce           (32 bytes)
 
 REPLY transcript:
-  "erpc-hs-reply-v1\0"   (17 bytes, magic prefix)
+  "erpc-hs-reply-v1\0"   (17 bytes)
   epoch                  (4 bytes, big-endian uint32)
   client_pub             (32 bytes)
   client_nonce           (32 bytes)
   server_pub             (32 bytes)
 ```
 
-The two prefixes plus the epoch plus the per-handshake nonce defeat:
+These prefixes plus the epoch plus the per-handshake nonce defeat:
 
 - Replay across direction (hello vs. reply use different prefixes)
 - Replay across handshake attempts (epoch differs each time)
 - Substitution attacks (an active MITM cannot swap either ephemeral public key without invalidating the signature)
 
-## State machines
+For the full wire layout of the frames that carry these signatures, see [Protocol § Frame format](protocol.md#frame-format).
 
-### Server
+## Auth processing order
 
-```
-waiting --> pending : hello received + auth verified
-pending --> ready   : 1st valid TAG_MSG
-pending --> waiting : timeout / error / auth failure
-ready   --> waiting : new hello (client re-handshaking)
-waiting --> waiting : new hello
-```
+Auth runs **before** any session key is materialized. Failed verification never leaks ECDH artifacts. See [Protocol § Handshake](protocol.md#handshake) for the step-by-step details.
 
-The server survives failures. Bad PSK, bad signature, timeout — it resets to `waiting` and accepts the next hello. Only an explicit `destroy()` is permanent.
+A throw at any auth step rejects the handshake. The client resets to `idle`; the server resets to `waiting`. Failed verifications never silently downgrade.
 
-### Client
-
-```
-idle        --> handshaking : api call / hello sent
-handshaking --> ready       : server reply OK + auth verified
-handshaking --> idle        : hs timeout / hs error / auth failure
-ready       --> idle        : timeout / send error (auto-reset, epoch check)
-```
-
-The client resets on session failure and retries once on the next call. See [API: Auto-Retry](api.md).
-
-## Key management
-
-### Session key derivation
-
-```
-session_key = HKDF(
-  hash  = SHA-256,
-  ikm   = X25519(local_priv, remote_pub),
-  salt  = psk_or_EMPTY_PSK,
-  info  = KDF_INFO,           // "drpc-v1"
-  L     = KEY_LEN,            // 32
-)
-```
-
-The PSK is the **salt** parameter, not the IKM. This is deliberate: the salt parameter is what HKDF uses for domain separation and authentication. An attacker who runs the X25519 exchange but lacks the PSK derives a different key and the HMAC proof fails.
-
-### Safe PSK patterns
+## Safe vs unsafe PSK patterns
 
 ```typescript
-// Static PSK from a secrets vault — server-to-server
+// ✅ Static PSK from a secrets vault — server-to-server
 auth: {
   psk: async () => await vault.getSecret("erpc-server-key"),
 }
 
-// Session-derived from an authenticated token + device secret
+// ✅ Session-derived from an authenticated token + device secret
 auth: {
   psk: async () => deriveSessionPSK(
     await getValidatedSession(),
@@ -229,7 +147,7 @@ auth: {
   ),
 }
 
-// Time-bucketed rotation
+// ✅ Time-bucketed rotation
 auth: {
   psk: () => deriveSessionPSK(
     String(Math.floor(Date.now() / 3_600_000)), // hourly bucket
@@ -238,8 +156,6 @@ auth: {
 }
 ```
 
-### Unsafe PSK patterns
-
 ```typescript
 // ❌ Hard-coded constant — leaks the moment your bundle leaks
 auth: { psk: () => new TextEncoder().encode("secret123") }
@@ -247,7 +163,10 @@ auth: { psk: () => new TextEncoder().encode("secret123") }
 // ❌ Predictable session ID — attacker just guesses it
 auth: { psk: () => deriveSessionPSK("user-123", secret) }
 
-// ❌ All-zero or weak derivation material — no security at all
+// ❌ All-zero or weak derivation material — no security at all.
+// eRPC refuses an all-zero PSK at runtime: `HANDSHAKE` is thrown with
+// "Application returned an all-zero PSK" so this mistake fails loudly
+// instead of silently degrading into the asymmetric-only mode.
 auth: { psk: () => deriveSessionPSK(sessionId, new Uint8Array(32)) }
 
 // ❌ Secret material in client-side bundle
@@ -260,7 +179,7 @@ The common pattern in the unsafe list: the attacker can reproduce the derivation
 
 ## Built-in signature helpers
 
-eRPC ships ready-made helpers for common cases.
+eRPC ships ready-made helpers for common cases. Every helper binds its proof to the handshake transcript that eRPC passes in.
 
 ```typescript
 import {
@@ -270,6 +189,8 @@ import {
   createECDSAServerAuth,
   createJWTClientAuth,
   createJWTServerAuth,
+  createCertificateServerAuth,
+  createMultifactorServerAuth,
   generateEd25519Keypair,
   generateECDSAKeypair,
 } from "@dotex/erpc";
@@ -278,10 +199,8 @@ import {
 ### Ed25519 (recommended)
 
 ```typescript
-import { createEd25519ClientAuth, createEd25519ServerAuth } from "@dotex/erpc";
-
 const clientAuth = createEd25519ClientAuth({
-  privateKey: devicePrivateKey,
+  privateKey: devicePrivateKey,     // 32-byte secret key
   deviceId: "device-123",
 });
 
@@ -291,18 +210,17 @@ const serverAuth = createEd25519ServerAuth({
 
 // Client
 auth: { ...clientAuth }
-
 // Server
 auth: { ...serverAuth }
 ```
 
+Uses `@noble/curves` so it works in every JS runtime — no dependency on WebCrypto Ed25519 (which is not uniformly available across browsers).
+
 ### ECDSA P-256 (WebCrypto)
 
 ```typescript
-import { createECDSAClientAuth, createECDSAServerAuth } from "@dotex/erpc";
-
 const clientAuth = createECDSAClientAuth({
-  privateKey: ecdsaPrivateKey,
+  privateKey: ecdsaPrivateKey,      // CryptoKey (can be non-extractable)
   identifier: "device-123",
 });
 
@@ -311,11 +229,11 @@ const serverAuth = createECDSAServerAuth({
 });
 ```
 
-### JWT (bearer-style, client-side credential)
+Use this when you want the private key to be non-extractable. Pair `generateECDSAKeypair()` with platform key stores.
+
+### JWT (bearer token, transcript-bound)
 
 ```typescript
-import { createJWTClientAuth, createJWTServerAuth } from "@dotex/erpc";
-
 const clientAuth = createJWTClientAuth({
   getToken: () => localStorage.getItem("jwt"),
 });
@@ -325,10 +243,38 @@ const serverAuth = createJWTServerAuth({
     const payload = await validateJWT(jwt);
     return { userId: payload.sub, permissions: payload.permissions };
   },
+  maxAge: 30_000,
 });
 ```
 
-JWTs are not cryptographic proofs over the transcript — they are bearer tokens transported inside the auth payload. A leaked JWT lets the attacker authenticate until expiry. Combine with PSK for transcript binding when this matters.
+The JWT helper does **not** sign the transcript — JWTs are bearer tokens. Instead, the client embeds `{ jwt, ts, th = SHA-256(transcript) }` in the auth payload, and the server validates the JWT, the timestamp (symmetric `maxAge` skew, so future-dated forgeries are rejected too), and the transcript digest in constant time. A captured payload can only be replayed within a handshake that produces the same transcript, which means the attacker cannot mount a new handshake with their own ephemeral key.
+
+A leaked JWT still lets the attacker authenticate as long as the token is valid. Combine with PSK or a real signature mode when this matters.
+
+### Certificate-based
+
+```typescript
+const serverAuth = createCertificateServerAuth({
+  verifyCertificate: async (certBytes) => {
+    return { subject, publicKey }; // your chain verification
+  },
+});
+```
+
+The client embeds `{ cert, sig }` where `sig` is an ECDSA P-256 signature over the transcript using the cert's key.
+
+### Multifactor
+
+Compose two verifiers. Both must pass.
+
+```typescript
+const serverAuth = createMultifactorServerAuth({
+  primary: createEd25519ServerAuth({ getPublicKey: ... }),
+  secondary: createJWTServerAuth({ verifyToken: ... }),
+});
+```
+
+The client embeds `{ primary, secondary }` — two pre-encoded sub-payloads.
 
 ## Replay within a session
 
@@ -368,27 +314,6 @@ auth: {
 }
 ```
 
-## Wire-level frames
-
-Two tags:
-
-- `0x00` — handshake frame (hello or reply)
-- `0x01` — encrypted RPC message
-
-Hello (client → server):
-
-```
-{ pub: Uint8Array, nonce: Uint8Array, epoch: number, auth?: Uint8Array }
-```
-
-Reply (server → client):
-
-```
-{ pub: Uint8Array, proof: Uint8Array, epoch: number, auth?: Uint8Array }
-```
-
-The optional `auth` field carries the signature payload. Peers without `verify` ignore incoming `auth`. Peers with `verify` reject frames lacking it. PSK-only deployments do not need to know `auth` exists.
-
 ## Constants and limits
 
 | Constant | Value | Notes |
@@ -396,8 +321,8 @@ The optional `auth` field carries the signature payload. Peers without `verify` 
 | `NONCE_LEN` | 24 | XSalsa20-Poly1305 per-message nonce |
 | `KEY_LEN` | 32 | Symmetric key, X25519 pub/priv, and the client hello nonce |
 | `MAX_HELLO_BYTES` | 65,536 | Sized for typical signature payloads |
-| `MAX_AUTH_BYTES` | 32,768 | Hard cap on `auth` payload |
+| `MAX_AUTH_BYTES` | 32,768 | Hard cap on `auth` payload inside a hello/reply |
 | `MAX_MSG_BYTES` | 1,048,576 | Per encrypted RPC frame (configurable) |
 | `HANDSHAKE_TIMEOUT` | 5,000 ms | Default |
 | PSK minimum | 32 bytes | Validated when `psk()` returns |
-| Encryption nonce | 24 bytes | Random, XSalsa20-Poly1305 |
+| Encryption nonce | 24 bytes | Random per message |

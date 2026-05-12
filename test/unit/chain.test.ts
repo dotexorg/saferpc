@@ -21,10 +21,18 @@ describe("chain / handler", () => {
   });
 
   it("rejects non-function handler", () => {
-    expect(() => chain().handler("nope" as unknown as () => Promise<unknown>)).toThrow(TypeError);
-    expect(() => chain().handler(null as unknown as () => Promise<unknown>)).toThrow(TypeError);
-    expect(() => chain().handler(undefined as unknown as () => Promise<unknown>)).toThrow(TypeError);
-    expect(() => chain().handler(42 as unknown as () => Promise<unknown>)).toThrow(TypeError);
+    expect(() =>
+      chain().handler("nope" as unknown as () => Promise<unknown>),
+    ).toThrow(TypeError);
+    expect(() =>
+      chain().handler(null as unknown as () => Promise<unknown>),
+    ).toThrow(TypeError);
+    expect(() =>
+      chain().handler(undefined as unknown as () => Promise<unknown>),
+    ).toThrow(TypeError);
+    expect(() =>
+      chain().handler(42 as unknown as () => Promise<unknown>),
+    ).toThrow(TypeError);
   });
 });
 
@@ -49,7 +57,9 @@ describe("chain / use (middleware)", () => {
   });
 
   it("rejects non-function use()", () => {
-    expect(() => chain().use("not a fn" as unknown as never)).toThrow(TypeError);
+    expect(() => chain().use("not a fn" as unknown as never)).toThrow(
+      TypeError,
+    );
     expect(() => chain().use(null as unknown as never)).toThrow(TypeError);
     expect(() => chain().use(undefined as unknown as never)).toThrow(TypeError);
   });
@@ -67,11 +77,19 @@ describe("chain / input + output schemas", () => {
   });
 
   it("rejects non-Zod schemas", () => {
-    expect(() => chain().input(null as unknown as z.ZodType)).toThrow(TypeError);
-    expect(() => chain().input(undefined as unknown as z.ZodType)).toThrow(TypeError);
+    expect(() => chain().input(null as unknown as z.ZodType)).toThrow(
+      TypeError,
+    );
+    expect(() => chain().input(undefined as unknown as z.ZodType)).toThrow(
+      TypeError,
+    );
     expect(() => chain().input({} as unknown as z.ZodType)).toThrow(TypeError);
-    expect(() => chain().input("nope" as unknown as z.ZodType)).toThrow(TypeError);
-    expect(() => chain().output(null as unknown as z.ZodType)).toThrow(TypeError);
+    expect(() => chain().input("nope" as unknown as z.ZodType)).toThrow(
+      TypeError,
+    );
+    expect(() => chain().output(null as unknown as z.ZodType)).toThrow(
+      TypeError,
+    );
     expect(() => chain().output({} as unknown as z.ZodType)).toThrow(TypeError);
   });
 });

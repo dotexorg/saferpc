@@ -41,7 +41,12 @@ export const HANDSHAKE_TIMEOUT = 5_000;
  */
 export const MAX_AUTH_BYTES = 32_768;
 
-const MAX_DEPTH = 32;
+/**
+ * Maximum recursion depth `sanitize()` will follow. Exposed so adapter
+ * authors that emit deeply-nested payloads can size their data against
+ * the protocol's hard limit.
+ */
+export const MAX_DEPTH = 32;
 const KDF_INFO = new TextEncoder().encode("drpc-v1");
 
 /**
@@ -77,6 +82,58 @@ SAFE_CODEC.register({
 export function zero(buf: Uint8Array | ArrayBuffer): void {
   const view = buf instanceof ArrayBuffer ? new Uint8Array(buf) : buf;
   view.fill(0);
+}
+
+/** Constant-time equality for byte arrays. Independent of input contents. */
+export function constTimeEqual(a: Uint8Array, b: Uint8Array): boolean {
+  if (a.length !== b.length) return false;
+  let d = 0;
+  for (let i = 0; i < a.length; i++) {
+    d |= a[i]! ^ b[i]!;
+  }
+  return d === 0;
+}
+
+/**
+ * Tight type guard for wire-decoded byte fields. `instanceof Uint8Array`
+ * accepts every subclass; this guard requires the exact `Uint8Array`
+ * prototype so a custom subclass with overridden methods cannot smuggle
+ * behavior past the protocol layer. Inbound frames are normalized via
+ * `toPlainBytes()` at the channel boundary so msgpack-decoded `bin`
+ * fields are always plain Uint8Arrays by the time they reach this guard.
+ * Use on values that originated on the wire.
+ */
+export function isPlainBytes(v: unknown): v is Uint8Array {
+  return (
+    v instanceof Uint8Array && Object.getPrototypeOf(v) === Uint8Array.prototype
+  );
+}
+
+/**
+ * Normalize an inbound buffer to a plain `Uint8Array`. Node's `Buffer`
+ * extends `Uint8Array` and its `subarray()` returns another `Buffer`;
+ * msgpack's `bin` decoder propagates that subclass into decoded fields,
+ * which would defeat `isPlainBytes()`. Wrapping at the boundary creates
+ * a plain `Uint8Array` view (zero byte copy) so all internal code can
+ * trust that `bin` values have the canonical prototype.
+ */
+export function toPlainBytes(v: Uint8Array): Uint8Array {
+  if (Object.getPrototypeOf(v) === Uint8Array.prototype) return v;
+  return new Uint8Array(v.buffer, v.byteOffset, v.byteLength);
+}
+
+/**
+ * Constant-time check that a buffer is the protocol's "no PSK" sentinel:
+ * 32 zero bytes. Returns false for any other length. eRPC's internal flow
+ * uses `EMPTY_PSK` as the HKDF salt when `auth.psk` is absent — but if a
+ * user-provided `psk()` returns 32 zeros (e.g. `new Uint8Array(32)`), the
+ * resulting session has no PSK authentication. Refuse it at runtime.
+ */
+export function isEmptyPsk(buf: Uint8Array): boolean {
+  if (buf.length !== KEY_LEN) return false;
+  let acc = 0;
+  for (let i = 0; i < buf.length; i++) acc |= buf[i]!;
+  return acc === 0;
 }
 
 const POISON = new Set(["__proto__", "constructor", "prototype"]);
@@ -138,10 +195,9 @@ export function computeProof(
   clientPub: Uint8Array,
   nonce: Uint8Array,
 ): Uint8Array {
+  // The concatenated buffer contains only public values; nothing to zero.
   const msg = concatBytes(serverPub, clientPub, nonce);
-  const result = hmac(sha256, sessionKey, msg);
-  zero(msg);
-  return result;
+  return hmac(sha256, sessionKey, msg);
 }
 
 /**
@@ -205,7 +261,7 @@ export function createDecryptor(sessionKey: Uint8Array) {
 // ─── Handshake transcript ────────────────────────────────
 //
 // The transcript is the canonical byte string the application's
-// authenticator signs (on `produce`) and verifies (on `verify`).
+// auth signs (via `auth.sign`) and verifies (via `auth.verify`).
 //
 // Two transcripts:
 //   HELLO  — what the client commits to before knowing the server's pub
@@ -277,12 +333,12 @@ export function buildReplyTranscript(
   );
 }
 
-// ─── PSK / Authenticator config validation ───────────────
+// ─── Auth config validation ──────────────────────────────
 
 /**
  * Empty salt used in HKDF when no PSK is configured. HKDF with an
  * all-zero salt is well-defined per RFC 5869 and provides no
- * authentication on its own — pair with `Authenticator` to get
+ * authentication on its own — pair with `sign`/`verify` to get
  * a usable session.
  */
 export const EMPTY_PSK: Uint8Array = new Uint8Array(KEY_LEN);
@@ -313,19 +369,6 @@ export function validateAuthConfig(auth: AuthOptions): void {
       "At least one of `auth.psk` or asymmetric auth (`auth.sign`/`auth.verify`) must be configured. " +
         "An eRPC handshake with neither would be unauthenticated.",
     );
-  }
-}
-
-/**
- * Validate PSK bytes (backward compatibility helper)
- * @deprecated Use auth.psk function instead
- */
-export function validatePSK(psk: Uint8Array): void {
-  if (!(psk instanceof Uint8Array)) {
-    throw new TypeError("PSK must be a Uint8Array");
-  }
-  if (psk.length < KEY_LEN) {
-    throw new TypeError(`PSK must be at least ${KEY_LEN} bytes`);
   }
 }
 
@@ -441,16 +484,6 @@ export interface AuthOptions {
     transcript: Uint8Array,
   ) => VerifyResult | Promise<VerifyResult>;
 }
-
-// Backward compatibility
-export type AuthVerifyResult = VerifyResult;
-export type Authenticator = {
-  produce?: (transcript: Uint8Array) => Uint8Array | Promise<Uint8Array>;
-  verify?: (
-    payload: Uint8Array,
-    transcript: Uint8Array,
-  ) => AuthVerifyResult | Promise<AuthVerifyResult>;
-};
 
 // ─── Chain builder ────────────────────────────────────────
 

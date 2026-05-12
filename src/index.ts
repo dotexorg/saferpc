@@ -7,6 +7,7 @@ export {
   MAX_MSG_BYTES,
   MAX_HELLO_BYTES,
   MAX_AUTH_BYTES,
+  MAX_DEPTH,
   HANDSHAKE_TIMEOUT,
   // Crypto re-exports
   x25519,
@@ -14,6 +15,10 @@ export {
   // Security utilities
   zero,
   sanitize,
+  constTimeEqual,
+  isPlainBytes,
+  isEmptyPsk,
+  toPlainBytes,
   // Msgpack
   mpEncode,
   mpDecode,
@@ -28,7 +33,6 @@ export {
   createDecryptor,
   // Auth config
   validateAuthConfig,
-  validatePSK,
   EMPTY_PSK,
   // Error
   RPCError,
@@ -45,9 +49,6 @@ export {
   type Chain,
   type AuthOptions,
   type VerifyResult,
-  // Backward compatibility
-  type Authenticator,
-  type AuthVerifyResult,
 } from "./common.ts";
 
 export {

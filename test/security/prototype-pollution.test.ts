@@ -27,8 +27,8 @@ describe("security / prototype pollution via inputs", () => {
         return "ok";
       }),
     };
-    const srv = server(router, a, { psk });
-    const { api, destroy } = client(b, { psk, timeout: 1000 });
+    const srv = server(router, a, { auth: { psk: () => psk } });
+    const { api, destroy } = client(b, { auth: { psk: () => psk }, timeout: 1000 });
     try {
       const payload = mpDecode(
         mpEncode({ a: 1, __proto__: { polluted: "yes" } }),
@@ -37,11 +37,13 @@ describe("security / prototype pollution via inputs", () => {
 
       await api.sink(payload);
 
-      expect((Object.prototype as Record<string, unknown>).polluted).toBe(before);
+      expect((Object.prototype as Record<string, unknown>).polluted).toBe(
+        before,
+      );
       expect(received).not.toBeNull();
-      expect(
-        Object.prototype.hasOwnProperty.call(received, "__proto__"),
-      ).toBe(false);
+      expect(Object.prototype.hasOwnProperty.call(received, "__proto__")).toBe(
+        false,
+      );
       expect((received as { a: number }).a).toBe(1);
     } finally {
       destroy();
@@ -60,8 +62,8 @@ describe("security / prototype pollution via inputs", () => {
         return "ok";
       }),
     };
-    const srv = server(router, a, { psk });
-    const { api, destroy } = client(b, { psk, timeout: 1000 });
+    const srv = server(router, a, { auth: { psk: () => psk } });
+    const { api, destroy } = client(b, { auth: { psk: () => psk }, timeout: 1000 });
     try {
       const payload = mpDecode(
         mpEncode({
@@ -76,7 +78,9 @@ describe("security / prototype pollution via inputs", () => {
 
       expect(received).not.toBeNull();
       const r = received as unknown as Record<string, unknown>;
-      expect(Object.prototype.hasOwnProperty.call(r, "constructor")).toBe(false);
+      expect(Object.prototype.hasOwnProperty.call(r, "constructor")).toBe(
+        false,
+      );
       expect(Object.prototype.hasOwnProperty.call(r, "prototype")).toBe(false);
       expect(
         Object.prototype.hasOwnProperty.call(
@@ -107,8 +111,8 @@ describe("security / prototype pollution via outputs", () => {
         mpDecode(mpEncode({ ok: true, __proto__: { stolen: "yes" } })),
       ),
     };
-    const srv = server(router, a, { psk });
-    const { api, destroy } = client(b, { psk, timeout: 1000 });
+    const srv = server(router, a, { auth: { psk: () => psk } });
+    const { api, destroy } = client(b, { auth: { psk: () => psk }, timeout: 1000 });
     try {
       const before = (Object.prototype as Record<string, unknown>).stolen;
       const result = (await api.poison({})) as Record<string, unknown>;

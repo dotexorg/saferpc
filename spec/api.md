@@ -85,7 +85,7 @@ Subscribes to `channel` and serves the given router. Returns synchronously.
 
 | Field | Type | Default | Required |
 |-------|------|---------|----------|
-| `auth` | `AuthOptions` | — | ✅ (or legacy `psk` / `authenticator`) |
+| `auth` | `AuthOptions` | — | ✅ |
 | `context` | `(ctx: { auth?: Ctx }) => Ctx \| Promise<Ctx>` | — | — |
 | `handshakeTimeout` | `number` (ms) | `5000` | — |
 | `maxMessageBytes` | `number` | `1_048_576` | — |
@@ -120,10 +120,6 @@ At least one of `psk` or asymmetric (`sign` / `verify`) must be set. Configuring
 
 Returned `auth` data is sanitized (poison keys stripped) before being passed to `context`.
 
-### Legacy options
-
-`psk: Uint8Array` and `authenticator: { produce?, verify? }` are accepted for backwards compatibility and converted to `auth` internally. Use `auth` in new code.
-
 ### Server lifecycle
 
 ```
@@ -155,7 +151,7 @@ Returns synchronously. The handshake is lazy: it starts on the first `api` call.
 
 | Field | Type | Default | Required |
 |-------|------|---------|----------|
-| `auth` | `AuthOptions` | — | ✅ (or legacy `psk` / `authenticator`) |
+| `auth` | `AuthOptions` | — | ✅ |
 | `timeout` | `number` (ms) | `10_000` | — |
 | `maxPending` | `number` | `256` | — |
 | `handshakeTimeout` | `number` (ms) | `5000` | — |
@@ -192,47 +188,11 @@ idle → handshaking → ready
 
 ## Auto-retry
 
-When an RPC call fails (timeout or send error) on an established session, the client automatically retries once with a fresh handshake.
+When an call fails on a `ready` session with a local `TIMEOUT` or send error, the client zeros its session key, returns to `idle`, runs a fresh handshake, and resends the request **exactly once**. `RemoteRPCError` (server returned an error) is **not** retried — the server is alive. Concurrent failures share one re-handshake via an epoch counter; no infinite loops. Full state-machine and wire-level semantics in [Protocol § Auto-retry semantics](protocol.md#auto-retry-semantics).
 
-```
-api.foo("x") → sendRequest() → timeout (server died)
-epoch === sentEpoch? → YES → reset() (zero keys, state → idle)
-ensureHandshake() → new handshake (epoch++)
-hello → reply → ready
-sendRequest() again → success
-api.foo() resolves
-```
+## Replay within a session
 
-### Retry rules
-
-| Failure | Retried? |
-|---------|----------|
-| `RemoteRPCError` (server returned an error) | No |
-| `destroy()` was called | No |
-| Local `RPCError("TIMEOUT" | send error)` | Yes, exactly once |
-
-Concurrent calls coordinate via the epoch counter. Only the first failing call triggers `reset()`; subsequent calls notice the epoch advanced and share the new handshake. No infinite loops.
-
----
-
-## Re-handshake
-
-The server accepts a new hello in `ready` state. This is what enables transparent recovery:
-
-```
-Client (ready)                     Server (ready)
-
-reset() → idle
-        ── new hello ──►           resetHandshake()
-                                   state → waiting → pending
-        ◀── reply ────
-state → ready
-        ── retry RPC ──►          state → ready (confirmed)
-        ◀── response ──
-call resolves
-```
-
-The epoch counter increments on each handshake. Stale responses from a dead session are silently dropped when their epoch does not match.
+Per-message AEAD nonces are random; an attacker who can inject into a live channel can replay a captured ciphertext and the receiver will execute it again. For non-idempotent procedures, add an application-level idempotency key inside `input`, or maintain a request-ID set on the server keyed by the verified principal. Full discussion in [Security § Replay within a session](security.md#replay-within-a-session).
 
 ---
 
@@ -252,6 +212,8 @@ The only transport contract. `receive` returns an unsubscribe function. The chan
 - Allow `send` and `receive` to run concurrently
 
 It is **allowed** to drop messages, duplicate them, or reorder them — eRPC will time out and retry. Ready-made adapters live in [Integrations](integrations.md).
+
+> Within a single eRPC session the protocol assumes the `TAG_HELLO` reply arrives before any `TAG_MSG` sent under the resulting session key. Transports that may reorder *across* the hello/reply boundary (multi-path links, fan-out buses) will hang the handshake until the timeout fires. `TAG_MSG`-to-`TAG_MSG` reordering remains safe because every encrypted frame is independently authenticated and the protocol has no ordering requirement on application messages.
 
 ---
 
@@ -354,7 +316,7 @@ Use to bind each handshake to a session identifier instead of holding a single s
 
 ## Built-in auth helpers
 
-All return partial `AuthOptions` you can spread into the `auth` block.
+Every helper returns a partial `AuthOptions` you can spread into the `auth` block. All bind their proof to the canonical handshake transcript so a captured payload cannot be replayed into a new handshake.
 
 ### Client-side
 
@@ -368,13 +330,13 @@ import {
 } from "@dotex/erpc";
 ```
 
-| Helper | Returns |
-|--------|---------|
-| `createJWTClientAuth({ getToken })` | `{ sign }` — embeds JWT + timestamp in the hello auth payload |
-| `createEd25519ClientAuth({ privateKey, deviceId })` | `{ sign }` |
-| `createECDSAClientAuth({ privateKey, identifier })` | `{ sign }` |
-| `generateEd25519Keypair()` | `{ privateKey: Uint8Array, publicKey: Uint8Array }` |
-| `generateECDSAKeypair()` | `{ privateKey: CryptoKey, publicKey: CryptoKey }` |
+| Helper | Returns | Notes |
+|--------|---------|-------|
+| `createJWTClientAuth({ getToken })` | `{ sign }` | Embeds `{ jwt, ts, th }` where `th` is `SHA-256(transcript)`. |
+| `createEd25519ClientAuth({ privateKey, deviceId })` | `{ sign }` | Signs the transcript via `@noble/curves` (no WebCrypto needed). |
+| `createECDSAClientAuth({ privateKey, identifier })` | `{ sign }` | WebCrypto P-256, `privateKey` is a `CryptoKey`. |
+| `generateEd25519Keypair()` | `{ privateKey: Uint8Array, publicKey: Uint8Array }` | Pure JS, works everywhere. |
+| `generateECDSAKeypair()` | `{ privateKey: CryptoKey, publicKey: CryptoKey }` | Non-extractable. |
 
 ### Server-side
 
@@ -390,13 +352,13 @@ import {
 
 | Helper | Use |
 |--------|-----|
-| `createJWTServerAuth({ verifyToken })` | Verifies JWT from `createJWTClientAuth`. Returns `{ auth: { userId, ... } }`. |
-| `createEd25519ServerAuth({ getPublicKey })` | Verifies Ed25519 signature against a device's public key. |
-| `createECDSAServerAuth({ getPublicKey })` | Verifies ECDSA P-256 signature. |
-| `createCertificateServerAuth({ validateChain })` | Verifies certificate chain + signature. |
-| `createMultifactorServerAuth({ factors })` | Combines multiple verifiers; all must pass. |
+| `createJWTServerAuth({ verifyToken, maxAge? })` | Verifies JWT + timestamp (symmetric skew check) + transcript digest. Returns the `verifyToken` result as `auth`. |
+| `createEd25519ServerAuth({ getPublicKey, validateDevice? })` | Verifies Ed25519 signature against a device's 32-byte public key. |
+| `createECDSAServerAuth({ getPublicKey, validateEntity? })` | Verifies ECDSA P-256 signature via WebCrypto. |
+| `createCertificateServerAuth({ verifyCertificate, validateSubject? })` | Verifies a presented certificate chain + ECDSA P-256 signature. |
+| `createMultifactorServerAuth({ primary, secondary, combineAuth? })` | Composes two verifiers; both must pass. |
 
-All return partial `AuthOptions` (`{ verify }` or `{ sign, verify }`).
+All decode auth payloads through the hardened msgpack codec (ext types rejected, prototype-pollution keys stripped, depth-limited). Returned `auth` data is sanitized before reaching `context`.
 
 ---
 
@@ -411,8 +373,12 @@ import {
   MAX_MSG_BYTES,    // 1_048_576
   MAX_HELLO_BYTES,  // 65_536
   MAX_AUTH_BYTES,   // 32_768
+  MAX_DEPTH,        // 32 — max `sanitize()` recursion depth
   HANDSHAKE_TIMEOUT,// 5000
-  EMPTY_PSK,        // Uint8Array(32) of zeros
+  EMPTY_PSK,        // Uint8Array(32) of zeros — internal "no PSK" sentinel
+  // Type guards
+  isPlainBytes,     // exact-prototype Uint8Array check for wire data
+  isEmptyPsk,       // constant-time check for the 32-zero PSK sentinel
 } from "@dotex/erpc";
 ```
 
@@ -445,10 +411,10 @@ After `destroy()`:
 
 Both `server()` and `client()` return **synchronously**. No top-level `await`. Pure JavaScript dependencies. Compatible with:
 
-- Cloudflare Workers / Durable Objects
-- Deno Deploy
-- Vercel Edge Functions
-- Service Workers
-- React Native
 - Node.js 18+
 - Modern browsers
+- Service Workers
+- React Native
+- Vercel Edge Functions
+- Cloudflare Workers / Durable Objects
+- Deno Deploy

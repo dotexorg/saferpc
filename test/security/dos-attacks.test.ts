@@ -33,12 +33,12 @@ describe("security / DoS — framing limits", () => {
       }),
     };
     const srv = server(router, a, {
-      psk,
+      auth: { psk: () => psk },
       maxMessageBytes: 1024,
       onError: (e) => errors.push(e),
     });
 
-    const { api, destroy } = client(b, { psk, timeout: 1000 });
+    const { api, destroy } = client(b, { auth: { psk: () => psk }, timeout: 1000 });
     try {
       expect(await api.ping({})).toBe("pong");
       expect(invocations).toBe(1);
@@ -67,9 +67,9 @@ describe("security / DoS — client backpressure", () => {
           new Promise<string>((r) => setTimeout(() => r("done"), 200)),
       ),
     };
-    const srv = server(router, a, { psk });
+    const srv = server(router, a, { auth: { psk: () => psk } });
     const { api, destroy } = client(b, {
-      psk,
+      auth: { psk: () => psk },
       timeout: 5000,
       maxPending: 4,
     });
@@ -104,8 +104,8 @@ describe("security / DoS — depth bomb input", () => {
     const router: Router = {
       sink: chain().handler(async ({ input }) => input),
     };
-    const srv = server(router, a, { psk });
-    const { api, destroy } = client(b, { psk, timeout: 1500 });
+    const srv = server(router, a, { auth: { psk: () => psk } });
+    const { api, destroy } = client(b, { auth: { psk: () => psk }, timeout: 1500 });
     try {
       let nested: { v?: number; n?: unknown } = { v: 1 };
       for (let i = 0; i < 60; i++) nested = { n: nested };
@@ -133,7 +133,7 @@ describe("security / DoS — black-hole channel", () => {
     mitm.transformAtoB(() => null);
 
     const { api, destroy } = client(b, {
-      psk,
+      auth: { psk: () => psk },
       timeout: 600,
       handshakeTimeout: 200,
     });

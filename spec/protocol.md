@@ -173,7 +173,7 @@ reply_transcript :=
 0x00 || msgpack({ pub: s_pub, proof: proof, epoch: epoch, auth: signed? })
 ```
 
-The server **does not** transition to `ready` yet. It does so on the first successful decrypt of a `TAG_MSG`.
+The server **does not** transition to `ready` yet. It does so on the first `TAG_MSG` whose Poly1305 tag verifies under the freshly-derived session key, regardless of whether the decrypted payload is a well-formed RPC request. Producing a valid AEAD frame is the implicit proof; the inner shape is checked afterwards and may be silently dropped without rolling state back.
 
 ### Step 3 — Client processes reply
 
@@ -190,7 +190,7 @@ The server **does not** transition to `ready` yet. It does so on the first succe
 
 ### Step 4 — First encrypted message
 
-The client encrypts and sends its first RPC request. On the server, successful decryption of the first `TAG_MSG` is the implicit proof that the client knows the PSK, and the server transitions from `pending` to `ready`.
+The client encrypts and sends its first RPC request. On the server, successful AEAD verification of the first `TAG_MSG` (Poly1305 tag passes under the freshly-derived session key) is the implicit proof that the client knows the PSK, and the server transitions from `pending` to `ready`. The inner RPC payload is validated separately; a junk payload that nonetheless decrypts cleanly still confirms the session — it is just dropped without producing a response.
 
 ### Re-handshake
 
@@ -211,6 +211,8 @@ session_key = HKDF(
 The PSK is the **salt** parameter, not the IKM. This is deliberate: the salt parameter is what HKDF uses for domain separation and authentication.
 
 If both endpoints derive the same `psk` and the X25519 exchange is intact, both arrive at the same `session_key`. An attacker who runs the X25519 exchange but lacks the PSK derives a different key and the HMAC proof fails.
+
+When `psk` is not configured (asymmetric-only mode), `psk_or_EMPTY_PSK` is 32 zero bytes. RFC 5869 allows an all-zero salt; in this mode session authentication relies entirely on the `sign`/`verify` callbacks. The reference implementation refuses an application-supplied `psk()` that returns 32 zeros, so a misconfigured PSK never silently degrades into the asymmetric-only mode.
 
 ### `deriveSessionPSK` (helper)
 
@@ -434,11 +436,17 @@ A new-language port that ticks all of these is conformant:
 - [ ] X25519, XSalsa20-Poly1305, HKDF-SHA-256, HMAC-SHA-256 implementations are constant-time where the spec requires (proof comparison, MAC verification).
 - [ ] msgpack codec rejects all extension types; built-in Timestamp explicitly.
 - [ ] Sanitization rejects host objects (or the language equivalent of "weird types"), strips prototype-pollution keys, limits depth.
+- [ ] Handler output is also sanitized (or otherwise restricted to plain-data trees) before encoding, so a stray host object surfaces as `INVALID_DATA` and not an opaque `INTERNAL`.
 - [ ] Frames are bounded by `MAX_HELLO_BYTES` / `MAX_MSG_BYTES`.
 - [ ] Hello transcript and reply transcript are built from the exact byte sequences shown.
 - [ ] Auth is processed **before** any session key is materialized; failed auth never leaks session state.
 - [ ] Server transitions to `ready` only on first valid decrypt, not on sending the reply.
 - [ ] Epoch counter increments per handshake attempt on both sides and is echoed in the reply.
+- [ ] The epoch counter is bumped for **every** incoming hello, including ones that arrive while a previous attempt is still suspended at an `await`. In-flight stale attempts detect themselves via the epoch guard and abandon all writes.
+- [ ] Every `await` in the handshake path is followed by an epoch + destroyed guard before any module-level state is written. Module-level publishes happen under a final guard inside a synchronous block.
+- [ ] PSK bytes equal to `EMPTY_PSK` (32 zero bytes) are rejected at runtime when `auth.psk` is configured.
+- [ ] The X25519 raw shared secret is zeroed in a try/finally so a thrown `psk()` does not leak it.
+- [ ] Ephemeral private keys captured for the duration of an `await` are owned by the in-flight attempt (copied, not aliased), so a concurrent reset that zeroes the live buffer does not corrupt the in-flight derivation.
 - [ ] Server accepts new hellos in any state (including `ready`); doing so resets the current session before processing.
 - [ ] Client auto-retries exactly once per call on `TIMEOUT` / send error; never on `RemoteRPCError`.
 - [ ] Ephemeral keys, raw shared secrets, and session keys are zeroed on reset and destroy.

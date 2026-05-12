@@ -1,19 +1,19 @@
 # Encrypted RPC
 
 <!-- NAV
-## Intro
+## Overview
 - [Encrypted RPC](index.md)
 
-## Start
-- [Getting Started](spec/getting-started.md)
+## Get Started
+- [Quickstart](spec/getting-started.md)
 
-## Deep Dive
-- [Security](spec/security.md)
-- [Integrations](spec/integrations.md)
+## Concepts
+- [Security & Auth](spec/security.md)
+- [Transports & Integrations](spec/integrations.md)
 
 ## Reference
 - [API](spec/api.md)
-- [Protocol](spec/protocol.md)
+- [Wire Protocol](spec/protocol.md)
 -->
 
 Two peers, one shared secret. Define your API as typed procedures — every call is end-to-end encrypted. Do not rely on TLS or other transport layers.
@@ -59,8 +59,6 @@ See the [Getting Started](spec/getting-started.md) guide to set it up in under f
 
 **Electron / Tauri IPC.** Main process and renderer need a secure channel. eRPC works over any IPC mechanism that can carry binary data.
 
-**Edge-to-edge.** Two Cloudflare Workers, two Deno Deploy isolates, any combination of edge runtimes. WebSocket between them, eRPC on top. Encrypted, typed, auto-retry.
-
 ## Platform support
 
 The reference implementation is **TypeScript/JavaScript** and runs anywhere JS runs:
@@ -68,9 +66,9 @@ The reference implementation is **TypeScript/JavaScript** and runs anywhere JS r
 - Node.js
 - Browsers
 - Service Workers
-- Cloudflare Workers
-- Vercel Edge
-- Deno Deploy
 - React Native
+- Vercel Edge
+- Cloudflare Workers
+- Deno Deploy
 
 The protocol is language-agnostic. It uses msgpack for serialization and standard primitives (X25519, XSalsa20-Poly1305, HKDF-SHA-256, HMAC-SHA-256). Implementations in Rust, Go, C++, or anything else are welcome — the [Protocol](spec/protocol.md) page is the contract.

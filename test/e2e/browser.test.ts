@@ -31,7 +31,10 @@ const MIME: Record<string, string> = {
   ".map": "application/json",
 };
 
-function makeStaticServer(): Promise<{ port: number; close: () => Promise<void> }> {
+function makeStaticServer(): Promise<{
+  port: number;
+  close: () => Promise<void>;
+}> {
   return new Promise((resolve) => {
     const srv: Server = createServer(async (req, res) => {
       const url = new URL(req.url ?? "/", "http://localhost");
@@ -105,13 +108,15 @@ describeMaybe("browser / puppeteer", () => {
       );
 
       const result = await page.evaluate(async () => {
-        const erpc = (window as unknown as {
-          __erpc: {
-            chain: typeof import("../../src/index.ts").chain;
-            client: typeof import("../../src/index.ts").client;
-            server: typeof import("../../src/index.ts").server;
-          };
-        }).__erpc;
+        const erpc = (
+          window as unknown as {
+            __erpc: {
+              chain: typeof import("../../src/index.ts").chain;
+              client: typeof import("../../src/index.ts").client;
+              server: typeof import("../../src/index.ts").server;
+            };
+          }
+        ).__erpc;
 
         let aCb: ((d: Uint8Array) => void) | null = null;
         let bCb: ((d: Uint8Array) => void) | null = null;
@@ -143,12 +148,11 @@ describeMaybe("browser / puppeteer", () => {
           greet: erpc
             .chain()
             .handler(async ({ input }: { input: unknown }) => ({
-              message:
-                "Hello, " + (input as { name: string }).name + "!",
+              message: "Hello, " + (input as { name: string }).name + "!",
             })),
         };
-        const srv = erpc.server(router, a, { psk });
-        const { api, destroy } = erpc.client(b, { psk, timeout: 3000 });
+        const srv = erpc.server(router, a, { auth: { psk: () => psk } });
+        const { api, destroy } = erpc.client(b, { auth: { psk: () => psk }, timeout: 3000 });
         try {
           return await api.greet({ name: "browser" });
         } finally {

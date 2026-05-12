@@ -34,7 +34,7 @@ describe("security / handshake proof", () => {
     const srv = server(
       { ping: chain().handler(async () => "pong") } as Router,
       a,
-      { psk, onError: (e) => errors.push(e) },
+      { auth: { psk: () => psk }, onError: (e) => errors.push(e) },
     );
 
     mitm.transformAtoB((data) => {
@@ -55,7 +55,7 @@ describe("security / handshake proof", () => {
     });
 
     const { api, destroy } = client(b, {
-      psk,
+      auth: { psk: () => psk },
       timeout: 600,
       handshakeTimeout: 400,
     });
@@ -90,7 +90,7 @@ describe("security / handshake proof", () => {
     });
 
     const { api, destroy } = client(b, {
-      psk: randomBytes(32),
+      auth: { psk: () => randomBytes(32) },
       timeout: 600,
       handshakeTimeout: 400,
     });
@@ -115,7 +115,7 @@ describe("security / handshake proof", () => {
     const srv = server(
       { ping: chain().handler(async () => "pong") } as Router,
       a,
-      { psk },
+      { auth: { psk: () => psk } },
     );
 
     mitm.transformAtoB((data) => {
@@ -134,7 +134,7 @@ describe("security / handshake proof", () => {
     });
 
     const { api, destroy } = client(b, {
-      psk,
+      auth: { psk: () => psk },
       timeout: 600,
       handshakeTimeout: 400,
     });
