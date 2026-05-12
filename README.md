@@ -14,42 +14,18 @@ npm install @dotex/erpc
 
 ![eRPC](erpc.png)
 
----
-
-- **Full docs:** <https://dotex.org/epic/erpc>
+- **Full docs and rationale:** <https://dotex.org/epic/erpc>
 - [Quickstart](./spec/getting-started.md) · [API](./spec/api.md) · [Wire Protocol](./spec/protocol.md) · [Security](./spec/security.md) · [Transports](./spec/integrations.md)
 
----
+## Highlights
 
-## Why eRPC
-
-|  | tRPC | eRPC |
-|---|---|---|
-| **Transport** | HTTP (mostly) | Anything that carries bytes |
-| **Encryption** | TLS at the edge | End-to-end, every message |
-| **Roles** | Server / client | Peer / peer (either side can serve) |
-| **Edge runtimes** | Mostly | Yes (synchronous init, no top-level `await`) |
-| **Auth** | App-level (middleware) | Built into the handshake |
-
-eRPC is designed for the cases tRPC wasn't:
-
-- Browser extensions (content script ↔ background ↔ popup)
-- iframes embedding third-party code over `postMessage`
-- Workers and SharedWorkers over `MessagePort`
-- Edge-to-edge services over WebSocket
-- Tab coordination over `BroadcastChannel`
-- Peer-to-peer WebRTC data channels
-
-## Features
-
-- **Typed procedures** with Zod input/output validation
-- **End-to-end encryption** — X25519 ECDH, XSalsa20-Poly1305 AEAD, HKDF-SHA-256, forward secrecy
-- **Lazy handshake** on first call, transparent auto-retry on session drop
-- **Three auth modes** — PSK, asymmetric (Ed25519 / ECDSA / JWT / cert / multifactor), or both for defense-in-depth
-- **All built-in auth helpers are transcript-bound** — captured payloads cannot be replayed into a new handshake
+- **Typed procedures** with Zod input/output validation.
+- **End-to-end encryption** — X25519 ECDH, XSalsa20-Poly1305 AEAD, HKDF-SHA-256, forward secrecy.
+- **Lazy handshake** on first call, transparent auto-retry on session drop.
+- **Three auth modes** — PSK, asymmetric (Ed25519 / ECDSA / JWT / cert / multifactor), or both for defense-in-depth.
 - **Synchronous** `client()` / `server()` — works in Node.js, browsers, Service Workers, React Native, Vercel Edge, Cloudflare Workers, Deno Deploy.
-- **Tiny surface** — `@noble/*` crypto, `@msgpack/msgpack`, `zod` and nothing else
-- **Pure ESM + CJS dual build**, side-effect-free, tree-shakeable
+- **Tiny surface** — `@noble/*` crypto, `@msgpack/msgpack`, `zod`, and nothing else.
+- **Pure ESM + CJS dual build**, side-effect-free, tree-shakeable.
 
 ## Quick start
 
@@ -57,7 +33,6 @@ eRPC is designed for the cases tRPC wasn't:
 import { chain, server, client } from "@dotex/erpc";
 import { z } from "zod";
 
-// 1. Define your router
 const d = chain();
 
 const router = {
@@ -69,27 +44,16 @@ const router = {
     })),
 };
 
-// 2. Shared secret (32 bytes)
 const psk = crypto.getRandomValues(new Uint8Array(32));
 const auth = { psk: () => psk };
 
-// 3. Server (attach to any Channel)
-const { destroy: stopServer } = server(router, serverChannel, {
-  auth,
-  onError: console.error,
-});
+const { destroy: stopServer } = server(router, serverChannel, { auth });
+const { api, destroy: stopClient } = client<typeof router>(clientChannel, { auth });
 
-// 4. Client (typed from the router)
-const { api, destroy: stopClient } = client<typeof router>(clientChannel, {
-  auth,
-});
-
-// 5. Call. Handshake, encryption, validation — all automatic.
 const { message } = await api.greet({ name: "World" });
-console.log(message); // "Hello, World!"
 ```
 
-`client()` and `server()` are **synchronous** — no top-level `await`. The handshake happens lazily on the first procedure call. If the session drops, the next call retries once with a fresh handshake.
+`client()` and `server()` are synchronous — no top-level `await`. The handshake runs lazily on the first procedure call. If the session drops, the next call retries once with a fresh handshake.
 
 ## Channel — the only transport contract
 
@@ -100,24 +64,7 @@ interface Channel {
 }
 ```
 
-Anything that satisfies this can host an eRPC session. A minimal WebSocket adapter:
-
-```typescript
-function wsChannel(ws: WebSocket): Channel {
-  return {
-    send: (data) => ws.send(data),
-    receive: (cb) => {
-      const h = (e: MessageEvent) => {
-        if (e.data instanceof ArrayBuffer) cb(new Uint8Array(e.data));
-      };
-      ws.addEventListener("message", h);
-      return () => ws.removeEventListener("message", h);
-    },
-  };
-}
-```
-
-Ready-made adapters for WebSocket, postMessage, MessagePort, Chrome extension ports, BroadcastChannel, WebRTC, TCP, and SSE: [spec/integrations.md](./spec/integrations.md).
+Anything that satisfies this can host an eRPC session. Ready-made adapters for WebSocket, `postMessage`, `MessagePort`, Chrome extension ports, `BroadcastChannel`, WebRTC, TCP, and SSE live in [spec/integrations.md](./spec/integrations.md).
 
 ## Authentication
 
@@ -141,7 +88,7 @@ auth: {
 }
 ```
 
-Ready-made helpers ship for Ed25519, ECDSA P-256, JWT, certificate-based, and multifactor auth. See [spec/security.md](./spec/security.md) for the threat model, transcript format, and the trade-offs between each mode.
+Built-in helpers for Ed25519, ECDSA P-256, JWT, certificate-based, and multifactor auth — all transcript-bound, so captured payloads can't be replayed. See [spec/security.md](./spec/security.md) for the threat model.
 
 ## Errors
 
@@ -174,8 +121,6 @@ src/
   index.ts        — Public entry point
 ```
 
-Importing:
-
 ```typescript
 import { chain, server, client, RPCError } from "@dotex/erpc";
 // Subpaths also available for tree-shaking:
@@ -186,17 +131,11 @@ import { chain, RPCError } from "@dotex/erpc/common";
 
 ## Compatibility
 
-- **Node.js** 18+
-- **Modern browsers** (WebCrypto required only for the ECDSA/cert helpers)
-- **Service Workers**, **Web Workers**, **SharedWorkers**
-- **React Native**
-- **Vercel Edge**, **Cloudflare Workers**, **Deno Deploy**
+Node.js 18+, modern browsers, Service / Web / Shared Workers, React Native, Vercel Edge, Cloudflare Workers, Deno Deploy. WebCrypto is required only for the ECDSA and certificate helpers.
 
 ## Project status
 
-eRPC is at `0.x` and has a stable wire protocol (`drpc-v1` HKDF info, `erpc-hs-{hello,reply}-v1` transcript prefixes). Test coverage exists for handshake attacks, replay, tampering, type confusion, prototype pollution, middleware misuse, and DoS limits — see `test/security/`.
-
-A 1.0 release will lock the public API surface.
+`0.x` with a stable wire protocol (`drpc-v1` HKDF info, `erpc-hs-{hello,reply}-v1` transcript prefixes). Test coverage for handshake attacks, replay, tampering, type confusion, prototype pollution, middleware misuse, and DoS limits lives in `test/security/`. A 1.0 release will lock the public API surface.
 
 ## License
 
