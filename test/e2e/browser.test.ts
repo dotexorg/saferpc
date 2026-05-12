@@ -152,7 +152,10 @@ describeMaybe("browser / puppeteer", () => {
             })),
         };
         const srv = erpc.server(router, a, { auth: { psk: () => psk } });
-        const { api, destroy } = erpc.client(b, { auth: { psk: () => psk }, timeout: 3000 });
+        const { api, destroy } = erpc.client(b, {
+          auth: { psk: () => psk },
+          timeout: 3000,
+        });
         try {
           return await api.greet({ name: "browser" });
         } finally {

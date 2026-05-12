@@ -31,7 +31,10 @@ describe("security / middleware pipeline", () => {
         .handler(async () => "ok"),
     };
     const srv = server(router, a, { auth: { psk: () => psk } });
-    const { api, destroy } = client(b, { auth: { psk: () => psk }, timeout: 1000 });
+    const { api, destroy } = client(b, {
+      auth: { psk: () => psk },
+      timeout: 1000,
+    });
     try {
       try {
         await api.doubleNext({});
@@ -55,7 +58,10 @@ describe("security / middleware pipeline", () => {
         .handler(async () => "ok"),
     };
     const srv = server(router, a, { auth: { psk: () => psk } });
-    const { api, destroy } = client(b, { auth: { psk: () => psk }, timeout: 1000 });
+    const { api, destroy } = client(b, {
+      auth: { psk: () => psk },
+      timeout: 1000,
+    });
     try {
       try {
         await api.badNext({});
@@ -84,7 +90,10 @@ describe("security / middleware pipeline", () => {
         .handler(async ({ input }) => (input as { id: string }).id),
     };
     const srv = server(router, a, { auth: { psk: () => psk } });
-    const { api, destroy } = client(b, { auth: { psk: () => psk }, timeout: 1000 });
+    const { api, destroy } = client(b, {
+      auth: { psk: () => psk },
+      timeout: 1000,
+    });
     try {
       try {
         await api.authValidate({ id: 42 });
@@ -111,7 +120,10 @@ describe("security / middleware pipeline", () => {
         .handler(async () => "ok"),
     };
     const srv = server(router, a, { auth: { psk: () => psk } });
-    const { api, destroy } = client(b, { auth: { psk: () => psk }, timeout: 1000 });
+    const { api, destroy } = client(b, {
+      auth: { psk: () => psk },
+      timeout: 1000,
+    });
     try {
       try {
         await api.gated({});

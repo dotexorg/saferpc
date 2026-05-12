@@ -38,7 +38,10 @@ describe("security / DoS — framing limits", () => {
       onError: (e) => errors.push(e),
     });
 
-    const { api, destroy } = client(b, { auth: { psk: () => psk }, timeout: 1000 });
+    const { api, destroy } = client(b, {
+      auth: { psk: () => psk },
+      timeout: 1000,
+    });
     try {
       expect(await api.ping({})).toBe("pong");
       expect(invocations).toBe(1);
@@ -105,7 +108,10 @@ describe("security / DoS — depth bomb input", () => {
       sink: chain().handler(async ({ input }) => input),
     };
     const srv = server(router, a, { auth: { psk: () => psk } });
-    const { api, destroy } = client(b, { auth: { psk: () => psk }, timeout: 1500 });
+    const { api, destroy } = client(b, {
+      auth: { psk: () => psk },
+      timeout: 1500,
+    });
     try {
       let nested: { v?: number; n?: unknown } = { v: 1 };
       for (let i = 0; i < 60; i++) nested = { n: nested };

@@ -79,7 +79,10 @@ describe("security / handshake attacks", () => {
     // Clear errors before testing legitimate client
     errors.length = 0;
 
-    const { api, destroy } = client(b, { auth: { psk: () => psk }, timeout: 1000 });
+    const { api, destroy } = client(b, {
+      auth: { psk: () => psk },
+      timeout: 1000,
+    });
     try {
       expect(await api.ping({})).toBe("pong");
     } finally {
@@ -109,7 +112,10 @@ describe("security / handshake attacks", () => {
     expect(errors.length).toBeGreaterThanOrEqual(1);
     expect(errors[0]!.code).toBe("HANDSHAKE");
 
-    const { api, destroy } = client(b, { auth: { psk: () => psk }, timeout: 1000 });
+    const { api, destroy } = client(b, {
+      auth: { psk: () => psk },
+      timeout: 1000,
+    });
     try {
       expect(await api.ping({})).toBe("pong");
     } finally {
@@ -136,7 +142,10 @@ describe("security / handshake attacks", () => {
     expect(errors.length).toBeGreaterThanOrEqual(1);
     expect(errors[0]!.code).toBe("HANDSHAKE");
 
-    const { api, destroy } = client(b, { auth: { psk: () => psk }, timeout: 1000 });
+    const { api, destroy } = client(b, {
+      auth: { psk: () => psk },
+      timeout: 1000,
+    });
     try {
       expect(await api.ping({})).toBe("pong");
     } finally {
@@ -159,7 +168,10 @@ describe("security / handshake attacks", () => {
     await new Promise((r) => setTimeout(r, 30));
     expect(errors.length).toBe(0);
 
-    const { api, destroy } = client(b, { auth: { psk: () => psk }, timeout: 1000 });
+    const { api, destroy } = client(b, {
+      auth: { psk: () => psk },
+      timeout: 1000,
+    });
     try {
       expect(await api.ping({})).toBe("pong");
     } finally {
@@ -183,7 +195,10 @@ describe("security / handshake attacks", () => {
     await new Promise((r) => setTimeout(r, 30));
     expect(errors.length).toBe(0);
 
-    const { api, destroy } = client(b, { auth: { psk: () => psk }, timeout: 1000 });
+    const { api, destroy } = client(b, {
+      auth: { psk: () => psk },
+      timeout: 1000,
+    });
     try {
       expect(await api.ping({})).toBe("pong");
     } finally {

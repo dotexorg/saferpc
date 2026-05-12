@@ -28,7 +28,10 @@ describe("security / prototype pollution via inputs", () => {
       }),
     };
     const srv = server(router, a, { auth: { psk: () => psk } });
-    const { api, destroy } = client(b, { auth: { psk: () => psk }, timeout: 1000 });
+    const { api, destroy } = client(b, {
+      auth: { psk: () => psk },
+      timeout: 1000,
+    });
     try {
       const payload = mpDecode(
         mpEncode({ a: 1, __proto__: { polluted: "yes" } }),
@@ -63,7 +66,10 @@ describe("security / prototype pollution via inputs", () => {
       }),
     };
     const srv = server(router, a, { auth: { psk: () => psk } });
-    const { api, destroy } = client(b, { auth: { psk: () => psk }, timeout: 1000 });
+    const { api, destroy } = client(b, {
+      auth: { psk: () => psk },
+      timeout: 1000,
+    });
     try {
       const payload = mpDecode(
         mpEncode({
@@ -112,7 +118,10 @@ describe("security / prototype pollution via outputs", () => {
       ),
     };
     const srv = server(router, a, { auth: { psk: () => psk } });
-    const { api, destroy } = client(b, { auth: { psk: () => psk }, timeout: 1000 });
+    const { api, destroy } = client(b, {
+      auth: { psk: () => psk },
+      timeout: 1000,
+    });
     try {
       const before = (Object.prototype as Record<string, unknown>).stolen;
       const result = (await api.poison({})) as Record<string, unknown>;

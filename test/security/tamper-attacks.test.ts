@@ -125,8 +125,14 @@ describe("security / tamper attacks", () => {
         return "pong";
       }),
     };
-    const srv = server(router, a, { auth: { psk: () => psk }, onError: (e) => errors.push(e) });
-    const { api, destroy } = client(b, { auth: { psk: () => psk }, timeout: 1000 });
+    const srv = server(router, a, {
+      auth: { psk: () => psk },
+      onError: (e) => errors.push(e),
+    });
+    const { api, destroy } = client(b, {
+      auth: { psk: () => psk },
+      timeout: 1000,
+    });
 
     try {
       expect(await api.ping({})).toBe("pong");
@@ -157,7 +163,10 @@ describe("security / tamper attacks", () => {
       ),
     };
     const srv = server(router, a, { auth: { psk: () => psk } });
-    const { api, destroy } = client(b, { auth: { psk: () => psk }, timeout: 500 });
+    const { api, destroy } = client(b, {
+      auth: { psk: () => psk },
+      timeout: 500,
+    });
     try {
       const slow = api.slow({});
       setTimeout(() => {
