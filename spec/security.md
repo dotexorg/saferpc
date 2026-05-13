@@ -1,6 +1,6 @@
 # Security
 
-eRPC treats the transport as hostile. This page covers what that means, what eRPC actually guarantees, how to configure auth so those guarantees hold, and what is *not* covered. Wire-level mechanics (frame layout, handshake steps, state machines, key derivation) live in [Protocol](protocol.md).
+eRPC treats the transport as hostile. This page covers what that buys you, how to configure auth so those guarantees hold, and what is *not* covered. Wire-level mechanics (frame layout, handshake steps, state machines, key derivation) live in [Protocol](protocol.md).
 
 ## Threat model
 
@@ -13,9 +13,9 @@ The transport channel is **untrusted**. The attacker may:
 
 eRPC does **not** protect against:
 
-- **Denial of service.** If the attacker drops every byte, communication is impossible. No fix at this layer.
-- **Compromised endpoints.** If the attacker runs code on either side, encryption is irrelevant.
-- **Timing side channels in your handlers.** eRPC's own comparisons are constant-time; your handler code is not unless you write it that way.
+- **Denial of service.** An attacker who drops every byte makes communication impossible. No protocol-layer fix.
+- **Compromised endpoints.** Once attacker code runs on either side, encryption is moot.
+- **Timing side channels in your handlers.** eRPC's own comparisons are constant-time. Your handler code is not, unless you write it that way.
 
 ## Security properties
 
@@ -49,9 +49,9 @@ auth: {
 }
 ```
 
-Use when both endpoints are controlled by the same entity, secrets can be rotated, and individual revocation is not required. PSK is cheap — no signature operations on the hot path.
+Fits when both endpoints belong to the same entity, secrets can be rotated, and you do not need per-identity revocation. No signature work on the hot path.
 
-> The PSK buffer's lifecycle belongs to the caller. eRPC reads it during HKDF and never mutates it. Returning the same `Uint8Array` from `psk()` across handshakes is safe; if you want it zeroed, zero it yourself when the secret is no longer needed.
+> The PSK buffer's lifecycle belongs to the caller. eRPC reads it during HKDF and never mutates it. Returning the same `Uint8Array` from `psk()` across handshakes is safe. If you want it zeroed, zero it yourself when the secret is no longer needed.
 
 ### Asymmetric only
 
@@ -70,7 +70,7 @@ auth: {
 }
 ```
 
-Use when one side is a public client (browser, mobile app, IoT device), when there are no shared secrets to safely distribute, or when you need per-device identity and revocation.
+Fits when one side is a public client (browser, mobile app, IoT device), when there is no safe place to put a shared secret, or when you need per-device identity and revocation.
 
 ### Both (defense-in-depth)
 
@@ -82,7 +82,7 @@ auth: {
 }
 ```
 
-Use when you want session binding *and* identity proof. An attacker must now compromise two independent things — the derivation secret and the device key — and still cannot read past sessions because of forward secrecy.
+Fits when you need session binding *and* identity proof. The attacker now has to compromise both the derivation secret and the device key, and forward secrecy still protects past traffic if either one leaks.
 
 ### Comparison
 
@@ -96,11 +96,11 @@ Use when you want session binding *and* identity proof. An attacker must now com
 | Cost | Low (HMAC only) | Higher (signature ops) |
 | Complexity | Simple | More moving parts |
 
-Forward secrecy comes from the ephemeral X25519 exchange in either mode. Even if a long-term secret leaks, past session ciphertexts remain unreadable — the ephemeral private keys were zeroed when the session ended.
+Forward secrecy comes from the ephemeral X25519 exchange in either mode. A leaked long-term secret cannot decrypt past traffic, because the ephemeral private keys are zeroed when each session ends.
 
 ## Transcript format
 
-Signatures are taken over canonical byte strings built by eRPC. There are two, with domain-separated magic prefixes so a hello signature can never be replayed as a reply (or vice versa).
+Signatures are taken over canonical byte strings built by eRPC. Two transcripts exist, each with a domain-separated magic prefix, so a hello signature cannot be replayed as a reply (or vice versa).
 
 ```
 HELLO transcript:
@@ -117,19 +117,19 @@ REPLY transcript:
   server_pub             (32 bytes)
 ```
 
-These prefixes plus the epoch plus the per-handshake nonce defeat:
+Prefix, epoch, and per-handshake nonce together defeat:
 
-- Replay across direction (hello vs. reply use different prefixes)
-- Replay across handshake attempts (epoch differs each time)
-- Substitution attacks (an active MITM cannot swap either ephemeral public key without invalidating the signature)
+- Replay across direction — hello and reply use different prefixes
+- Replay across handshake attempts — epoch differs each time
+- Substitution attacks — an active MITM cannot swap either ephemeral public key without invalidating the signature
 
 For the full wire layout of the frames that carry these signatures, see [Protocol § Frame format](protocol.md#frame-format).
 
 ## Auth processing order
 
-Auth runs **before** any session key is materialized. Failed verification never leaks ECDH artifacts. See [Protocol § Handshake](protocol.md#handshake) for the step-by-step details.
+Auth runs **before** any session key is materialized, so a failed verification never leaks ECDH artifacts. Step-by-step in [Protocol § Handshake](protocol.md#handshake).
 
-A throw at any auth step rejects the handshake. The client resets to `idle`; the server resets to `waiting`. Failed verifications never silently downgrade.
+A throw at any auth step rejects the handshake. The client resets to `idle`, the server resets to `waiting`. Failed verification never silently downgrades into an unauthenticated session.
 
 ## Safe vs unsafe PSK patterns
 
@@ -175,11 +175,11 @@ auth: {
 }
 ```
 
-The common pattern in the unsafe list: the attacker can reproduce the derivation either because the input is guessable or because the secret is in the wrong place.
+The unsafe list shares one pattern: the attacker can reproduce the derivation, either because the input is guessable or because the secret material lives in the wrong place.
 
 ## Built-in signature helpers
 
-eRPC ships ready-made helpers for common cases. Every helper binds its proof to the handshake transcript that eRPC passes in.
+eRPC ships ready-made helpers for the common cases. Each one binds its proof to the handshake transcript that eRPC passes in.
 
 ```typescript
 import {
@@ -214,7 +214,7 @@ auth: { ...clientAuth }
 auth: { ...serverAuth }
 ```
 
-Uses `@noble/curves` so it works in every JS runtime — no dependency on WebCrypto Ed25519 (which is not uniformly available across browsers).
+Built on `@noble/curves` so it runs in every JS runtime. WebCrypto Ed25519 is not uniformly available across browsers, and the helper sidesteps that.
 
 ### ECDSA P-256 (WebCrypto)
 
@@ -229,7 +229,7 @@ const serverAuth = createECDSAServerAuth({
 });
 ```
 
-Use this when you want the private key to be non-extractable. Pair `generateECDSAKeypair()` with platform key stores.
+Use this when the private key must be non-extractable. Pair `generateECDSAKeypair()` with platform key stores.
 
 ### JWT (bearer token, transcript-bound)
 
@@ -247,9 +247,9 @@ const serverAuth = createJWTServerAuth({
 });
 ```
 
-The JWT helper does **not** sign the transcript — JWTs are bearer tokens. Instead, the client embeds `{ jwt, ts, th = SHA-256(transcript) }` in the auth payload, and the server validates the JWT, the timestamp (symmetric `maxAge` skew, so future-dated forgeries are rejected too), and the transcript digest in constant time. A captured payload can only be replayed within a handshake that produces the same transcript, which means the attacker cannot mount a new handshake with their own ephemeral key.
+The JWT helper does **not** sign the transcript: JWTs are bearer tokens. The client embeds `{ jwt, ts, th = SHA-256(transcript) }` in the auth payload, and the server validates the JWT, the timestamp (symmetric `maxAge` skew, so future-dated forgeries are rejected too), and the transcript digest in constant time. A captured payload can only be replayed inside a handshake that produces the same transcript, which means an attacker cannot mount a new handshake with their own ephemeral key.
 
-A leaked JWT still lets the attacker authenticate as long as the token is valid. Combine with PSK or a real signature mode when this matters.
+A leaked JWT still authenticates the attacker for as long as the token is valid. Combine with PSK or a real signature mode when that matters.
 
 ### Certificate-based
 
@@ -278,11 +278,11 @@ The client embeds `{ primary, secondary }` — two pre-encoded sub-payloads.
 
 ## Replay within a session
 
-eRPC uses random 24-byte nonces (not counters) for XSalsa20-Poly1305. The collision probability is negligible — but **a captured ciphertext can be replayed by an attacker who can inject into a live channel**. The replayed message will decrypt and execute again.
+eRPC uses random 24-byte nonces for XSalsa20-Poly1305, not counters. Collision probability is negligible, but **a captured ciphertext can still be replayed by an attacker who can inject into a live channel**. The replay decrypts and executes again.
 
-For non-idempotent operations, add an application-level idempotency key inside the procedure input, or maintain a request-ID set on the server keyed by the verified principal.
+For non-idempotent operations, add an idempotency key inside the procedure input, or keep a request-ID set on the server keyed by the verified principal.
 
-This is the only known replay window in the protocol. A counter-based scheme would close it but introduces a stronger ordering requirement on the transport, which is not always available (BroadcastChannel, lossy WebRTC, etc.).
+This is the only known replay window in the protocol. A counter-based scheme would close it, but it would also require strict transport ordering, and several supported transports (BroadcastChannel, lossy WebRTC, multi-path links) cannot promise that.
 
 ## Recommended configurations
 

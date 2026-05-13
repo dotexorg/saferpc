@@ -1,6 +1,6 @@
 # API Reference
 
-Strict reference for every exported symbol. For an end-to-end walkthrough see [Getting Started](getting-started.md). For threat model and crypto details see [Security](security.md). For the wire format see [Protocol](protocol.md).
+Reference for every exported symbol. End-to-end walkthrough lives in [Getting Started](getting-started.md), threat model and crypto in [Security](security.md), wire format in [Protocol](protocol.md).
 
 ## Import paths
 
@@ -26,7 +26,7 @@ import { ... } from "@dotex/erpc/client";
 function chain(): Chain;
 ```
 
-Returns a procedure builder. All methods are immutable and chainable. The chain terminates with `.handler()`, which returns a frozen `Procedure`.
+Returns a procedure builder. Every method is immutable and chainable. `.handler()` terminates the chain and returns a frozen `Procedure`.
 
 ```typescript
 interface Chain<TCtx = {}, TIn = unknown, TOut = unknown> {
@@ -65,7 +65,7 @@ interface Procedure {
 type Router = Record<string, Procedure>;
 ```
 
-Treat `Procedure` as opaque. The fields are exported only so `server()` can introspect them.
+Treat `Procedure` as opaque. The fields are exposed only so `server()` can introspect them.
 
 ---
 
@@ -79,7 +79,7 @@ function server<T extends Router>(
 ): { destroy: () => void };
 ```
 
-Subscribes to `channel` and serves the given router. Returns synchronously.
+Subscribes to `channel` and serves the router. Returns synchronously.
 
 ### `ServerOptions`
 
@@ -91,9 +91,9 @@ Subscribes to `channel` and serves the given router. Returns synchronously.
 | `maxMessageBytes` | `number` | `1_048_576` | — |
 | `onError` | `(err: unknown) => void` | — | — |
 
-`context` is called per request. The `auth` argument carries whatever `auth.verify` returned for the current session. When `context` is omitted, the request context is the verified auth data (or `{}` if none).
+`context` runs per request. The `auth` argument carries whatever `auth.verify` returned for the current session. When `context` is omitted, the request context falls back to the verified auth data (or `{}` if none).
 
-`onError` is called on handshake failures and non-fatal internal errors. The server does **not** destroy on handshake failure — it resets and accepts the next hello.
+`onError` fires on handshake failures and non-fatal internal errors. The server does **not** destroy itself on a failed handshake — it resets and accepts the next hello.
 
 ### `AuthOptions`
 
@@ -110,7 +110,7 @@ interface AuthOptions {
 type VerifyResult = { auth?: Ctx } | void;
 ```
 
-At least one of `psk` or asymmetric (`sign` / `verify`) must be set. Configuring neither throws a `TypeError` at construction.
+Set at least one of `psk` or asymmetric (`sign` / `verify`). Configuring neither throws a `TypeError` at construction.
 
 | Field | Called | Notes |
 |-------|--------|-------|
@@ -118,7 +118,7 @@ At least one of `psk` or asymmetric (`sign` / `verify`) must be set. Configuring
 | `sign` | Per handshake attempt, if set | Signature payload, ≤ 32 KiB. |
 | `verify` | Per handshake attempt, if set | Throw to reject. Returned `auth` is bound to the resulting session. |
 
-Returned `auth` data is sanitized (poison keys stripped) before being passed to `context`.
+Returned `auth` data is sanitized (poison keys stripped) before reaching `context`.
 
 ### Server lifecycle
 
@@ -145,7 +145,7 @@ function client<T extends Router>(
 ): { api: Client<T>; destroy: () => void };
 ```
 
-Returns synchronously. The handshake is lazy: it starts on the first `api` call.
+Returns synchronously. The handshake stays lazy: it starts on the first `api` call.
 
 ### `ClientOptions`
 
@@ -188,11 +188,11 @@ idle → handshaking → ready
 
 ## Auto-retry
 
-When an call fails on a `ready` session with a local `TIMEOUT` or send error, the client zeros its session key, returns to `idle`, runs a fresh handshake, and resends the request **exactly once**. `RemoteRPCError` (server returned an error) is **not** retried — the server is alive. Concurrent failures share one re-handshake via an epoch counter; no infinite loops. Full state-machine and wire-level semantics in [Protocol § Auto-retry semantics](protocol.md#auto-retry-semantics).
+A call that fails on a `ready` session with a local `TIMEOUT` or send error triggers a single retry: the client zeros its session key, returns to `idle`, runs a fresh handshake, and resends the request **exactly once**. `RemoteRPCError` (server returned an error) is **not** retried — the server is alive and answered. Concurrent failures share one re-handshake via an epoch counter, so there are no retry storms. Full state-machine and wire-level semantics in [Protocol § Auto-retry semantics](protocol.md#auto-retry-semantics).
 
 ## Replay within a session
 
-Per-message AEAD nonces are random; an attacker who can inject into a live channel can replay a captured ciphertext and the receiver will execute it again. For non-idempotent procedures, add an application-level idempotency key inside `input`, or maintain a request-ID set on the server keyed by the verified principal. Full discussion in [Security § Replay within a session](security.md#replay-within-a-session).
+Per-message AEAD nonces are random, not counter-derived. An attacker who can inject into a live channel can replay a captured ciphertext and the receiver will execute it again. For non-idempotent procedures, add an idempotency key inside `input`, or keep a request-ID set on the server keyed by the verified principal. Full discussion in [Security § Replay within a session](security.md#replay-within-a-session).
 
 ---
 
@@ -211,9 +211,9 @@ The only transport contract. `receive` returns an unsubscribe function. The chan
 - Deliver each call to `cb` once, in any order
 - Allow `send` and `receive` to run concurrently
 
-It is **allowed** to drop messages, duplicate them, or reorder them — eRPC will time out and retry. Ready-made adapters live in [Integrations](integrations.md).
+Dropping, duplicating, or reordering messages is allowed — eRPC will time out and retry. Ready-made adapters live in [Integrations](integrations.md).
 
-> Within a single eRPC session the protocol assumes the `TAG_HELLO` reply arrives before any `TAG_MSG` sent under the resulting session key. Transports that may reorder *across* the hello/reply boundary (multi-path links, fan-out buses) will hang the handshake until the timeout fires. `TAG_MSG`-to-`TAG_MSG` reordering remains safe because every encrypted frame is independently authenticated and the protocol has no ordering requirement on application messages.
+> Within a single session the protocol assumes the `TAG_HELLO` reply arrives before any `TAG_MSG` sent under the resulting session key. Transports that can reorder *across* the hello/reply boundary (multi-path links, fan-out buses) will hang the handshake until the timeout fires. `TAG_MSG`-to-`TAG_MSG` reordering stays safe: every encrypted frame is independently authenticated and the protocol imposes no ordering on application messages.
 
 ---
 
@@ -230,7 +230,7 @@ class RemoteRPCError extends RPCError {}
 ```
 
 - `RPCError` is thrown for **local** failures: timeout, session destroyed, handshake failure, validation failure, channel error.
-- `RemoteRPCError` is thrown when the remote peer's handler returned an error. The `code`, `message`, and `data` come from the remote side and are **untrusted strings** — do not log them at warn/error level without sanitization.
+- `RemoteRPCError` is thrown when the remote peer's handler returned an error. The `code`, `message`, and `data` come from the remote side and are **untrusted strings** — sanitize before logging at warn/error level, or before showing them to a user.
 
 ### Standard local error codes
 
@@ -246,7 +246,7 @@ class RemoteRPCError extends RPCError {}
 | `INTERNAL` | Defensive — should not be reachable |
 | `MIDDLEWARE` | Middleware misuse (`next()` called twice, bad `extra` arg) |
 
-Handlers may throw `RPCError(...)` with any code — those codes become `RemoteRPCError.code` on the client.
+Handlers may throw `RPCError(...)` with any code; those codes surface as `RemoteRPCError.code` on the client.
 
 ### Pattern
 
@@ -268,7 +268,7 @@ try {
 
 ## Middleware and context
 
-Middleware extends the context. Each middleware is `({ ctx, input, next })`. It must call `next(extra?)` exactly once.
+Middleware extends the context. Signature is `({ ctx, input, next })`, and `next(extra?)` must be called exactly once.
 
 ```typescript
 const d = chain();
@@ -294,9 +294,9 @@ server(router, channel, {
 });
 ```
 
-Calling `next()` twice in the same middleware throws `RPCError("MIDDLEWARE", ...)`. Passing a non-object `extra` does the same.
+Calling `next()` twice in the same middleware throws `RPCError("MIDDLEWARE", ...)`. So does passing a non-object `extra`.
 
-The `context` factory runs **per request**, after auth verification, and receives `{ auth }` carrying the data returned by `auth.verify` for the session.
+The `context` factory runs **per request**, after auth verification, and receives `{ auth }` carrying the data returned by `auth.verify` for that session.
 
 ---
 
@@ -310,13 +310,13 @@ HKDF-SHA-256 over `secret` with `sessionId` as salt and the fixed info string `"
 
 Throws `TypeError` if `sessionId` is empty or `secret` is shorter than 32 bytes.
 
-Use to bind each handshake to a session identifier instead of holding a single static PSK.
+Use it to bind each handshake to a session identifier instead of relying on a single static PSK.
 
 ---
 
 ## Built-in auth helpers
 
-Every helper returns a partial `AuthOptions` you can spread into the `auth` block. All bind their proof to the canonical handshake transcript so a captured payload cannot be replayed into a new handshake.
+Every helper returns a partial `AuthOptions` you spread into the `auth` block. Each one binds its proof to the canonical handshake transcript, so a captured payload cannot be replayed into a new handshake.
 
 ### Client-side
 
@@ -358,7 +358,7 @@ import {
 | `createCertificateServerAuth({ verifyCertificate, validateSubject? })` | Verifies a presented certificate chain + ECDSA P-256 signature. |
 | `createMultifactorServerAuth({ primary, secondary, combineAuth? })` | Composes two verifiers; both must pass. |
 
-All decode auth payloads through the hardened msgpack codec (ext types rejected, prototype-pollution keys stripped, depth-limited). Returned `auth` data is sanitized before reaching `context`.
+Auth payloads decode through the hardened msgpack codec: extension types rejected, prototype-pollution keys stripped, recursion depth capped. Returned `auth` data is sanitized before reaching `context`.
 
 ---
 
@@ -382,13 +382,13 @@ import {
 } from "@dotex/erpc";
 ```
 
-Exported for adapter authors. Application code does not normally need these.
+Exported for adapter authors. Application code rarely needs them.
 
 ---
 
 ## Cleanup
 
-Always call `destroy()` when you are done with a session.
+Call `destroy()` when you are done with a session.
 
 ```typescript
 const { destroy: destroyServer } = server(router, channel, { auth });
@@ -409,7 +409,7 @@ After `destroy()`:
 
 ## Edge runtime compatibility
 
-Both `server()` and `client()` return **synchronously**. No top-level `await`. Pure JavaScript dependencies. Compatible with:
+Both `server()` and `client()` return **synchronously**, with no top-level `await`. Dependencies are pure JavaScript. Compatible with:
 
 - Node.js 18+
 - Modern browsers
