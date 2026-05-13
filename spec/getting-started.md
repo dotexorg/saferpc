@@ -1,6 +1,6 @@
 # Getting Started
 
-Five minutes from `npm install` to encrypted, typed procedure calls. The shape is always the same: define a router, configure auth, attach a channel, call functions.
+Five minutes from `npm install` to encrypted, typed procedure calls. The shape never changes: define a router, configure auth, attach a channel, call functions.
 
 ## Install
 
@@ -8,7 +8,7 @@ Five minutes from `npm install` to encrypted, typed procedure calls. The shape i
 npm install @dotex/erpc
 ```
 
-Peer dependency: a Zod-compatible schema library. eRPC uses `zod` for input/output validation in procedures.
+Peer dependency: a Zod-compatible schema library. eRPC validates procedure input and output through `zod`.
 
 ## Define procedures
 
@@ -30,7 +30,7 @@ const router = {
 };
 ```
 
-The router is a plain object — keys are procedure names, values are procedures. Share it between server and client as a **type**. The client infers the entire API surface from `typeof router` without ever importing the runtime code.
+The router is a plain object. Keys are procedure names, values are procedures. Share it between server and client as a **type** — the client infers the whole API surface from `typeof router` and never imports the runtime code.
 
 ## Configure authentication
 
@@ -38,7 +38,7 @@ eRPC requires at least one authentication method.
 
 ### PSK (shared secret)
 
-Both sides hold the same 32-byte key. Simplest and fastest.
+Both sides hold the same 32-byte key. Cheapest mode, no signature ops on the hot path.
 
 ```typescript
 const sharedSecret = crypto.getRandomValues(new Uint8Array(32));
@@ -46,9 +46,9 @@ const sharedSecret = crypto.getRandomValues(new Uint8Array(32));
 const auth = { psk: () => sharedSecret };
 ```
 
-`psk()` may return the same `Uint8Array` across calls — eRPC reads it and never mutates the buffer. Lifecycle is yours: zero it yourself if and when the secret should disappear from memory.
+`psk()` may return the same `Uint8Array` across calls. eRPC reads it and never mutates the buffer. Lifecycle stays with you: zero it yourself if the secret should disappear from memory.
 
-For better security, derive a fresh PSK from a per-session identifier:
+A single static PSK works, but a per-session derivation is harder to misuse — leaked traffic only compromises one session, not every past or future one:
 
 ```typescript
 import { deriveSessionPSK } from "@dotex/erpc";
@@ -64,7 +64,7 @@ const auth = {
 
 ### Asymmetric (signatures)
 
-For public clients or when device-level identity matters. The signer proves identity over the handshake transcript; the verifier rejects bad signatures.
+For public clients, or when device-level identity matters. The signer proves identity over the handshake transcript; the verifier rejects bad signatures.
 
 ```typescript
 const auth = {
@@ -93,11 +93,11 @@ const auth = createEd25519ServerAuth({
 });
 ```
 
-All built-in helpers (Ed25519, ECDSA, JWT, certificate, multifactor) bind their proof to the canonical handshake transcript automatically. See [Security: Built-in signature helpers](security.md#built-in-signature-helpers).
+All built-in helpers (Ed25519, ECDSA, JWT, certificate, multifactor) bind their proof to the canonical handshake transcript. See [Security → Built-in signature helpers](security.md#built-in-signature-helpers).
 
 ### Both (defense-in-depth)
 
-Combine them when you need both session binding and individual revocation.
+Combine them when you need session binding and per-key revocation at the same time.
 
 ```typescript
 const auth = {
@@ -120,7 +120,7 @@ const { destroy: destroyServer } = server(router, serverChannel, {
 });
 ```
 
-The server listens on a `Channel` — any bidirectional transport that can carry `Uint8Array`. See [Integrations](integrations.md) for ready-made adapters.
+The server listens on a `Channel`: any bidirectional transport that can carry `Uint8Array`. Ready-made adapters live in [Integrations](integrations.md).
 
 ## Connect the client
 
@@ -132,7 +132,7 @@ const { api, destroy: destroyClient } = client<typeof router>(clientChannel, {
 });
 ```
 
-Construction is **synchronous**. The handshake is lazy — it runs on the first call, not when the client is created. No top-level `await`.
+Construction is **synchronous**. The handshake is lazy: it runs on the first call, not when the client is created. No top-level `await`.
 
 ## Make calls
 
@@ -141,7 +141,7 @@ const result = await api.greet({ name: "World" });
 console.log(result.message); // "Hello, World!"
 ```
 
-Handshake, encryption, msgpack serialization, schema validation — handled. If the session drops, the client retries once with a fresh handshake. See [API: Auto-Retry](api.md).
+Handshake, encryption, msgpack serialization, schema validation — all handled internally. If the session drops, the client retries once with a fresh handshake. See [API: Auto-Retry](api.md).
 
 ## End-to-end example
 
@@ -225,10 +225,10 @@ server(router, channel, {
 
 ## Error handling
 
-Two error types:
+Two error types, and the distinction matters because they imply different recovery paths.
 
-- `RPCError` — local failure (timeout, session lost, validation error, handshake failure)
-- `RemoteRPCError` — error returned from the remote peer (carries `code`, `message`, `data`)
+- `RPCError` — local failure: timeout, session lost, validation error, handshake failure. Worth retrying or surfacing as a transient problem.
+- `RemoteRPCError` — the remote peer's handler threw. Carries `code`, `message`, `data`. The other side is alive and made a deliberate decision.
 
 ```typescript
 import { RPCError, RemoteRPCError } from "@dotex/erpc";
@@ -250,11 +250,11 @@ try {
 
 ## Choosing an auth mode
 
-**PSK** when you control both endpoints — server-to-server, internal services, parent ↔ iframe of the same origin. Fast (no signature ops). Simple.
+PSK fits when you control both endpoints: server-to-server, internal services, an iframe talking to its parent on the same origin. No signature work per handshake.
 
-**Asymmetric** when one side is untrusted or there is no shared secret — public web clients, mobile apps, IoT devices. Per-device revocation.
+Asymmetric fits when one side is untrusted or there is no safe place to put a shared secret: public browser clients, mobile apps, IoT devices. Each key revokes independently.
 
-**Both** when you want session binding *and* per-device identity — regulated environments, high-value systems.
+Use both when you need session binding *and* per-device identity. Regulated environments, high-value systems. An attacker now has to compromise the derivation secret *and* a device key, and forward secrecy still protects past traffic if either leaks.
 
 ## Next steps
 

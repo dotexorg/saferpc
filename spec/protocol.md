@@ -1,20 +1,20 @@
 # Protocol
 
-A complete, language-agnostic specification of the eRPC wire protocol. Read this if you want to port eRPC to another language, audit the security, or build a compatible implementation. Everything below is normative.
+Language-agnostic specification of the eRPC wire protocol. Read this to port eRPC, audit it, or build a compatible implementation. Everything below is normative.
 
-The reference implementation is TypeScript. This document is the contract; the code follows it.
+The reference implementation is in TypeScript, but this document is the contract — the code follows it.
 
 ## Goals and non-goals
 
 Design constraints, in order:
 
 1. **Encrypted by default.** No "plaintext mode."
-2. **Lazy.** No work happens until the application makes a call. `client()` and `server()` return synchronously.
-3. **Resilient.** Either side can fail and re-handshake without coordination from the application.
-4. **Transport-agnostic.** The protocol must work over any byte-pipe — duplex socket, message pair, broadcast bus.
-5. **No long-lived state in the protocol.** PSK rotation, key revocation, replay caches — application concerns.
+2. **Lazy.** No work runs until the application makes a call. `client()` and `server()` return synchronously.
+3. **Resilient.** Either side can fail and re-handshake without coordination from the application layer.
+4. **Transport-agnostic.** Any byte pipe will do: duplex socket, message pair, broadcast bus.
+5. **No long-lived state in the protocol.** PSK rotation, key revocation, replay caches — those belong to the application.
 
-Non-goals: in-protocol streaming RPCs, multiplexing over a single channel, formal session tickets, ordering guarantees beyond what the transport provides.
+Non-goals: streaming RPCs in-protocol, multiplexing over a single channel, formal session tickets, ordering guarantees stronger than what the transport provides.
 
 ## Primitives
 
@@ -106,7 +106,7 @@ A frame whose total length exceeds `MAX_MSG_BYTES` **must** be dropped. A frame 
 
 ## Handshake
 
-The handshake is one round-trip initiated by the client. It is **lazy**: the client does not send anything until the application makes its first RPC call.
+The handshake is one round-trip initiated by the client, and it is **lazy** — nothing goes on the wire until the application makes its first RPC call.
 
 ```mermaid
 sequenceDiagram
@@ -266,7 +266,7 @@ plaintext   = XSalsa20-Poly1305-decrypt(session_key, nonce, ciphertext, AD=∅)
 message     = sanitize(msgpack_decode(plaintext))
 ```
 
-A 24-byte random nonce gives 192 bits of entropy; collisions are negligible for any realistic message volume. eRPC does **not** use a counter — this trades slightly higher nonce size for stateless encoding and tolerance for out-of-order or duplicated transport delivery.
+A 24-byte random nonce gives 192 bits of entropy; collisions are negligible for any realistic message volume. eRPC does **not** use a counter. The trade is slightly larger nonces in exchange for stateless encoding and tolerance for out-of-order or duplicated transport delivery.
 
 ## RPC message format
 
@@ -366,7 +366,7 @@ Calls that received a `RemoteRPCError` (the server responded with `ok: false`) a
 
 ## Sanitization
 
-eRPC applies a strict sanitization pass to every decoded msgpack value, both inbound and outbound (on error payloads). Any of the following causes the protocol to reject the message:
+Every decoded msgpack value passes through a sanitization step, inbound and outbound (the latter on error payloads). Any of the following rejects the message:
 
 1. Recursion depth greater than 32 ⇒ `INVALID_DATA`.
 2. Any msgpack extension type, **including the built-in Timestamp (type -1)** ⇒ `INVALID_DATA`. The Timestamp extension is explicitly rejected because msgpack libraries hard-code its decoder.
@@ -375,7 +375,7 @@ eRPC applies a strict sanitization pass to every decoded msgpack value, both inb
 
 `Uint8Array` (msgpack `bin`) is preserved. `BigInt64` is decoded as JavaScript `BigInt`. Plain objects are rebuilt with `Object.create(null)` so prototype chains cannot be re-poisoned downstream.
 
-A port to a language without prototype pollution should still:
+A port to a language without prototype pollution still has to:
 
 - Reject extension types it does not know about.
 - Limit recursion depth.
@@ -420,7 +420,7 @@ Clients can also configure `verify`; on the client side the return value is unus
 | Stale request (after server reset) | Drop response (server-side guard) | Eventually times out, retries |
 | RPC handler throws non-`RPCError` | Send `{ c: "INTERNAL", m: "Internal error" }` | Surface as `RemoteRPCError` |
 
-"Drop silently" is deliberate. Any feedback at the wire level would help an attacker probe the implementation.
+Silent drops are deliberate. Any feedback at the wire level gives an attacker probing material.
 
 ## Compatibility
 
@@ -430,7 +430,7 @@ Clients can also configure `verify`; on the client side the return value is unus
 
 ## Implementation checklist
 
-A new-language port that ticks all of these is conformant:
+A new-language port that ticks every item is conformant:
 
 - [ ] Constants match the table above exactly.
 - [ ] X25519, XSalsa20-Poly1305, HKDF-SHA-256, HMAC-SHA-256 implementations are constant-time where the spec requires (proof comparison, MAC verification).
@@ -453,7 +453,7 @@ A new-language port that ticks all of these is conformant:
 - [ ] The proof is verified in constant time.
 - [ ] No information is sent back to a peer that sends a malformed frame.
 
-If all these hold and the test vectors below pass, two implementations interoperate.
+When every item holds and the test vectors below pass, two implementations interoperate.
 
 ## Test vectors
 
