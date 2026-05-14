@@ -9,17 +9,10 @@ The reference implementation is in TypeScript, but this document is the contract
 Design constraints, in order:
 
 1. **Encrypted by default.** No "plaintext mode."
-<<<<<<< HEAD
 2. **Lazy.** No work happens until the application makes a call. `client()` and `server()` return synchronously.
 3. **Resilient.** Either side can fail and re-handshake without coordination from the application.
 4. **Transport-agnostic.** The protocol must work over any byte-pipe: duplex socket, message pair, broadcast bus.
 5. **No long-lived state in the protocol.** Secret rotation, key revocation, replay caches: application concerns.
-=======
-2. **Lazy.** No work runs until the application makes a call. `client()` and `server()` return synchronously.
-3. **Resilient.** Either side can fail and re-handshake without coordination from the application layer.
-4. **Transport-agnostic.** Any byte pipe will do: duplex socket, message pair, broadcast bus.
-5. **No long-lived state in the protocol.** PSK rotation, key revocation, replay caches — those belong to the application.
->>>>>>> origin/main
 
 Non-goals: streaming RPCs in-protocol, multiplexing over a single channel, formal session tickets, ordering guarantees stronger than what the transport provides.
 
@@ -113,7 +106,7 @@ A frame whose total length exceeds `MAX_MSG_BYTES` **must** be dropped. A frame 
 
 ## Handshake
 
-The handshake is one round-trip initiated by the client, and it is **lazy** — nothing goes on the wire until the application makes its first RPC call.
+The handshake is one round-trip initiated by the client, and it is **lazy** - nothing goes on the wire until the application makes its first RPC call.
 
 ```mermaid
 sequenceDiagram
@@ -273,11 +266,7 @@ plaintext   = XSalsa20-Poly1305-decrypt(session_key, nonce, ciphertext, AD=∅)
 message     = sanitize(msgpack_decode(plaintext))
 ```
 
-<<<<<<< HEAD
 A 24-byte random nonce gives 192 bits of entropy. Collisions are negligible for any realistic message volume. eRPC does **not** use a counter. The trade-off: slightly higher nonce size in exchange for stateless encoding and tolerance for out-of-order or duplicated transport delivery.
-=======
-A 24-byte random nonce gives 192 bits of entropy; collisions are negligible for any realistic message volume. eRPC does **not** use a counter. The trade is slightly larger nonces in exchange for stateless encoding and tolerance for out-of-order or duplicated transport delivery.
->>>>>>> origin/main
 
 ## RPC message format
 

@@ -17,11 +17,7 @@ Bidirectional byte streams. Each connection maps to one eRPC session.
 
 ### WebSocket
 
-<<<<<<< HEAD
 The most common case: browser or service talking to a server over WS.
-=======
-Browser or service talking to a server over WS. The case you probably have.
->>>>>>> origin/main
 
 ```typescript
 function wsChannel(ws: WebSocket): Channel {
@@ -252,11 +248,7 @@ const { api } = client<typeof router>(extensionPortChannel(port), {
 });
 ```
 
-<<<<<<< HEAD
 `getExtensionPSK()` is whatever your extension uses to derive a secret both sides agree on. Extension ID + version + a stored secret, for example.
-=======
-`getExtensionPSK()` is whatever your extension uses to derive a key both sides agree on, for example extension ID plus version plus a stored secret.
->>>>>>> origin/main
 
 ### BroadcastChannel
 
@@ -332,11 +324,7 @@ const { api } = client<typeof router>(webRTCChannel(dataChannel), {
 
 ## Split-channel transports
 
-<<<<<<< HEAD
 Asymmetric transports work too. You only need a `send` and a `receive`, not a single duplex socket.
-=======
-Asymmetric transports work too. The contract is `send` and `receive`, not a single duplex socket.
->>>>>>> origin/main
 
 ### Server-Sent Events + fetch
 
@@ -378,16 +366,8 @@ The server side needs an in-memory map from session to SSE stream so it knows wh
 
 The rules are the same as everywhere else:
 
-<<<<<<< HEAD
 1. `send` accepts `Uint8Array` and gets it to the other side.
 2. `receive(cb)` calls `cb` with each incoming `Uint8Array`. It returns an unsubscribe function.
 3. The transport is allowed to drop, duplicate, or reorder messages. eRPC will time out and retry. It will not behave correctly if your transport silently corrupts bytes. Wrap it in something that fails noisily if you cannot trust it.
 
 That is the whole API surface. Encryption, framing, retry, key management: all on the eRPC side. Your adapter does not need to care.
-=======
-1. `send` accepts a `Uint8Array` and gets it to the other side.
-2. `receive(cb)` calls `cb` with each incoming `Uint8Array` and returns an unsubscribe function.
-3. The transport may drop, duplicate, or reorder messages — eRPC will time out and retry. Silent byte corruption breaks the protocol, so wrap any transport you cannot trust in something that fails noisily.
-
-That is the entire API surface. Encryption, framing, retry, key management all live inside eRPC. The adapter is not in the security boundary.
->>>>>>> origin/main

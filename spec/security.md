@@ -49,15 +49,9 @@ auth: {
 }
 ```
 
-<<<<<<< HEAD
 Use when both endpoints are controlled by the same entity, secrets can be rotated, and individual revocation is not required. A pre-shared secret is cheap: no signature operations on the hot path.
 
 > The secret buffer's lifecycle belongs to the caller. eRPC reads it during HKDF and never mutates it. Returning the same `Uint8Array` from `secret()` across handshakes is safe; if you want it zeroed, zero it yourself when the secret is no longer needed.
-=======
-Fits when both endpoints belong to the same entity, secrets can be rotated, and you do not need per-identity revocation. No signature work on the hot path.
-
-> The PSK buffer's lifecycle belongs to the caller. eRPC reads it during HKDF and never mutates it. Returning the same `Uint8Array` from `psk()` across handshakes is safe. If you want it zeroed, zero it yourself when the secret is no longer needed.
->>>>>>> origin/main
 
 ### Asymmetric only
 
@@ -88,11 +82,7 @@ auth: {
 }
 ```
 
-<<<<<<< HEAD
 Use when you want session binding *and* identity proof. An attacker must now compromise two independent things (the derivation secret and the device key) and still cannot read past sessions because of forward secrecy.
-=======
-Fits when you need session binding *and* identity proof. The attacker now has to compromise both the derivation secret and the device key, and forward secrecy still protects past traffic if either one leaks.
->>>>>>> origin/main
 
 ### Comparison
 
@@ -106,11 +96,7 @@ Fits when you need session binding *and* identity proof. The attacker now has to
 | Cost | Low (HMAC only) | Higher (signature ops) |
 | Complexity | Simple | More moving parts |
 
-<<<<<<< HEAD
 Forward secrecy comes from the ephemeral X25519 exchange in either mode. Even if a long-term secret leaks, past session ciphertexts remain unreadable. The ephemeral private keys were zeroed when the session ended.
-=======
-Forward secrecy comes from the ephemeral X25519 exchange in either mode. A leaked long-term secret cannot decrypt past traffic, because the ephemeral private keys are zeroed when each session ends.
->>>>>>> origin/main
 
 ## Transcript format
 
@@ -134,7 +120,7 @@ REPLY transcript:
 Prefix, epoch, and per-handshake nonce together defeat:
 
 - Replay across direction — hello and reply use different prefixes
-- Replay across handshake attempts — epoch differs each time
+- Replay across handshake attempts - epoch differs each time
 - Substitution attacks — an active MITM cannot swap either ephemeral public key without invalidating the signature
 
 For the full wire layout of the frames that carry these signatures, see [Protocol § Frame format](protocol.md#frame-format).
@@ -234,11 +220,7 @@ auth: { ...clientAuth }
 auth: { ...serverAuth }
 ```
 
-<<<<<<< HEAD
 Uses `@noble/curves` so it works in every JS runtime. No dependency on WebCrypto Ed25519, which is not uniformly available across browsers.
-=======
-Built on `@noble/curves` so it runs in every JS runtime. WebCrypto Ed25519 is not uniformly available across browsers, and the helper sidesteps that.
->>>>>>> origin/main
 
 ### ECDSA P-256 (WebCrypto)
 
@@ -271,15 +253,9 @@ const serverAuth = createJWTServerAuth({
 });
 ```
 
-<<<<<<< HEAD
 The JWT helper does **not** sign the transcript. JWTs are bearer tokens. Instead, the client embeds `{ jwt, ts, th = SHA-256(transcript) }` in the auth payload, and the server validates the JWT, the timestamp (symmetric `maxAge` skew, so future-dated forgeries are rejected too), and the transcript digest in constant time.
 
 The transcript digest prevents replay of a captured auth payload into a different handshake — the digest was computed over the old transcript and will not match the new one. It does **not** prevent an attacker who has obtained the JWT itself from mounting a fresh handshake with their own ephemeral key and recomputing the digest. JWTs are bearer credentials: anyone holding one can authenticate until it expires. Combine with PSK or a real signature mode when this matters.
-=======
-The JWT helper does **not** sign the transcript: JWTs are bearer tokens. The client embeds `{ jwt, ts, th = SHA-256(transcript) }` in the auth payload, and the server validates the JWT, the timestamp (symmetric `maxAge` skew, so future-dated forgeries are rejected too), and the transcript digest in constant time. A captured payload can only be replayed inside a handshake that produces the same transcript, which means an attacker cannot mount a new handshake with their own ephemeral key.
-
-A leaked JWT still authenticates the attacker for as long as the token is valid. Combine with PSK or a real signature mode when that matters.
->>>>>>> origin/main
 
 ### Certificate-based
 
@@ -308,11 +284,7 @@ The client embeds `{ primary, secondary }`: two pre-encoded sub-payloads.
 
 ## Replay within a session
 
-<<<<<<< HEAD
 eRPC uses random 24-byte nonces (not counters) for XSalsa20-Poly1305. The collision probability is negligible. But **a captured ciphertext can be replayed by an attacker who can inject into a live channel**. The replayed message will decrypt and execute again.
-=======
-eRPC uses random 24-byte nonces for XSalsa20-Poly1305, not counters. Collision probability is negligible, but **a captured ciphertext can still be replayed by an attacker who can inject into a live channel**. The replay decrypts and executes again.
->>>>>>> origin/main
 
 For non-idempotent operations, add an idempotency key inside the procedure input, or keep a request-ID set on the server keyed by the verified principal.
 

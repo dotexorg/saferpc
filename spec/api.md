@@ -93,11 +93,7 @@ Subscribes to `channel` and serves the router. Returns synchronously.
 
 `context` runs per request. The `auth` argument carries whatever `auth.verify` returned for the current session. When `context` is omitted, the request context falls back to the verified auth data (or `{}` if none).
 
-<<<<<<< HEAD
-`onError` is called on handshake failures and non-fatal internal errors. The server does **not** destroy on handshake failure. It resets and accepts the next hello.
-=======
 `onError` fires on handshake failures and non-fatal internal errors. The server does **not** destroy itself on a failed handshake — it resets and accepts the next hello.
->>>>>>> origin/main
 
 ### `AuthOptions`
 
@@ -114,11 +110,7 @@ interface AuthOptions {
 type VerifyResult = { auth?: Ctx } | void;
 ```
 
-<<<<<<< HEAD
-At least one of `secret` or asymmetric (`sign` / `verify`) must be set. Configuring neither throws a `TypeError` at construction.
-=======
-Set at least one of `psk` or asymmetric (`sign` / `verify`). Configuring neither throws a `TypeError` at construction.
->>>>>>> origin/main
+Set at least one of `secret` or asymmetric (`sign` / `verify`). Configuring neither throws a `TypeError` at construction.
 
 | Field | Called | Notes |
 |-------|--------|-------|
@@ -196,11 +188,7 @@ idle → handshaking → ready
 
 ## Auto-retry
 
-<<<<<<< HEAD
-When a call fails on a `ready` session with a local `TIMEOUT` or send error, the client zeros its session key, returns to `idle`, runs a fresh handshake, and resends the request **exactly once**. `RemoteRPCError` (server returned an error) is **not** retried. The server is alive and gave a real answer. Concurrent failures share one re-handshake via an epoch counter; no infinite loops. Full state-machine and wire-level semantics in [Protocol § Auto-retry semantics](protocol.md#auto-retry-semantics).
-=======
 A call that fails on a `ready` session with a local `TIMEOUT` or send error triggers a single retry: the client zeros its session key, returns to `idle`, runs a fresh handshake, and resends the request **exactly once**. `RemoteRPCError` (server returned an error) is **not** retried — the server is alive and answered. Concurrent failures share one re-handshake via an epoch counter, so there are no retry storms. Full state-machine and wire-level semantics in [Protocol § Auto-retry semantics](protocol.md#auto-retry-semantics).
->>>>>>> origin/main
 
 ## Replay within a session
 
@@ -223,11 +211,7 @@ The only transport contract. `receive` returns an unsubscribe function. The chan
 - Deliver each call to `cb` once, in any order
 - Allow `send` and `receive` to run concurrently
 
-<<<<<<< HEAD
-It is **allowed** to drop messages, duplicate them, or reorder them. eRPC will time out and retry. Ready-made adapters live in [Integrations](integrations.md).
-=======
 Dropping, duplicating, or reordering messages is allowed — eRPC will time out and retry. Ready-made adapters live in [Integrations](integrations.md).
->>>>>>> origin/main
 
 > Within a single session the protocol assumes the `TAG_HELLO` reply arrives before any `TAG_MSG` sent under the resulting session key. Transports that can reorder *across* the hello/reply boundary (multi-path links, fan-out buses) will hang the handshake until the timeout fires. `TAG_MSG`-to-`TAG_MSG` reordering stays safe: every encrypted frame is independently authenticated and the protocol imposes no ordering on application messages.
 
@@ -246,11 +230,7 @@ class RemoteRPCError extends RPCError {}
 ```
 
 - `RPCError` is thrown for **local** failures: timeout, session destroyed, handshake failure, validation failure, channel error.
-<<<<<<< HEAD
-- `RemoteRPCError` is thrown when the remote peer's handler returned an error. The `code`, `message`, and `data` come from the remote side. Treat them as **untrusted strings**. Do not log them at warn/error level without sanitization.
-=======
 - `RemoteRPCError` is thrown when the remote peer's handler returned an error. The `code`, `message`, and `data` come from the remote side and are **untrusted strings** — sanitize before logging at warn/error level, or before showing them to a user.
->>>>>>> origin/main
 
 ### Standard local error codes
 
@@ -266,11 +246,7 @@ class RemoteRPCError extends RPCError {}
 | `INTERNAL` | Defensive: should not be reachable |
 | `MIDDLEWARE` | Middleware misuse (`next()` called twice, bad `extra` arg) |
 
-<<<<<<< HEAD
-Handlers may throw `RPCError(...)` with any code. Those codes become `RemoteRPCError.code` on the client.
-=======
 Handlers may throw `RPCError(...)` with any code; those codes surface as `RemoteRPCError.code` on the client.
->>>>>>> origin/main
 
 ### Pattern
 
@@ -334,11 +310,7 @@ HKDF-SHA-256 over `secret` with `sessionId` as salt and the fixed info string `"
 
 Throws `TypeError` if `sessionId` is empty or `secret` is shorter than 32 bytes.
 
-<<<<<<< HEAD
-Use to bind each handshake to a session identifier instead of holding a single static secret.
-=======
-Use it to bind each handshake to a session identifier instead of relying on a single static PSK.
->>>>>>> origin/main
+Use it to bind each handshake to a session identifier instead of relying on a single static secret.
 
 ---
 
