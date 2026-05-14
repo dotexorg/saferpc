@@ -1,6 +1,6 @@
 {
   "name": "@dotex/erpc",
-  "version": "0.3.1",
+  "version": "0.3.2",
   "description": "Encrypted RPC for any two counterparties over any bidirectional channel",
   "type": "module",
   "files": [
