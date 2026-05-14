@@ -66,7 +66,9 @@ describe("deriveSessionSecret", () => {
 
   it("rejects a secret shorter than KEY_LEN", () => {
     for (const len of [0, 1, 16, 31]) {
-      expect(() => deriveSessionSecret("s", randomBytes(len))).toThrow(TypeError);
+      expect(() => deriveSessionSecret("s", randomBytes(len))).toThrow(
+        TypeError,
+      );
     }
   });
 

@@ -98,7 +98,10 @@ describe("security / handshake attacks", () => {
     const srv = server(
       { ping: chain().handler(async () => "pong") } as Router,
       a,
-      { auth: { secret: () => psk }, onError: (e) => errors.push(e as RPCError) },
+      {
+        auth: { secret: () => psk },
+        onError: (e) => errors.push(e as RPCError),
+      },
     );
 
     const badPayload = mpEncode({
@@ -131,7 +134,10 @@ describe("security / handshake attacks", () => {
     const srv = server(
       { ping: chain().handler(async () => "pong") } as Router,
       a,
-      { auth: { secret: () => psk }, onError: (e) => errors.push(e as RPCError) },
+      {
+        auth: { secret: () => psk },
+        onError: (e) => errors.push(e as RPCError),
+      },
     );
 
     mitm.injectToA(

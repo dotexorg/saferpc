@@ -396,7 +396,10 @@ export function client<T extends Router>(
             auth.secret !== undefined ? await auth.secret() : EMPTY_SECRET;
           if (state !== "handshaking" || epoch !== currentEpoch) return;
 
-          if (!(secretBytes instanceof Uint8Array) || secretBytes.length < KEY_LEN) {
+          if (
+            !(secretBytes instanceof Uint8Array) ||
+            secretBytes.length < KEY_LEN
+          ) {
             throw new RPCError(
               "HANDSHAKE",
               `secret must be a Uint8Array of at least ${KEY_LEN} bytes`,
