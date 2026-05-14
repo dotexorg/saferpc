@@ -1,6 +1,6 @@
 # Integrations
 
-eRPC needs one thing from the transport: it must move `Uint8Array` in both directions. That is the whole contract.
+eRPC asks one thing of the transport: it must move `Uint8Array` in both directions. That is the whole contract.
 
 ```typescript
 interface Channel {
@@ -9,7 +9,7 @@ interface Channel {
 }
 ```
 
-Everything below is a one-screen adapter that satisfies that interface. Each one is a few lines of glue around a native transport. None of them need to know what eRPC does.
+Everything below is a one-screen adapter that satisfies that interface. Each one is a few lines of glue around a native transport, and none of them need to know what eRPC does.
 
 ## Duplex socket transports
 
@@ -17,7 +17,11 @@ Bidirectional byte streams. Each connection maps to one eRPC session.
 
 ### WebSocket
 
+<<<<<<< HEAD
 The most common case: browser or service talking to a server over WS.
+=======
+Browser or service talking to a server over WS. The case you probably have.
+>>>>>>> origin/main
 
 ```typescript
 function wsChannel(ws: WebSocket): Channel {
@@ -148,7 +152,7 @@ function postMessageChannel(target: Window, origin: string): Channel {
 }
 ```
 
-**Always check `origin`.** Skipping the check is how cross-window attacks happen. The wildcard `"*"` is fine for development but should never ship.
+**Always check `origin`.** Skipping it is how cross-window attacks happen. The wildcard `"*"` is fine in development and dangerous in production.
 
 ```typescript
 // Parent (server)
@@ -225,7 +229,7 @@ function extensionPortChannel(port: chrome.runtime.Port): Channel {
 }
 ```
 
-The `Array.from` round-trip is the price of `chrome.runtime`. For high-throughput extensions, consider `chrome.runtime.connect` between a content script and an offscreen document and switch to MessagePort there.
+The `Array.from` round-trip is the price of `chrome.runtime`. High-throughput extensions should pin a `chrome.runtime.connect` between a content script and an offscreen document, then switch to MessagePort there.
 
 ```typescript
 // background.js (service worker)
@@ -248,7 +252,11 @@ const { api } = client<typeof router>(extensionPortChannel(port), {
 });
 ```
 
+<<<<<<< HEAD
 `getExtensionPSK()` is whatever your extension uses to derive a secret both sides agree on. Extension ID + version + a stored secret, for example.
+=======
+`getExtensionPSK()` is whatever your extension uses to derive a key both sides agree on, for example extension ID plus version plus a stored secret.
+>>>>>>> origin/main
 
 ### BroadcastChannel
 
@@ -272,7 +280,7 @@ function broadcastChannel(name: string): Channel {
 }
 ```
 
-eRPC is a 1:1 protocol, so to use BroadcastChannel you need to elect a single server tab (leader). Other tabs become clients. The leader holds the session state; clients re-handshake when leadership moves.
+eRPC is a 1:1 protocol. To use BroadcastChannel, elect a single server tab (leader) and let other tabs become clients. The leader holds the session state; clients re-handshake when leadership moves.
 
 ```typescript
 const isLeader = await electLeader();
@@ -294,7 +302,7 @@ Direct connection between peers without a central relay.
 
 ### WebRTC DataChannel
 
-Peer-to-peer. Often paired with mutual signature auth because there is no shared infrastructure.
+Peer-to-peer, no central relay. Usually paired with mutual signature auth because there is no shared infrastructure to put a PSK on.
 
 ```typescript
 function webRTCChannel(dc: RTCDataChannel): Channel {
@@ -324,7 +332,11 @@ const { api } = client<typeof router>(webRTCChannel(dataChannel), {
 
 ## Split-channel transports
 
+<<<<<<< HEAD
 Asymmetric transports work too. You only need a `send` and a `receive`, not a single duplex socket.
+=======
+Asymmetric transports work too. The contract is `send` and `receive`, not a single duplex socket.
+>>>>>>> origin/main
 
 ### Server-Sent Events + fetch
 
@@ -360,14 +372,22 @@ function sseChannel(url: string): Channel {
 }
 ```
 
-The server side needs to keep an in-memory map from session to SSE stream so it knows where to send replies. The adapter is more involved than the duplex transports, but the eRPC code on top is identical.
+The server side needs an in-memory map from session to SSE stream so it knows where to send replies. The adapter is more involved than the duplex transports, but the eRPC code on top stays identical.
 
 ## Custom transports
 
-The rules do not change:
+The rules are the same as everywhere else:
 
+<<<<<<< HEAD
 1. `send` accepts `Uint8Array` and gets it to the other side.
 2. `receive(cb)` calls `cb` with each incoming `Uint8Array`. It returns an unsubscribe function.
 3. The transport is allowed to drop, duplicate, or reorder messages. eRPC will time out and retry. It will not behave correctly if your transport silently corrupts bytes. Wrap it in something that fails noisily if you cannot trust it.
 
 That is the whole API surface. Encryption, framing, retry, key management: all on the eRPC side. Your adapter does not need to care.
+=======
+1. `send` accepts a `Uint8Array` and gets it to the other side.
+2. `receive(cb)` calls `cb` with each incoming `Uint8Array` and returns an unsubscribe function.
+3. The transport may drop, duplicate, or reorder messages — eRPC will time out and retry. Silent byte corruption breaks the protocol, so wrap any transport you cannot trust in something that fails noisily.
+
+That is the entire API surface. Encryption, framing, retry, key management all live inside eRPC. The adapter is not in the security boundary.
+>>>>>>> origin/main
