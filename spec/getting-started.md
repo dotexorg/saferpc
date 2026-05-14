@@ -84,9 +84,17 @@ import type { AppRouter } from "./router";
 
 const secret = new Uint8Array([/* same 32 bytes as the server */]);
 
-function wsChannel(ws: WebSocket): Channel {
+function wsChannel(url: string): Channel {
+  const ws = new WebSocket(url);
+  ws.binaryType = "arraybuffer";
+  
+  const ready = new Promise<void>((resolve) =>
+    ws.addEventListener("open", () => resolve(), { once: true }),
+  );
+  
   return {
-    send(data) {
+    async send(data) {
+      await ready;
       ws.send(data);
     },
     receive(cb) {
@@ -99,13 +107,7 @@ function wsChannel(ws: WebSocket): Channel {
   };
 }
 
-const ws = new WebSocket("ws://localhost:8080");
-ws.binaryType = "arraybuffer";
-await new Promise<void>((resolve) =>
-  ws.addEventListener("open", () => resolve(), { once: true })
-);
-
-const { api } = client<AppRouter>(wsChannel(ws), {
+const { api } = client<AppRouter>(wsChannel("ws://localhost:8080"), {
   auth: { secret: () => secret },
 });
 

@@ -1,13 +1,13 @@
 # Encrypted RPC
 
 <!-- NAV
-## Overview
+## Intro
 - [Encrypted RPC](index.md)
 
 ## Get Started
-- [Quickstart](spec/getting-started.md)
+- [📦 Quickstart](spec/getting-started.md)
 
-## Concepts
+## Learn
 - [Security & Auth](spec/security.md)
 - [Transports & Integrations](spec/integrations.md)
 
