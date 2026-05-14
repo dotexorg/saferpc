@@ -19,7 +19,7 @@ import {
   zero,
   sanitize,
   isPlainBytes,
-  isEmptyPsk,
+  isEmptySecret,
   toPlainBytes,
   mpEncode,
   mpDecode,
@@ -28,7 +28,7 @@ import {
   createEncryptor,
   createDecryptor,
   validateAuthConfig,
-  EMPTY_PSK,
+  EMPTY_SECRET,
   buildHelloTranscript,
   buildReplyTranscript,
   RPCError,
@@ -46,7 +46,7 @@ const MAX_ID_LEN = 64;
 
 export interface ServerOptions {
   /**
-   * Authentication configuration. At least one of `psk` OR asymmetric
+   * Authentication configuration. At least one of `secret` OR asymmetric
    * auth (`sign`/`verify`) MUST be configured.
    */
   auth: AuthOptions;
@@ -346,7 +346,7 @@ export function server<T extends Router>(
           }
 
           // Strict epoch validation on the wire. `encodeEpoch` enforces
-          // the same predicate inside transcript building, but PSK-only
+          // the same predicate inside transcript building, but secret-only
           // paths never reach it — validate here so every path is strict.
           const clientEpoch = hello["epoch"];
           if (
@@ -397,38 +397,41 @@ export function server<T extends Router>(
           }
           // If `verify` is not configured, hello.auth is ignored even
           // if the client embedded one. This preserves backward
-          // compatibility with PSK-only deployments.
+          // compatibility with secret-only deployments.
 
           rawShared = x25519.getSharedSecret(myPriv, clientPub);
           // Private key no longer needed; zero our copy immediately.
           zero(myPriv);
 
-          const pskBytes =
-            auth.psk !== undefined ? await auth.psk() : EMPTY_PSK;
+          const secretBytes =
+            auth.secret !== undefined ? await auth.secret() : EMPTY_SECRET;
           if (epoch !== myEpoch || destroyed) return;
 
-          if (!(pskBytes instanceof Uint8Array) || pskBytes.length < KEY_LEN) {
+          if (
+            !(secretBytes instanceof Uint8Array) ||
+            secretBytes.length < KEY_LEN
+          ) {
             throw new RPCError(
               "HANDSHAKE",
-              `PSK must be a Uint8Array of at least ${KEY_LEN} bytes`,
+              `secret must be a Uint8Array of at least ${KEY_LEN} bytes`,
             );
           }
-          if (auth.psk !== undefined && isEmptyPsk(pskBytes)) {
+          if (auth.secret !== undefined && isEmptySecret(secretBytes)) {
             throw new RPCError(
               "HANDSHAKE",
-              "Application returned an all-zero PSK",
+              "Application returned an all-zero secret",
             );
           }
 
-          // The caller owns the PSK buffer's lifecycle — do NOT mutate it.
+          // The caller owns the secret buffer's lifecycle — do NOT mutate it.
           // A `() => sharedSecret` pattern would break on the next handshake.
-          localSessionKey = deriveSessionKey(rawShared, pskBytes);
+          localSessionKey = deriveSessionKey(rawShared, secretBytes);
           localProof = computeProof(localSessionKey, myPub, clientPub, nonce);
 
           // ── Server-side auth production ──────────────────
           // If `sign` is configured, sign over the canonical reply
           // transcript (which binds BOTH ephemeral pubs) so the client
-          // can authenticate the server beyond what PSK alone provides.
+          // can authenticate the server beyond what the secret alone provides.
           // Computed BEFORE state transition so a failure here cleanly
           // resets the handshake.
           if (auth.sign !== undefined) {
@@ -522,7 +525,7 @@ export function server<T extends Router>(
 
         // First valid decrypt confirms the session.
         // The client proved it has the correct sessionKey (which
-        // requires the correct PSK) by producing a valid ciphertext.
+        // requires the correct secret) by producing a valid ciphertext.
         if (state === "pending") {
           clearHsTimer();
           state = "ready";
@@ -551,11 +554,7 @@ export function server<T extends Router>(
 
         try {
           if (!(procedure in frozen)) {
-            // Do NOT echo the attacker-controlled procedure name on the
-            // wire — keep it in onError-only data for debuggability.
-            throw new RPCError("NOT_FOUND", "Procedure not found", {
-              procedure,
-            });
+            throw new RPCError("NOT_FOUND", "Procedure not found");
           }
           const proc = frozen[procedure]!;
           // Snapshot auth data at request time so re-handshake mid-flight

@@ -2,12 +2,12 @@
  * Authentication utilities
  */
 
-// ─── Session-Derived PSK Helper ─────────────────────────────
+// ─── Session-Derived Secret Helper ─────────────────────────────
 
 /**
- * Re-export deriveSessionPSK for convenience
+ * Re-export deriveSessionSecret for convenience
  */
-export { deriveSessionPSK } from "./common.ts";
+export { deriveSessionSecret } from "./common.ts";
 
 // ─── Re-exports for convenience ──────────────────────────────
 

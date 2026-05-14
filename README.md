@@ -4,7 +4,7 @@
 [![license](https://img.shields.io/npm/l/@dotex/erpc.svg)](./LICENSE)
 [![types](https://img.shields.io/badge/types-TypeScript-blue.svg)](https://www.typescriptlang.org/)
 
-**Encrypted, typed RPC over any bidirectional channel.** Two peers, one shared secret (or one keypair), every call end-to-end encrypted with XSalsa20-Poly1305 AEAD. WebSocket, `postMessage`, `MessagePort`, `chrome.runtime`, `BroadcastChannel`, WebRTC — if it can carry bytes, eRPC encrypts and types them.
+**Encrypted, typed RPC over any bidirectional channel.** Two peers, one shared secret (or one keypair). Every call is end-to-end encrypted with XSalsa20-Poly1305 AEAD. WebSocket, `postMessage`, `MessagePort`, `chrome.runtime`, `BroadcastChannel`, WebRTC — if a channel can carry bytes, eRPC encrypts and types what flows through it.
 
 Think tRPC, but transport-agnostic and encrypted by default.
 
@@ -19,13 +19,13 @@ npm install @dotex/erpc
 
 ## Highlights
 
-- **Typed procedures** with Zod input/output validation.
-- **End-to-end encryption** — X25519 ECDH, XSalsa20-Poly1305 AEAD, HKDF-SHA-256, forward secrecy.
-- **Lazy handshake** on first call, transparent auto-retry on session drop.
-- **Three auth modes** — PSK, asymmetric (Ed25519 / ECDSA / JWT / cert / multifactor), or both for defense-in-depth.
-- **Synchronous** `client()` / `server()` — works in Node.js, browsers, Service Workers, React Native, Vercel Edge, Cloudflare Workers, Deno Deploy.
-- **Tiny surface** — `@noble/*` crypto, `@msgpack/msgpack`, `zod`, and nothing else.
-- **Pure ESM + CJS dual build**, side-effect-free, tree-shakeable.
+- **Typed procedures** with Zod input/output validation
+- **End-to-end encryption.** X25519 ECDH, XSalsa20-Poly1305 AEAD, HKDF-SHA-256, with forward secrecy by design
+- **Lazy handshake** on the first call. Transparent auto-retry when the session drops
+- **Three auth modes:** pre-shared secret, asymmetric (Ed25519 / ECDSA / JWT / cert / multifactor), or both for defense-in-depth
+- **Synchronous** `client()` and `server()`. Runs in Node.js, browsers, Service Workers, React Native, Vercel Edge, Cloudflare Workers, Deno Deploy
+- **Tiny surface.** `@noble/*` crypto, `@msgpack/msgpack`, `zod`, and nothing else
+- **Pure ESM + CJS dual build**, side-effect-free, tree-shakeable
 
 ## Quick start
 
@@ -44,8 +44,8 @@ const router = {
     })),
 };
 
-const psk = crypto.getRandomValues(new Uint8Array(32));
-const auth = { psk: () => psk };
+const secret = crypto.getRandomValues(new Uint8Array(32));
+const auth = { secret: () => secret };
 
 const { destroy: stopServer } = server(router, serverChannel, { auth });
 const { api, destroy: stopClient } = client<typeof router>(clientChannel, { auth });
@@ -53,9 +53,9 @@ const { api, destroy: stopClient } = client<typeof router>(clientChannel, { auth
 const { message } = await api.greet({ name: "World" });
 ```
 
-`client()` and `server()` are synchronous — no top-level `await`. The handshake runs lazily on the first procedure call. If the session drops, the next call retries once with a fresh handshake.
+`client()` and `server()` are synchronous. No top-level `await`. The handshake runs lazily on the first procedure call. If the session drops, the next call retries once with a fresh handshake.
 
-## Channel — the only transport contract
+## Channel: the only transport contract
 
 ```typescript
 interface Channel {
@@ -68,27 +68,27 @@ Anything that satisfies this can host an eRPC session. Ready-made adapters for W
 
 ## Authentication
 
-Three modes, all configured through the same `auth` block.
+Three modes. The `auth` block is the same shape in all three.
 
 ```typescript
-// PSK only — simple, fast, controlled environments
-auth: { psk: () => sharedSecret }
+// Secret only. Simple, fast, controlled environments.
+auth: { secret: () => sharedSecret }
 
-// Asymmetric only — public clients, no shared secrets
+// Asymmetric only. Public clients, no shared secrets.
 auth: {
   sign: (transcript) => signWithDeviceKey(transcript),
   verify: (proof, transcript) => verifyPeerSignature(proof, transcript),
 }
 
-// Both — defense-in-depth (session binding + identity proof)
+// Both. Session binding plus identity proof.
 auth: {
-  psk: () => deriveSessionPSK(sessionId, deploymentSecret),
+  secret: () => deriveSessionSecret(sessionId, deploymentSecret),
   sign: (transcript) => signWithDeviceKey(transcript),
   verify: (proof, transcript) => verifyPeerSignature(proof, transcript),
 }
 ```
 
-Built-in helpers for Ed25519, ECDSA P-256, JWT, certificate-based, and multifactor auth — all transcript-bound, so captured payloads can't be replayed. See [spec/security.md](./spec/security.md) for the threat model.
+Built-in helpers cover Ed25519, ECDSA P-256, JWT, certificate-based, and multifactor auth. All bind their proof to the handshake transcript, so a captured payload cannot be replayed into a new session. The full threat model lives in [spec/security.md](./spec/security.md).
 
 ## Errors
 
@@ -99,9 +99,9 @@ try {
   await api.greet({ name: "World" });
 } catch (err) {
   if (err instanceof RemoteRPCError) {
-    // The remote peer threw — err.code / err.message / err.data come from there
+    // The remote peer threw. err.code / err.message / err.data come from there.
   } else if (err instanceof RPCError) {
-    // Local failure — TIMEOUT, SESSION, HANDSHAKE, INPUT_VALIDATION, ...
+    // Local failure: TIMEOUT, SESSION, HANDSHAKE, INPUT_VALIDATION, ...
   } else {
     throw err;
   }
@@ -112,18 +112,18 @@ try {
 
 ```
 src/
-  common.ts       — Shared types, crypto, msgpack, chain builder
-  server.ts       — Resilient handshake server
-  client.ts       — Lazy handshake client with auto-retry
-  auth.ts         — Re-exports for auth helpers
-  authClient.ts   — Ed25519, ECDSA, JWT client helpers
-  authServer.ts   — Ed25519, ECDSA, JWT, certificate, multifactor server helpers
-  index.ts        — Public entry point
+  common.ts       : shared types, crypto, msgpack, chain builder
+  server.ts       : resilient handshake server
+  client.ts       : lazy handshake client with auto-retry
+  auth.ts         : re-exports for auth helpers
+  authClient.ts   : Ed25519, ECDSA, JWT client helpers
+  authServer.ts   : Ed25519, ECDSA, JWT, certificate, multifactor server helpers
+  index.ts        : public entry point
 ```
 
 ```typescript
 import { chain, server, client, RPCError } from "@dotex/erpc";
-// Subpaths also available for tree-shaking:
+// Subpaths are also available for tree-shaking:
 import { server } from "@dotex/erpc/server";
 import { client } from "@dotex/erpc/client";
 import { chain, RPCError } from "@dotex/erpc/common";
@@ -136,6 +136,18 @@ Node.js 18+, modern browsers, Service / Web / Shared Workers, React Native, Verc
 ## Project status
 
 `0.x` with a stable wire protocol (`drpc-v1` HKDF info, `erpc-hs-{hello,reply}-v1` transcript prefixes). Test coverage for handshake attacks, replay, tampering, type confusion, prototype pollution, middleware misuse, and DoS limits lives in `test/security/`. A 1.0 release will lock the public API surface.
+
+## Releasing
+
+One command bumps the version, publishes to npm, and pushes the tag:
+
+```bash
+npm version patch    # or: minor / major / 1.2.3-beta.0
+```
+
+`prepublishOnly` runs lint, tests, and build before publishing. The `postversion` hook then runs `npm publish && git push --follow-tags`. The pushed `vX.Y.Z` tag triggers `.github/workflows/release.yml`, which verifies the version is live on npm and creates a GitHub Release with auto-generated changelog notes since the previous tag.
+
+If `npm publish` fails, the tag exists locally but is not pushed. Fix the issue and re-run `npm publish && git push --follow-tags`. To abort, run `git tag -d vX.Y.Z && git reset --hard HEAD~1`.
 
 ## License
 

@@ -1,6 +1,6 @@
-# Getting Started
+# Getting started
 
-Five minutes from `npm install` to encrypted, typed procedure calls. The shape is always the same: define a router, configure auth, attach a channel, call functions.
+Install, define a router, configure auth, attach a channel, call functions.
 
 ## Install
 
@@ -8,19 +8,20 @@ Five minutes from `npm install` to encrypted, typed procedure calls. The shape i
 npm install @dotex/erpc
 ```
 
-Peer dependency: a Zod-compatible schema library. eRPC uses `zod` for input/output validation in procedures.
+The only peer dependency is `zod` (or any library exposing `.safeParse()`).
 
-## Define procedures
+## Define a router
 
-A procedure has an input schema, an output schema, and a handler. Build one with `chain()`:
+One file, shared between server and client as a **type**. The client never imports the handler code.
 
 ```typescript
+// router.ts
 import { chain } from "@dotex/erpc";
 import { z } from "zod";
 
 const d = chain();
 
-const router = {
+export const router = {
   greet: d
     .input(z.object({ name: z.string() }))
     .output(z.object({ message: z.string() }))
@@ -28,43 +29,183 @@ const router = {
       message: `Hello, ${input.name}!`,
     })),
 };
+
+export type AppRouter = typeof router;
 ```
 
-The router is a plain object — keys are procedure names, values are procedures. Share it between server and client as a **type**. The client infers the entire API surface from `typeof router` without ever importing the runtime code.
+## Quick start: Node server, browser client over WebSocket
 
-## Configure authentication
-
-eRPC requires at least one authentication method.
-
-### PSK (shared secret)
-
-Both sides hold the same 32-byte key. Simplest and fastest.
+Generate a 32-byte secret once and paste the same bytes on both sides:
 
 ```typescript
-const sharedSecret = crypto.getRandomValues(new Uint8Array(32));
-
-const auth = { psk: () => sharedSecret };
+crypto.getRandomValues(new Uint8Array(32)); // run once, store the result
 ```
 
-`psk()` may return the same `Uint8Array` across calls — eRPC reads it and never mutates the buffer. Lifecycle is yours: zero it yourself if and when the secret should disappear from memory.
-
-For better security, derive a fresh PSK from a per-session identifier:
+### Server (Node.js, `ws` package)
 
 ```typescript
-import { deriveSessionPSK } from "@dotex/erpc";
+// server.ts
+import { server, type Channel } from "@dotex/erpc";
+import { WebSocketServer, type WebSocket } from "ws";
+import { router } from "./router.js";
+
+const secret = new Uint8Array([/* 32 bytes from your generator */]);
+
+function wsChannel(ws: WebSocket): Channel {
+  return {
+    send(data) {
+      ws.send(data);
+    },
+    receive(cb) {
+      const handler = (data: Buffer) => cb(new Uint8Array(data));
+      ws.on("message", handler);
+      return () => ws.off("message", handler);
+    },
+  };
+}
+
+const wss = new WebSocketServer({ port: 8080 });
+
+wss.on("connection", (ws) => {
+  const { destroy } = server(router, wsChannel(ws), {
+    auth: { secret: () => secret },
+    onError: console.error,
+  });
+  ws.on("close", destroy);
+});
+```
+
+### Client (browser)
+
+```typescript
+// app.ts
+import { client, type Channel } from "@dotex/erpc";
+import type { AppRouter } from "./router";
+
+const secret = new Uint8Array([/* same 32 bytes as the server */]);
+
+function wsChannel(ws: WebSocket): Channel {
+  return {
+    send(data) {
+      ws.send(data);
+    },
+    receive(cb) {
+      const handler = (e: MessageEvent) => {
+        if (e.data instanceof ArrayBuffer) cb(new Uint8Array(e.data));
+      };
+      ws.addEventListener("message", handler);
+      return () => ws.removeEventListener("message", handler);
+    },
+  };
+}
+
+const ws = new WebSocket("ws://localhost:8080");
+ws.binaryType = "arraybuffer";
+await new Promise<void>((resolve) =>
+  ws.addEventListener("open", () => resolve(), { once: true })
+);
+
+const { api } = client<AppRouter>(wsChannel(ws), {
+  auth: { secret: () => secret },
+});
+
+const { message } = await api.greet({ name: "World" });
+console.log(message); // "Hello, World!"
+```
+
+That is the whole loop. The handshake runs on the first call, every payload is XSalsa20-Poly1305 AEAD over the WS, and the client retries once if the session drops.
+
+## What just happened
+
+1. `client()` and `server()` returned synchronously. No top-level `await` for the library itself.
+2. On `api.greet(...)`, the client sent a `TAG_HELLO` frame and the server replied with its own.
+3. Both sides derived the same session key from the secret + a fresh ECDH exchange.
+4. The actual call payload went encrypted, with schema validation on both ends.
+5. If the WS reconnects later, the next call re-handshakes transparently.
+
+## Error handling
+
+Two error classes:
+
+- `RPCError`: local failure (timeout, session lost, validation error, handshake failure).
+- `RemoteRPCError`: error returned from the remote peer (`code`, `message`, `data`).
+
+```typescript
+import { RPCError, RemoteRPCError } from "@dotex/erpc";
+
+try {
+  await api.greet({ name: "World" });
+} catch (err) {
+  if (err instanceof RemoteRPCError) {
+    if (err.code === "UNAUTHORIZED") await refreshCredentials();
+  } else if (err instanceof RPCError) {
+    if (err.code === "HANDSHAKE") console.warn("auth mismatch?");
+  } else {
+    throw err;
+  }
+}
+```
+
+## Middleware and context
+
+Middleware runs before the handler and extends the context. Chain it with `.use()`:
+
+```typescript
+import { chain, RPCError } from "@dotex/erpc";
+import { z } from "zod";
+
+const d = chain();
+
+const authed = d.use(async ({ ctx, next }) => {
+  const user = await getUser(ctx.token);
+  if (!user) throw new RPCError("UNAUTHORIZED", "Bad token");
+  return next({ user }); // merges { user } into ctx
+});
+
+const router = {
+  getProfile: authed
+    .input(z.object({ id: z.string() }))
+    .handler(async ({ ctx, input }) => db.getProfile(input.id)),
+};
+```
+
+The base context comes from the server. The factory runs per request, so the context is always fresh:
+
+```typescript
+server(router, channel, {
+  auth,
+  context: ({ auth: verified }) => ({
+    token: getCurrentToken(),
+    userId: verified?.userId,
+  }),
+});
+```
+
+---
+
+## Advanced auth
+
+A pre-shared secret is enough for the fast start. For public clients, per-device identity, or defense-in-depth, eRPC ships three more configurations.
+
+### Derived session secret
+
+Bind the secret to a per-session identifier instead of a single static key:
+
+```typescript
+import { deriveSessionSecret } from "@dotex/erpc";
 
 const auth = {
-  psk: async () => {
+  secret: async () => {
     const sessionToken = await getCurrentSessionToken();
     const deviceSecret = await getDeviceSecret(); // 32+ bytes
-    return deriveSessionPSK(sessionToken, deviceSecret);
+    return deriveSessionSecret(sessionToken, deviceSecret);
   },
 };
 ```
 
-### Asymmetric (signatures)
+### Asymmetric signatures
 
-For public clients or when device-level identity matters. The signer proves identity over the handshake transcript; the verifier rejects bad signatures.
+For public clients or device-level identity. The signer proves identity over the handshake transcript. The verifier rejects bad signatures.
 
 ```typescript
 const auth = {
@@ -97,168 +238,29 @@ All built-in helpers (Ed25519, ECDSA, JWT, certificate, multifactor) bind their 
 
 ### Both (defense-in-depth)
 
-Combine them when you need both session binding and individual revocation.
+Combine a pre-shared secret and asymmetric when you need session binding *and* individual revocation.
 
 ```typescript
 const auth = {
-  psk: () => deriveSessionPSK(sessionId, deploymentSecret),
+  secret: () => deriveSessionSecret(sessionId, deploymentSecret),
   sign: (transcript) => signWithDeviceKey(transcript),
   verify: (proof, transcript) => verifyPeerSignature(proof, transcript),
 };
 ```
 
-Full breakdown of trade-offs lives in [Security](security.md).
+### Choosing an auth mode
 
-## Start the server
+**Secret** when you control both endpoints: server-to-server, internal services, parent ↔ iframe of the same origin. No signature ops on the hot path.
 
-```typescript
-import { server } from "@dotex/erpc";
+**Asymmetric** when one side is untrusted or there is no shared secret: public web clients, mobile apps, IoT devices. Per-device revocation.
 
-const { destroy: destroyServer } = server(router, serverChannel, {
-  auth,
-  onError: console.error,
-});
-```
+**Both** when you want session binding *and* per-device identity: regulated environments, high-value systems.
 
-The server listens on a `Channel` — any bidirectional transport that can carry `Uint8Array`. See [Integrations](integrations.md) for ready-made adapters.
-
-## Connect the client
-
-```typescript
-import { client } from "@dotex/erpc";
-
-const { api, destroy: destroyClient } = client<typeof router>(clientChannel, {
-  auth,
-});
-```
-
-Construction is **synchronous**. The handshake is lazy — it runs on the first call, not when the client is created. No top-level `await`.
-
-## Make calls
-
-```typescript
-const result = await api.greet({ name: "World" });
-console.log(result.message); // "Hello, World!"
-```
-
-Handshake, encryption, msgpack serialization, schema validation — handled. If the session drops, the client retries once with a fresh handshake. See [API: Auto-Retry](api.md).
-
-## End-to-end example
-
-PSK mode, in-memory channels, two procedures:
-
-```typescript
-import { chain, server, client } from "@dotex/erpc";
-import { z } from "zod";
-
-const d = chain();
-
-const router = {
-  greet: d
-    .input(z.object({ name: z.string() }))
-    .output(z.object({ message: z.string() }))
-    .handler(async ({ input }) => ({
-      message: `Hello, ${input.name}!`,
-    })),
-
-  add: d
-    .input(z.object({ a: z.number(), b: z.number() }))
-    .output(z.object({ sum: z.number() }))
-    .handler(async ({ input }) => ({ sum: input.a + input.b })),
-};
-
-const sharedSecret = crypto.getRandomValues(new Uint8Array(32));
-const auth = { psk: () => sharedSecret };
-
-const { destroy: destroyServer } = server(router, serverChannel, {
-  auth,
-  onError: console.error,
-});
-
-const { api, destroy: destroyClient } = client<typeof router>(clientChannel, {
-  auth,
-});
-
-const greeting = await api.greet({ name: "World" });
-const math = await api.add({ a: 2, b: 3 });
-
-destroyClient();
-destroyServer();
-```
-
-## Middleware and context
-
-Middleware runs before the handler. It can extend the context that the handler receives. Chain middleware with `.use()`:
-
-```typescript
-import { chain, RPCError } from "@dotex/erpc";
-
-const d = chain();
-
-const authed = d.use(async ({ ctx, next }) => {
-  const user = await getUser(ctx.token);
-  if (!user) throw new RPCError("UNAUTHORIZED", "Bad token");
-  return next({ user }); // merges { user } into ctx
-});
-
-const router = {
-  getProfile: authed
-    .input(z.object({ id: z.string() }))
-    .handler(async ({ ctx, input }) => {
-      // ctx.user is available, typed
-      return db.getProfile(input.id);
-    }),
-};
-```
-
-Set the base context on the server. The factory is called per request, so the context is always fresh:
-
-```typescript
-server(router, channel, {
-  auth,
-  context: ({ auth: verified }) => ({
-    token: getCurrentToken(),
-    userId: verified?.userId,
-  }),
-});
-```
-
-## Error handling
-
-Two error types:
-
-- `RPCError` — local failure (timeout, session lost, validation error, handshake failure)
-- `RemoteRPCError` — error returned from the remote peer (carries `code`, `message`, `data`)
-
-```typescript
-import { RPCError, RemoteRPCError } from "@dotex/erpc";
-
-try {
-  const result = await api.greet({ name: "World" });
-} catch (err) {
-  if (err instanceof RemoteRPCError) {
-    // The remote peer threw
-    if (err.code === "UNAUTHORIZED") await refreshCredentials();
-  } else if (err instanceof RPCError) {
-    // Local failure — timeout, network, handshake
-    if (err.code === "HANDSHAKE") console.warn("auth mismatch?");
-  } else {
-    throw err;
-  }
-}
-```
-
-## Choosing an auth mode
-
-**PSK** when you control both endpoints — server-to-server, internal services, parent ↔ iframe of the same origin. Fast (no signature ops). Simple.
-
-**Asymmetric** when one side is untrusted or there is no shared secret — public web clients, mobile apps, IoT devices. Per-device revocation.
-
-**Both** when you want session binding *and* per-device identity — regulated environments, high-value systems.
+The full trade-off breakdown lives in [Security](security.md).
 
 ## Next steps
 
-- [Security](security.md) — threat model, handshake details, what each auth mode protects against
-- [Integrations](integrations.md) — adapters for WebSocket, postMessage, MessagePort, Chrome extensions, BroadcastChannel, WebRTC, TCP, SSE
-- [API](api.md) — full reference for `chain()`, `server()`, `client()`, and every option
-- [Protocol](protocol.md) — wire format and key derivation, enough to port eRPC to another language
+- [Security](security.md): threat model, handshake details, what each auth mode protects against
+- [Integrations](integrations.md): adapters for WebSocket, postMessage, MessagePort, Chrome extensions, BroadcastChannel, WebRTC, TCP, SSE
+- [API](api.md): full reference for `chain()`, `server()`, `client()`, and every option
+- [Protocol](protocol.md): wire format and key derivation, enough to port eRPC to another language

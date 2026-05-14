@@ -19,10 +19,10 @@ describe("security / replay attacks", () => {
     const router: Router = {
       bump: chain().handler(async () => ({ n: ++counter })),
     };
-    const srv = server(router, a, { auth: { psk: () => psk } });
+    const srv = server(router, a, { auth: { secret: () => psk } });
 
     // Session 1: one bump.
-    const c1 = client(b, { auth: { psk: () => psk }, timeout: 1000 });
+    const c1 = client(b, { auth: { secret: () => psk }, timeout: 1000 });
     expect(((await c1.api.bump({})) as { n: number }).n).toBe(1);
 
     const captured = mitm.state.captures
@@ -33,7 +33,7 @@ describe("security / replay attacks", () => {
     c1.destroy();
 
     // Session 2: brand new client, fresh ephemeral keys.
-    const c2 = client(b, { auth: { psk: () => psk }, timeout: 800 });
+    const c2 = client(b, { auth: { secret: () => psk }, timeout: 800 });
     expect(((await c2.api.bump({})) as { n: number }).n).toBe(2);
 
     const before = counter;
@@ -51,9 +51,9 @@ describe("security / replay attacks", () => {
     const router: Router = {
       ping: chain().handler(async () => "pong"),
     };
-    const srv = server(router, a, { auth: { psk: () => psk } });
+    const srv = server(router, a, { auth: { secret: () => psk } });
 
-    const c1 = client(b, { auth: { psk: () => psk }, timeout: 1000 });
+    const c1 = client(b, { auth: { secret: () => psk }, timeout: 1000 });
     expect(await c1.api.ping({})).toBe("pong");
 
     const oldReply = mitm.state.captures.find(
@@ -73,7 +73,7 @@ describe("security / replay attacks", () => {
     });
 
     const c2 = client(b, {
-      auth: { psk: () => psk },
+      auth: { secret: () => psk },
       timeout: 1500,
       handshakeTimeout: 1000,
     });

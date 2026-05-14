@@ -61,7 +61,7 @@ describe("security / type confusion in a live session", () => {
       }),
     };
     const srv = server(router, a, {
-      auth: { psk: () => psk },
+      auth: { secret: () => psk },
       onError: (e) => errors.push(e),
     });
 

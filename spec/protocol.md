@@ -11,8 +11,8 @@ Design constraints, in order:
 1. **Encrypted by default.** No "plaintext mode."
 2. **Lazy.** No work happens until the application makes a call. `client()` and `server()` return synchronously.
 3. **Resilient.** Either side can fail and re-handshake without coordination from the application.
-4. **Transport-agnostic.** The protocol must work over any byte-pipe — duplex socket, message pair, broadcast bus.
-5. **No long-lived state in the protocol.** PSK rotation, key revocation, replay caches — application concerns.
+4. **Transport-agnostic.** The protocol must work over any byte-pipe: duplex socket, message pair, broadcast bus.
+5. **No long-lived state in the protocol.** Secret rotation, key revocation, replay caches: application concerns.
 
 Non-goals: in-protocol streaming RPCs, multiplexing over a single channel, formal session tickets, ordering guarantees beyond what the transport provides.
 
@@ -44,10 +44,10 @@ All wire numbers are network-byte-order (big-endian) unless explicitly noted.
 | `RPC_TIMEOUT_MS` | 10,000 | Default per-call timeout (client side) |
 | `MAX_PENDING` | 256 | Default maximum in-flight RPCs per client |
 | `KDF_INFO` | UTF-8 bytes of `"drpc-v1"` | HKDF info parameter for session key |
-| `PSK_DERIVE_INFO` | UTF-8 bytes of `"erpc-session-v1"` | HKDF info for `deriveSessionPSK` helper |
+| `PSK_DERIVE_INFO` | UTF-8 bytes of `"erpc-session-v1"` | HKDF info for `deriveSessionSecret` helper |
 | `TRANSCRIPT_HELLO_MAGIC` | UTF-8 bytes of `"erpc-hs-hello-v1\0"` (17 bytes) | Domain separation for client transcript |
 | `TRANSCRIPT_REPLY_MAGIC` | UTF-8 bytes of `"erpc-hs-reply-v1\0"` (17 bytes) | Domain separation for server transcript |
-| `EMPTY_PSK` | 32 zero bytes | HKDF salt when no PSK is configured (asymmetric-only mode) |
+| `EMPTY_SECRET` | 32 zero bytes | HKDF salt when no secret is configured (asymmetric-only mode) |
 
 ## Frame format
 
@@ -102,7 +102,7 @@ The ciphertext is the output of XSalsa20-Poly1305 AEAD with:
 - Plaintext: msgpack-encoded RPC message (request or response)
 - Associated data: none
 
-A frame whose total length exceeds `MAX_MSG_BYTES` **must** be dropped. A frame whose ciphertext fails Poly1305 verification **must** be dropped silently — no error, no state change.
+A frame whose total length exceeds `MAX_MSG_BYTES` **must** be dropped. A frame whose ciphertext fails Poly1305 verification **must** be dropped silently. No error, no state change.
 
 ## Handshake
 
@@ -119,7 +119,7 @@ sequenceDiagram
     Server->>Client: TAG_MSG + encrypted response
 ```
 
-### Step 1 — Client builds and sends hello
+### Step 1: client builds and sends hello
 
 The client generates:
 
@@ -145,13 +145,13 @@ The client then sends:
 0x00 || msgpack({ pub: c_pub, nonce: c_nonce, epoch: epoch, auth: signed? })
 ```
 
-### Step 2 — Server processes hello
+### Step 2: server processes hello
 
 1. Verify frame length and tag.
 2. Decode msgpack, sanitize, check shape.
 3. If `verify` is configured: require `auth`, build hello transcript, call `verify(auth, transcript)`. On failure, reset handshake state.
 4. Compute ECDH shared secret: `raw = X25519(s_priv, c_pub)`.
-5. Call `psk()` if configured. If fewer than `KEY_LEN` bytes, fail. If not configured, use `EMPTY_PSK`.
+5. Call `secret()` if configured. If fewer than `KEY_LEN` bytes, fail. If not configured, use `EMPTY_SECRET`.
 6. Derive session key: `session_key = HKDF(SHA-256, IKM=raw, salt=psk, info=KDF_INFO, L=KEY_LEN)`.
 7. Zero `raw` and PSK bytes.
 8. Compute proof: `proof = HMAC-SHA-256(session_key, s_pub || c_pub || c_nonce)`.
@@ -175,22 +175,22 @@ reply_transcript :=
 
 The server **does not** transition to `ready` yet. It does so on the first `TAG_MSG` whose Poly1305 tag verifies under the freshly-derived session key, regardless of whether the decrypted payload is a well-formed RPC request. Producing a valid AEAD frame is the implicit proof; the inner shape is checked afterwards and may be silently dropped without rolling state back.
 
-### Step 3 — Client processes reply
+### Step 3: client processes reply
 
 1. Verify frame length and tag.
 2. Decode msgpack, sanitize, check shape.
 3. Silently drop if `reply.epoch !== this_epoch` (stale reply).
 4. If `verify` is configured: require `auth`, build reply transcript, call `verify(auth, transcript)`. On failure, reset handshake state.
 5. Compute ECDH shared secret: `raw = X25519(c_priv, s_pub)`.
-6. Call `psk()` if configured; otherwise use `EMPTY_PSK`. Validate ≥ `KEY_LEN` bytes.
+6. Call `secret()` if configured; otherwise use `EMPTY_SECRET`. Validate ≥ `KEY_LEN` bytes.
 7. Derive `session_key` with the same HKDF call as the server.
 8. Recompute expected proof: `expected = HMAC-SHA-256(session_key, s_pub || c_pub || c_nonce)`.
 9. Compare `expected` to `proof` in **constant time**. Mismatch ⇒ fail.
 10. Set encryptor/decryptor, zero intermediate buffers, transition to `ready`.
 
-### Step 4 — First encrypted message
+### Step 4: first encrypted message
 
-The client encrypts and sends its first RPC request. On the server, successful AEAD verification of the first `TAG_MSG` (Poly1305 tag passes under the freshly-derived session key) is the implicit proof that the client knows the PSK, and the server transitions from `pending` to `ready`. The inner RPC payload is validated separately; a junk payload that nonetheless decrypts cleanly still confirms the session — it is just dropped without producing a response.
+The client encrypts and sends its first RPC request. On the server, successful AEAD verification of the first `TAG_MSG` (Poly1305 tag passes under the freshly-derived session key) is the implicit proof that the client knows the secret, and the server transitions from `pending` to `ready`. The inner RPC payload is validated separately. A junk payload that nonetheless decrypts cleanly still confirms the session; it is just dropped without producing a response.
 
 ### Re-handshake
 
@@ -202,24 +202,24 @@ A server in **any** state that receives a `TAG_HELLO` resets its handshake state
 session_key = HKDF(
   hash  = SHA-256,
   ikm   = X25519(local_priv, remote_pub),
-  salt  = psk_or_EMPTY_PSK,
-  info  = KDF_INFO,           // "drpc-v1"
-  L     = KEY_LEN,            // 32
+  salt  = secret_or_EMPTY_SECRET,
+  info  = KDF_INFO,                // "drpc-v1"
+  L     = KEY_LEN,                 // 32
 )
 ```
 
-The PSK is the **salt** parameter, not the IKM. This is deliberate: the salt parameter is what HKDF uses for domain separation and authentication.
+The secret is the **salt** parameter, not the IKM. This is deliberate: the salt parameter is what HKDF uses for domain separation and authentication.
 
-If both endpoints derive the same `psk` and the X25519 exchange is intact, both arrive at the same `session_key`. An attacker who runs the X25519 exchange but lacks the PSK derives a different key and the HMAC proof fails.
+If both endpoints derive the same `secret` and the X25519 exchange is intact, both arrive at the same `session_key`. An attacker who runs the X25519 exchange but lacks the secret derives a different key and the HMAC proof fails.
 
-When `psk` is not configured (asymmetric-only mode), `psk_or_EMPTY_PSK` is 32 zero bytes. RFC 5869 allows an all-zero salt; in this mode session authentication relies entirely on the `sign`/`verify` callbacks. The reference implementation refuses an application-supplied `psk()` that returns 32 zeros, so a misconfigured PSK never silently degrades into the asymmetric-only mode.
+When `secret` is not configured (asymmetric-only mode), `secret_or_EMPTY_SECRET` is 32 zero bytes. RFC 5869 allows an all-zero salt; in this mode session authentication relies entirely on the `sign`/`verify` callbacks. The reference implementation refuses an application-supplied `secret()` that returns 32 zeros, so a misconfigured secret never silently degrades into the asymmetric-only mode.
 
-### `deriveSessionPSK` (helper)
+### `deriveSessionSecret` (helper)
 
-Optional convenience for binding the PSK to a per-session identifier:
+Optional convenience for binding the secret to a per-session identifier:
 
 ```
-deriveSessionPSK(sessionId, secret) := HKDF(
+deriveSessionSecret(sessionId, secret) := HKDF(
   hash = SHA-256,
   ikm  = secret,                  // ≥ 32 bytes
   salt = utf8(sessionId),         // non-empty
@@ -266,7 +266,7 @@ plaintext   = XSalsa20-Poly1305-decrypt(session_key, nonce, ciphertext, AD=∅)
 message     = sanitize(msgpack_decode(plaintext))
 ```
 
-A 24-byte random nonce gives 192 bits of entropy; collisions are negligible for any realistic message volume. eRPC does **not** use a counter — this trades slightly higher nonce size for stateless encoding and tolerance for out-of-order or duplicated transport delivery.
+A 24-byte random nonce gives 192 bits of entropy. Collisions are negligible for any realistic message volume. eRPC does **not** use a counter. The trade-off: slightly higher nonce size in exchange for stateless encoding and tolerance for out-of-order or duplicated transport delivery.
 
 ## RPC message format
 
@@ -313,7 +313,7 @@ The error map's fields:
 | `m` | Human-readable message. Untrusted from the receiver's perspective. |
 | `d` | Optional structured data, sanitized before transmission. |
 
-Messages with wrong `t`, missing/empty `id`, missing/empty `p`, or any unexpected type **must** be dropped silently. The protocol has no provision for "bad message" responses — they would be useful only to an attacker enumerating implementation behavior.
+Messages with wrong `t`, missing/empty `id`, missing/empty `p`, or any unexpected type **must** be dropped silently. The protocol has no provision for "bad message" responses. Those would be useful only to an attacker enumerating implementation behavior.
 
 ## State machines
 
@@ -362,7 +362,7 @@ When a call fails with a local `TIMEOUT` or send error on a `ready` session:
 3. Once `ready`, resend the original request **once**.
 4. If that also fails, surface the error. No further retries.
 
-Calls that received a `RemoteRPCError` (the server responded with `ok: false`) are **not** retried — the server is alive and gave a real answer.
+Calls that received a `RemoteRPCError` (the server responded with `ok: false`) are **not** retried. The server is alive and gave a real answer.
 
 ## Sanitization
 
@@ -401,7 +401,7 @@ on each request:
     procedure runs with ctx
 ```
 
-Clients can also configure `verify`; on the client side the return value is unused — success is signaled by not throwing.
+Clients can also configure `verify`. On the client side the return value is unused. Success is signaled by not throwing.
 
 ## Failure modes
 
@@ -411,7 +411,7 @@ Clients can also configure `verify`; on the client side the return value is unus
 | Frame > max size | Drop silently | Drop silently |
 | msgpack decode error | Reset, `onError` | Fail handshake |
 | Sanitization failure | Reset, `onError` | Fail handshake |
-| Bad PSK / missing PSK bytes | Fail handshake (`HANDSHAKE`), reset | Fail handshake (`HANDSHAKE`) |
+| Bad secret / missing secret bytes | Fail handshake (`HANDSHAKE`), reset | Fail handshake (`HANDSHAKE`) |
 | `verify` throws | Fail handshake, reset | Fail handshake |
 | `sign` returns invalid payload | Fail handshake | Fail handshake |
 | Proof mismatch (client) | — | Fail handshake |
@@ -424,8 +424,8 @@ Clients can also configure `verify`; on the client side the return value is unus
 
 ## Compatibility
 
-- The `auth` field on hello and reply is **optional**. Peers that do not understand it ignore it; peers that need it reject frames that lack it. PSK-only deployments stay wire-compatible with mutual-auth deployments as long as neither side has `verify` configured.
-- The transcript magic strings (`erpc-hs-hello-v1`, `erpc-hs-reply-v1`) and `KDF_INFO` (`drpc-v1`) are version markers. Any change to transcripts, key derivation inputs, or framing **must** bump these strings — otherwise an attacker could mix and match versions in a downgrade attack.
+- The `auth` field on hello and reply is **optional**. Peers that do not understand it ignore it; peers that need it reject frames that lack it. Secret-only deployments stay wire-compatible with mutual-auth deployments as long as neither side has `verify` configured.
+- The transcript magic strings (`erpc-hs-hello-v1`, `erpc-hs-reply-v1`) and `KDF_INFO` (`drpc-v1`) are version markers. Any change to transcripts, key derivation inputs, or framing **must** bump these strings. Otherwise an attacker could mix and match versions in a downgrade attack.
 - New fields can be added to the request/response messages (`t: 1` and `t: 2` maps). Implementations **must** ignore unknown fields. They **must not** accept messages with wrong `t` or missing required fields.
 
 ## Implementation checklist
@@ -434,6 +434,7 @@ A new-language port that ticks all of these is conformant:
 
 - [ ] Constants match the table above exactly.
 - [ ] X25519, XSalsa20-Poly1305, HKDF-SHA-256, HMAC-SHA-256 implementations are constant-time where the spec requires (proof comparison, MAC verification).
+- [ ] The X25519 implementation rejects RFC 7748 §6.1 low-order public keys (or the application layer rejects them before `getSharedSecret`). Accepting them in asymmetric-only mode lets an active MITM force a deterministic all-zero ECDH output and decrypt the session. See [Security § Ephemeral key validity](security.md#ephemeral-key-validity).
 - [ ] msgpack codec rejects all extension types; built-in Timestamp explicitly.
 - [ ] Sanitization rejects host objects (or the language equivalent of "weird types"), strips prototype-pollution keys, limits depth.
 - [ ] Handler output is also sanitized (or otherwise restricted to plain-data trees) before encoding, so a stray host object surfaces as `INVALID_DATA` and not an opaque `INTERNAL`.
@@ -444,7 +445,7 @@ A new-language port that ticks all of these is conformant:
 - [ ] Epoch counter increments per handshake attempt on both sides and is echoed in the reply.
 - [ ] The epoch counter is bumped for **every** incoming hello, including ones that arrive while a previous attempt is still suspended at an `await`. In-flight stale attempts detect themselves via the epoch guard and abandon all writes.
 - [ ] Every `await` in the handshake path is followed by an epoch + destroyed guard before any module-level state is written. Module-level publishes happen under a final guard inside a synchronous block.
-- [ ] PSK bytes equal to `EMPTY_PSK` (32 zero bytes) are rejected at runtime when `auth.psk` is configured.
+- [ ] Secret bytes equal to `EMPTY_SECRET` (32 zero bytes) are rejected at runtime when `auth.secret` is configured.
 - [ ] The X25519 raw shared secret is zeroed in a try/finally so a thrown `psk()` does not leak it.
 - [ ] Ephemeral private keys captured for the duration of an `await` are owned by the in-flight attempt (copied, not aliased), so a concurrent reset that zeroes the live buffer does not corrupt the in-flight derivation.
 - [ ] Server accepts new hellos in any state (including `ready`); doing so resets the current session before processing.
@@ -457,4 +458,4 @@ If all these hold and the test vectors below pass, two implementations interoper
 
 ## Test vectors
 
-The reference implementation's `test/security` and `test/unit` directories contain canonical fixtures: known `(c_priv, c_pub, c_nonce, s_priv, s_pub, psk)` inputs and the resulting `session_key` and `proof`. Use those to validate a port at the byte level before running end-to-end interop tests over a real channel.
+The reference implementation's `test/security` and `test/unit` directories contain canonical fixtures: known `(c_priv, c_pub, c_nonce, s_priv, s_pub, secret)` inputs and the resulting `session_key` and `proof`. Use those to validate a port at the byte level before running end-to-end interop tests over a real channel.

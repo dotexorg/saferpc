@@ -1,15 +1,15 @@
-# API Reference
+# API reference
 
 Strict reference for every exported symbol. For an end-to-end walkthrough see [Getting Started](getting-started.md). For threat model and crypto details see [Security](security.md). For the wire format see [Protocol](protocol.md).
 
 ## Import paths
 
 ```typescript
-// Root entry — everything
+// Root entry: everything
 import {
   chain, server, client,
   RPCError, RemoteRPCError,
-  deriveSessionPSK,
+  deriveSessionSecret,
 } from "@dotex/erpc";
 
 // Subpaths for tree-shaking
@@ -93,13 +93,13 @@ Subscribes to `channel` and serves the given router. Returns synchronously.
 
 `context` is called per request. The `auth` argument carries whatever `auth.verify` returned for the current session. When `context` is omitted, the request context is the verified auth data (or `{}` if none).
 
-`onError` is called on handshake failures and non-fatal internal errors. The server does **not** destroy on handshake failure — it resets and accepts the next hello.
+`onError` is called on handshake failures and non-fatal internal errors. The server does **not** destroy on handshake failure. It resets and accepts the next hello.
 
 ### `AuthOptions`
 
 ```typescript
 interface AuthOptions {
-  psk?: () => Uint8Array | Promise<Uint8Array>;
+  secret?: () => Uint8Array | Promise<Uint8Array>;
   sign?: (transcript: Uint8Array) => Uint8Array | Promise<Uint8Array>;
   verify?: (
     proof: Uint8Array,
@@ -110,11 +110,11 @@ interface AuthOptions {
 type VerifyResult = { auth?: Ctx } | void;
 ```
 
-At least one of `psk` or asymmetric (`sign` / `verify`) must be set. Configuring neither throws a `TypeError` at construction.
+At least one of `secret` or asymmetric (`sign` / `verify`) must be set. Configuring neither throws a `TypeError` at construction.
 
 | Field | Called | Notes |
 |-------|--------|-------|
-| `psk` | Per handshake attempt | Returned bytes must be ≥ 32. Empty PSK used when `psk` is omitted but asymmetric auth is configured. |
+| `secret` | Per handshake attempt | Returned bytes must be ≥ 32. Empty secret used when `secret` is omitted but asymmetric auth is configured. |
 | `sign` | Per handshake attempt, if set | Signature payload, ≤ 32 KiB. |
 | `verify` | Per handshake attempt, if set | Throw to reject. Returned `auth` is bound to the resulting session. |
 
@@ -188,7 +188,7 @@ idle → handshaking → ready
 
 ## Auto-retry
 
-When an call fails on a `ready` session with a local `TIMEOUT` or send error, the client zeros its session key, returns to `idle`, runs a fresh handshake, and resends the request **exactly once**. `RemoteRPCError` (server returned an error) is **not** retried — the server is alive. Concurrent failures share one re-handshake via an epoch counter; no infinite loops. Full state-machine and wire-level semantics in [Protocol § Auto-retry semantics](protocol.md#auto-retry-semantics).
+When a call fails on a `ready` session with a local `TIMEOUT` or send error, the client zeros its session key, returns to `idle`, runs a fresh handshake, and resends the request **exactly once**. `RemoteRPCError` (server returned an error) is **not** retried. The server is alive and gave a real answer. Concurrent failures share one re-handshake via an epoch counter; no infinite loops. Full state-machine and wire-level semantics in [Protocol § Auto-retry semantics](protocol.md#auto-retry-semantics).
 
 ## Replay within a session
 
@@ -211,7 +211,7 @@ The only transport contract. `receive` returns an unsubscribe function. The chan
 - Deliver each call to `cb` once, in any order
 - Allow `send` and `receive` to run concurrently
 
-It is **allowed** to drop messages, duplicate them, or reorder them — eRPC will time out and retry. Ready-made adapters live in [Integrations](integrations.md).
+It is **allowed** to drop messages, duplicate them, or reorder them. eRPC will time out and retry. Ready-made adapters live in [Integrations](integrations.md).
 
 > Within a single eRPC session the protocol assumes the `TAG_HELLO` reply arrives before any `TAG_MSG` sent under the resulting session key. Transports that may reorder *across* the hello/reply boundary (multi-path links, fan-out buses) will hang the handshake until the timeout fires. `TAG_MSG`-to-`TAG_MSG` reordering remains safe because every encrypted frame is independently authenticated and the protocol has no ordering requirement on application messages.
 
@@ -230,7 +230,7 @@ class RemoteRPCError extends RPCError {}
 ```
 
 - `RPCError` is thrown for **local** failures: timeout, session destroyed, handshake failure, validation failure, channel error.
-- `RemoteRPCError` is thrown when the remote peer's handler returned an error. The `code`, `message`, and `data` come from the remote side and are **untrusted strings** — do not log them at warn/error level without sanitization.
+- `RemoteRPCError` is thrown when the remote peer's handler returned an error. The `code`, `message`, and `data` come from the remote side. Treat them as **untrusted strings**. Do not log them at warn/error level without sanitization.
 
 ### Standard local error codes
 
@@ -243,10 +243,10 @@ class RemoteRPCError extends RPCError {}
 | `INPUT_VALIDATION` | `.input(schema)` rejected the input |
 | `OUTPUT_VALIDATION` | `.output(schema)` rejected the handler output |
 | `INVALID_DATA` | Wire-level data rejected by `sanitize()` |
-| `INTERNAL` | Defensive — should not be reachable |
+| `INTERNAL` | Defensive: should not be reachable |
 | `MIDDLEWARE` | Middleware misuse (`next()` called twice, bad `extra` arg) |
 
-Handlers may throw `RPCError(...)` with any code — those codes become `RemoteRPCError.code` on the client.
+Handlers may throw `RPCError(...)` with any code. Those codes become `RemoteRPCError.code` on the client.
 
 ### Pattern
 
@@ -255,9 +255,9 @@ try {
   await api.getProfile({ id: "u_1" });
 } catch (err) {
   if (err instanceof RemoteRPCError) {
-    // handler threw on the other side — err.code, err.message, err.data
+    // handler threw on the other side: err.code, err.message, err.data
   } else if (err instanceof RPCError) {
-    // local failure — TIMEOUT, SESSION, etc.
+    // local failure: TIMEOUT, SESSION, etc.
   } else {
     throw err;
   }
@@ -300,17 +300,17 @@ The `context` factory runs **per request**, after auth verification, and receive
 
 ---
 
-## `deriveSessionPSK`
+## `deriveSessionSecret`
 
 ```typescript
-function deriveSessionPSK(sessionId: string, secret: Uint8Array): Uint8Array;
+function deriveSessionSecret(sessionId: string, secret: Uint8Array): Uint8Array;
 ```
 
 HKDF-SHA-256 over `secret` with `sessionId` as salt and the fixed info string `"erpc-session-v1"`. Returns 32 bytes.
 
 Throws `TypeError` if `sessionId` is empty or `secret` is shorter than 32 bytes.
 
-Use to bind each handshake to a session identifier instead of holding a single static PSK.
+Use to bind each handshake to a session identifier instead of holding a single static secret.
 
 ---
 
@@ -366,19 +366,19 @@ All decode auth payloads through the hardened msgpack codec (ext types rejected,
 
 ```typescript
 import {
-  NONCE_LEN,        // 24 — XSalsa20-Poly1305 message nonce
-  KEY_LEN,          // 32 — symmetric key / X25519 key / hello nonce
+  NONCE_LEN,        // 24: XSalsa20-Poly1305 message nonce
+  KEY_LEN,          // 32: symmetric key / X25519 key / hello nonce
   TAG_HELLO,        // 0x00
   TAG_MSG,          // 0x01
   MAX_MSG_BYTES,    // 1_048_576
   MAX_HELLO_BYTES,  // 65_536
   MAX_AUTH_BYTES,   // 32_768
-  MAX_DEPTH,        // 32 — max `sanitize()` recursion depth
+  MAX_DEPTH,        // 32: max `sanitize()` recursion depth
   HANDSHAKE_TIMEOUT,// 5000
-  EMPTY_PSK,        // Uint8Array(32) of zeros — internal "no PSK" sentinel
+  EMPTY_SECRET,     // Uint8Array(32) of zeros: internal "no secret" sentinel
   // Type guards
   isPlainBytes,     // exact-prototype Uint8Array check for wire data
-  isEmptyPsk,       // constant-time check for the 32-zero PSK sentinel
+  isEmptySecret,    // constant-time check for the 32-zero secret sentinel
 } from "@dotex/erpc";
 ```
 

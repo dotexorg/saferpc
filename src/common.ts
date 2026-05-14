@@ -123,13 +123,13 @@ export function toPlainBytes(v: Uint8Array): Uint8Array {
 }
 
 /**
- * Constant-time check that a buffer is the protocol's "no PSK" sentinel:
+ * Constant-time check that a buffer is the protocol's "no secret" sentinel:
  * 32 zero bytes. Returns false for any other length. eRPC's internal flow
- * uses `EMPTY_PSK` as the HKDF salt when `auth.psk` is absent — but if a
- * user-provided `psk()` returns 32 zeros (e.g. `new Uint8Array(32)`), the
- * resulting session has no PSK authentication. Refuse it at runtime.
+ * uses `EMPTY_SECRET` as the HKDF salt when `auth.secret` is absent — but if a
+ * user-provided `secret()` returns 32 zeros (e.g. `new Uint8Array(32)`), the
+ * resulting session has no secret authentication. Refuse it at runtime.
  */
-export function isEmptyPsk(buf: Uint8Array): boolean {
+export function isEmptySecret(buf: Uint8Array): boolean {
   if (buf.length !== KEY_LEN) return false;
   let acc = 0;
   for (let i = 0; i < buf.length; i++) acc |= buf[i]!;
@@ -184,9 +184,9 @@ export function mpDecode(buf: Uint8Array): unknown {
 
 export function deriveSessionKey(
   rawShared: Uint8Array,
-  psk: Uint8Array,
+  secret: Uint8Array,
 ): Uint8Array {
-  return hkdf(sha256, rawShared, psk, KDF_INFO, KEY_LEN);
+  return hkdf(sha256, rawShared, secret, KDF_INFO, KEY_LEN);
 }
 
 export function computeProof(
@@ -201,15 +201,15 @@ export function computeProof(
 }
 
 /**
- * Derive a session-bound PSK from a session identifier and secret using HKDF.
- * This provides better security than static PSKs by binding each session
+ * Derive a session-bound secret from a session identifier and secret using HKDF.
+ * This provides better security than static secrets by binding each session
  * to a specific session token/identifier.
  *
  * @param sessionId Session identifier (e.g., JWT, session token)
  * @param secret Secret key material (device secret, server secret, etc.)
- * @returns 32-byte derived PSK
+ * @returns 32-byte derived secret
  */
-export function deriveSessionPSK(
+export function deriveSessionSecret(
   sessionId: string,
   secret: Uint8Array,
 ): Uint8Array {
@@ -336,17 +336,17 @@ export function buildReplyTranscript(
 // ─── Auth config validation ──────────────────────────────
 
 /**
- * Empty salt used in HKDF when no PSK is configured. HKDF with an
+ * Empty salt used in HKDF when no secret is configured. HKDF with an
  * all-zero salt is well-defined per RFC 5869 and provides no
  * authentication on its own — pair with `sign`/`verify` to get
  * a usable session.
  */
-export const EMPTY_PSK: Uint8Array = new Uint8Array(KEY_LEN);
+export const EMPTY_SECRET: Uint8Array = new Uint8Array(KEY_LEN);
 
 /**
  * Validate the auth configuration. At least one of:
  *
- *   - `psk` function is configured, OR
+ *   - `secret` function is configured, OR
  *   - asymmetric auth (`sign` or `verify`) is configured, OR
  *   - BOTH are configured (defense-in-depth)
  *
@@ -359,14 +359,14 @@ export function validateAuthConfig(auth: AuthOptions): void {
     throw new TypeError("auth must be an object");
   }
 
-  const hasPsk = typeof auth.psk === "function";
+  const hasSecret = typeof auth.secret === "function";
   const hasSign = typeof auth.sign === "function";
   const hasVerify = typeof auth.verify === "function";
   const hasAsymmetric = hasSign || hasVerify;
 
-  if (!hasPsk && !hasAsymmetric) {
+  if (!hasSecret && !hasAsymmetric) {
     throw new TypeError(
-      "At least one of `auth.psk` or asymmetric auth (`auth.sign`/`auth.verify`) must be configured. " +
+      "At least one of `auth.secret` or asymmetric auth (`auth.sign`/`auth.verify`) must be configured. " +
         "An eRPC handshake with neither would be unauthenticated.",
     );
   }
@@ -423,7 +423,7 @@ export interface Channel {
   receive(cb: (data: Uint8Array) => void): () => void;
 }
 
-// ─── Authentication (PSK + asymmetric handshake authentication) ─
+// ─── Authentication (secret + asymmetric handshake authentication) ─
 
 /**
  * Result of `AuthOptions.verify` on the server side. The optional
@@ -435,27 +435,27 @@ export interface Channel {
 export type VerifyResult = { auth?: Ctx } | void;
 
 /**
- * Authentication configuration for eRPC. At least one of `psk` OR
+ * Authentication configuration for eRPC. At least one of `secret` OR
  * asymmetric auth (`sign`/`verify`) MUST be configured.
  *
  * Three modes:
- * 1. PSK-only: { psk: () => secret }
+ * 1. Secret-only: { secret: () => secret }
  * 2. Asymmetric-only: { sign: ..., verify?: ... }
- * 3. Both (defense-in-depth): { psk: () => secret, sign: ..., verify?: ... }
+ * 3. Both (defense-in-depth): { secret: () => secret, sign: ..., verify?: ... }
  */
 export interface AuthOptions {
   /**
-   * Pre-shared key function. Returns PSK bytes mixed into session key
+   * Pre-shared secret function. Returns secret bytes mixed into session key
    * derivation. Called once per handshake attempt.
    *
-   * Use session-derived PSKs for better security:
+   * Use session-derived secrets for better security:
    * ```typescript
-   * psk: () => deriveSessionPSK(sessionToken, deviceSecret)
+   * secret: () => deriveSessionSecret(sessionToken, deviceSecret)
    * ```
    *
    * Minimum 32 bytes when returned.
    */
-  psk?: () => Uint8Array | Promise<Uint8Array>;
+  secret?: () => Uint8Array | Promise<Uint8Array>;
 
   /**
    * Create proof of identity over handshake transcript. The returned

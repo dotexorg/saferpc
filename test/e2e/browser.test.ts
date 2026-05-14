@@ -151,9 +151,9 @@ describeMaybe("browser / puppeteer", () => {
               message: "Hello, " + (input as { name: string }).name + "!",
             })),
         };
-        const srv = erpc.server(router, a, { auth: { psk: () => psk } });
+        const srv = erpc.server(router, a, { auth: { secret: () => psk } });
         const { api, destroy } = erpc.client(b, {
-          auth: { psk: () => psk },
+          auth: { secret: () => psk },
           timeout: 3000,
         });
         try {

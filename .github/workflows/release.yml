@@ -1,0 +1,111 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*.*.*"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Existing tag to release (e.g. v0.3.0)"
+        required: true
+        type: string
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    name: GitHub Release
+    runs-on: ubuntu-latest
+    steps:
+      - name: Resolve tag
+        id: tag
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            TAG="${{ inputs.tag }}"
+          else
+            TAG="${GITHUB_REF#refs/tags/}"
+          fi
+          echo "name=$TAG" >> "$GITHUB_OUTPUT"
+          echo "version=${TAG#v}" >> "$GITHUB_OUTPUT"
+
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ steps.tag.outputs.name }}
+          fetch-depth: 0
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - name: Verify tag matches package.json version
+        run: |
+          PKG_VERSION="v$(node -p "require('./package.json').version")"
+          TAG="${{ steps.tag.outputs.name }}"
+          if [ "$PKG_VERSION" != "$TAG" ]; then
+            echo "Tag $TAG does not match package.json version $PKG_VERSION" >&2
+            exit 1
+          fi
+
+      - name: Verify tag is published on npm
+        run: |
+          NAME=$(node -p "require('./package.json').name")
+          VERSION=$(node -p "require('./package.json').version")
+          if ! npm view "$NAME@$VERSION" version >/dev/null 2>&1; then
+            echo "$NAME@$VERSION is not published on npm yet" >&2
+            exit 1
+          fi
+
+      - run: npm ci
+
+      - run: npm run build
+
+      - run: npm test
+
+      - name: Detect prerelease
+        id: prerelease
+        run: |
+          TAG="${{ steps.tag.outputs.name }}"
+          if [[ "$TAG" == *-* ]]; then
+            echo "value=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "value=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Resolve release body
+        id: body
+        run: |
+          TAG="${{ steps.tag.outputs.name }}"
+          VERSION="${{ steps.tag.outputs.version }}"
+          NPM_LINK="Published to npm: https://www.npmjs.com/package/@dotex/erpc/v/${VERSION}"
+          ARTICLE=$(git show --name-only --pretty=format: "$TAG" -- 'changelog/*.md' | grep -v '^$' | head -1 || true)
+          if [ -n "$ARTICLE" ] && [ -f "$ARTICLE" ]; then
+            echo "generate=false" >> "$GITHUB_OUTPUT"
+            {
+              echo "body<<RELEASE_BODY_EOF"
+              cat "$ARTICLE"
+              echo
+              echo "---"
+              echo
+              echo "$NPM_LINK"
+              echo "RELEASE_BODY_EOF"
+            } >> "$GITHUB_OUTPUT"
+          else
+            echo "generate=true" >> "$GITHUB_OUTPUT"
+            {
+              echo "body<<RELEASE_BODY_EOF"
+              echo "$NPM_LINK"
+              echo "RELEASE_BODY_EOF"
+            } >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.tag.outputs.name }}
+          name: ${{ steps.tag.outputs.name }}
+          generate_release_notes: ${{ steps.body.outputs.generate }}
+          prerelease: ${{ steps.prerelease.outputs.value }}
+          body: ${{ steps.body.outputs.body }}

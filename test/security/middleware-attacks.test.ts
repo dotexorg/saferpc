@@ -30,9 +30,9 @@ describe("security / middleware pipeline", () => {
         })
         .handler(async () => "ok"),
     };
-    const srv = server(router, a, { auth: { psk: () => psk } });
+    const srv = server(router, a, { auth: { secret: () => psk } });
     const { api, destroy } = client(b, {
-      auth: { psk: () => psk },
+      auth: { secret: () => psk },
       timeout: 1000,
     });
     try {
@@ -57,9 +57,9 @@ describe("security / middleware pipeline", () => {
         .use(async ({ next }) => next(42 as unknown as Record<string, unknown>))
         .handler(async () => "ok"),
     };
-    const srv = server(router, a, { auth: { psk: () => psk } });
+    const srv = server(router, a, { auth: { secret: () => psk } });
     const { api, destroy } = client(b, {
-      auth: { psk: () => psk },
+      auth: { secret: () => psk },
       timeout: 1000,
     });
     try {
@@ -89,9 +89,9 @@ describe("security / middleware pipeline", () => {
         .input(z.object({ id: z.string() }))
         .handler(async ({ input }) => (input as { id: string }).id),
     };
-    const srv = server(router, a, { auth: { psk: () => psk } });
+    const srv = server(router, a, { auth: { secret: () => psk } });
     const { api, destroy } = client(b, {
-      auth: { psk: () => psk },
+      auth: { secret: () => psk },
       timeout: 1000,
     });
     try {
@@ -119,9 +119,9 @@ describe("security / middleware pipeline", () => {
         })
         .handler(async () => "ok"),
     };
-    const srv = server(router, a, { auth: { psk: () => psk } });
+    const srv = server(router, a, { auth: { secret: () => psk } });
     const { api, destroy } = client(b, {
-      auth: { psk: () => psk },
+      auth: { secret: () => psk },
       timeout: 1000,
     });
     try {

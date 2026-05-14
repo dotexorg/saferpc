@@ -59,9 +59,9 @@ describe("in-memory / handshake & basic RPC", () => {
   it("completes the handshake on the first call and returns the result", async () => {
     const psk = randomBytes(32);
     const { a, b } = createChannelPair();
-    const srv = server(buildRouter(), a, { auth: { psk: () => psk } });
+    const srv = server(buildRouter(), a, { auth: { secret: () => psk } });
     const { api, destroy } = client(b, {
-      auth: { psk: () => psk },
+      auth: { secret: () => psk },
       timeout: 2000,
     });
     try {
@@ -78,9 +78,9 @@ describe("in-memory / handshake & basic RPC", () => {
   it("works over an async (microtask-deferred) channel", async () => {
     const psk = randomBytes(32);
     const { a, b } = createAsyncChannelPair();
-    const srv = server(buildRouter(), a, { auth: { psk: () => psk } });
+    const srv = server(buildRouter(), a, { auth: { secret: () => psk } });
     const { api, destroy } = client(b, {
-      auth: { psk: () => psk },
+      auth: { secret: () => psk },
       timeout: 2000,
     });
     try {
@@ -99,9 +99,9 @@ describe("in-memory / handshake & basic RPC", () => {
         blob: (input as { blob: Uint8Array }).blob,
       })),
     };
-    const srv = server(router, a, { auth: { psk: () => psk } });
+    const srv = server(router, a, { auth: { secret: () => psk } });
     const { api, destroy } = client(b, {
-      auth: { psk: () => psk },
+      auth: { secret: () => psk },
       timeout: 2000,
     });
     try {
@@ -120,9 +120,9 @@ describe("in-memory / errors", () => {
   it("raises RemoteRPCError(NOT_FOUND) for an unknown procedure", async () => {
     const psk = randomBytes(32);
     const { a, b } = createChannelPair();
-    const srv = server({} as Router, a, { auth: { psk: () => psk } });
+    const srv = server({} as Router, a, { auth: { secret: () => psk } });
     const { api, destroy } = client(b, {
-      auth: { psk: () => psk },
+      auth: { secret: () => psk },
       timeout: 1000,
     });
     try {
@@ -141,9 +141,9 @@ describe("in-memory / errors", () => {
   it("propagates RPCError code, message, and data from the handler", async () => {
     const psk = randomBytes(32);
     const { a, b } = createChannelPair();
-    const srv = server(buildRouter(), a, { auth: { psk: () => psk } });
+    const srv = server(buildRouter(), a, { auth: { secret: () => psk } });
     const { api, destroy } = client(b, {
-      auth: { psk: () => psk },
+      auth: { secret: () => psk },
       timeout: 1000,
     });
     try {
@@ -165,9 +165,9 @@ describe("in-memory / errors", () => {
   it("masks non-RPCError throws as INTERNAL with no leaked detail", async () => {
     const psk = randomBytes(32);
     const { a, b } = createChannelPair();
-    const srv = server(buildRouter(), a, { auth: { psk: () => psk } });
+    const srv = server(buildRouter(), a, { auth: { secret: () => psk } });
     const { api, destroy } = client(b, {
-      auth: { psk: () => psk },
+      auth: { secret: () => psk },
       timeout: 1000,
     });
     try {
@@ -190,9 +190,9 @@ describe("in-memory / errors", () => {
   it("validates input via Zod and returns INPUT_VALIDATION", async () => {
     const psk = randomBytes(32);
     const { a, b } = createChannelPair();
-    const srv = server(buildRouter(), a, { auth: { psk: () => psk } });
+    const srv = server(buildRouter(), a, { auth: { secret: () => psk } });
     const { api, destroy } = client(b, {
-      auth: { psk: () => psk },
+      auth: { secret: () => psk },
       timeout: 1000,
     });
     try {
@@ -217,9 +217,9 @@ describe("in-memory / errors", () => {
         .output(z.object({ s: z.string() }))
         .handler(async () => ({ s: 42 }) as unknown as { s: string }),
     };
-    const srv = server(router, a, { auth: { psk: () => psk } });
+    const srv = server(router, a, { auth: { secret: () => psk } });
     const { api, destroy } = client(b, {
-      auth: { psk: () => psk },
+      auth: { secret: () => psk },
       timeout: 1000,
     });
     try {
@@ -242,11 +242,11 @@ describe("in-memory / context & middleware", () => {
     const psk = randomBytes(32);
     const { a, b } = createChannelPair();
     const srv = server(buildRouter(), a, {
-      auth: { psk: () => psk },
+      auth: { secret: () => psk },
       context: () => ({ token: "secret" }),
     });
     const { api, destroy } = client(b, {
-      auth: { psk: () => psk },
+      auth: { secret: () => psk },
       timeout: 1000,
     });
     try {
@@ -261,11 +261,11 @@ describe("in-memory / context & middleware", () => {
     const psk = randomBytes(32);
     const { a, b } = createChannelPair();
     const srv = server(buildRouter(), a, {
-      auth: { psk: () => psk },
+      auth: { secret: () => psk },
       context: () => ({ token: "wrong" }),
     });
     const { api, destroy } = client(b, {
-      auth: { psk: () => psk },
+      auth: { secret: () => psk },
       timeout: 1000,
     });
     try {
@@ -292,11 +292,11 @@ describe("in-memory / context & middleware", () => {
       })),
     };
     const srv = server(router, a, {
-      auth: { psk: () => psk },
+      auth: { secret: () => psk },
       context: () => ({ n: ++count }),
     });
     const { api, destroy } = client(b, {
-      auth: { psk: () => psk },
+      auth: { secret: () => psk },
       timeout: 1000,
     });
     try {
@@ -314,9 +314,9 @@ describe("in-memory / concurrency", () => {
   it("handles many concurrent calls without crossing wires", async () => {
     const psk = randomBytes(32);
     const { a, b } = createChannelPair();
-    const srv = server(buildRouter(), a, { auth: { psk: () => psk } });
+    const srv = server(buildRouter(), a, { auth: { secret: () => psk } });
     const { api, destroy } = client(b, {
-      auth: { psk: () => psk },
+      auth: { secret: () => psk },
       timeout: 5000,
     });
     try {
@@ -334,9 +334,9 @@ describe("in-memory / concurrency", () => {
   it("shares a single handshake across concurrent first calls", async () => {
     const psk = randomBytes(32);
     const { a, b, mitm } = createMitmChannelPair();
-    const srv = server(buildRouter(), a, { auth: { psk: () => psk } });
+    const srv = server(buildRouter(), a, { auth: { secret: () => psk } });
     const { api, destroy } = client(b, {
-      auth: { psk: () => psk },
+      auth: { secret: () => psk },
       timeout: 5000,
     });
     try {
@@ -367,9 +367,9 @@ describe("in-memory / lifecycle", () => {
           new Promise<string>((r) => setTimeout(() => r("done"), 100)),
       ),
     };
-    const srv = server(router, a, { auth: { psk: () => psk } });
+    const srv = server(router, a, { auth: { secret: () => psk } });
     const { api, destroy } = client(b, {
-      auth: { psk: () => psk },
+      auth: { secret: () => psk },
       timeout: 5000,
     });
     const p = api.slow({});
@@ -388,9 +388,9 @@ describe("in-memory / lifecycle", () => {
   it("throws SESSION error after destroy()", async () => {
     const psk = randomBytes(32);
     const { a, b } = createChannelPair();
-    const srv = server(buildRouter(), a, { auth: { psk: () => psk } });
+    const srv = server(buildRouter(), a, { auth: { secret: () => psk } });
     const { api, destroy } = client(b, {
-      auth: { psk: () => psk },
+      auth: { secret: () => psk },
       timeout: 1000,
     });
     try {
@@ -411,9 +411,9 @@ describe("in-memory / lifecycle", () => {
   it("server.destroy() leaves the client without a responder", async () => {
     const psk = randomBytes(32);
     const { a, b } = createChannelPair();
-    const srv = server(buildRouter(), a, { auth: { psk: () => psk } });
+    const srv = server(buildRouter(), a, { auth: { secret: () => psk } });
     const { api, destroy } = client(b, {
-      auth: { psk: () => psk },
+      auth: { secret: () => psk },
       timeout: 500,
     });
     try {
@@ -438,12 +438,12 @@ describe("in-memory / construction guards", () => {
     const { a } = createChannelPair();
     expect(() =>
       server(null as unknown as Router, a, {
-        auth: { psk: () => randomBytes(32) },
+        auth: { secret: () => randomBytes(32) },
       }),
     ).toThrow(TypeError);
     expect(() =>
       server("nope" as unknown as Router, a, {
-        auth: { psk: () => randomBytes(32) },
+        auth: { secret: () => randomBytes(32) },
       }),
     ).toThrow(TypeError);
   });
@@ -452,21 +452,21 @@ describe("in-memory / construction guards", () => {
     const psk = randomBytes(32);
     expect(() =>
       server({} as Router, { send: () => {} } as never, {
-        auth: { psk: () => psk },
+        auth: { secret: () => psk },
       }),
     ).toThrow(TypeError);
     expect(() =>
       server({} as Router, { receive: () => () => {} } as never, {
-        auth: { psk: () => psk },
+        auth: { secret: () => psk },
       }),
     ).toThrow(TypeError);
 
     expect(() =>
-      client({ send: () => {} } as never, { auth: { psk: () => psk } }),
+      client({ send: () => {} } as never, { auth: { secret: () => psk } }),
     ).toThrow(TypeError);
     expect(() =>
       client({ receive: () => () => {} } as never, {
-        auth: { psk: () => psk },
+        auth: { secret: () => psk },
       }),
     ).toThrow(TypeError);
   });

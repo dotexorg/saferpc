@@ -22,7 +22,9 @@
     "test:security": "vitest run test/security",
     "test:browser": "vitest run test/e2e/browser.test.ts",
     "test:typecheck": "tsc -p tsconfig.test.json",
-    "prepublishOnly": "npm run build"
+    "prepublishOnly": "npm run lint && npm run test && npm run build",
+    "version": "git add changelog.md changelog/",
+    "postversion": "npm publish && git push --follow-tags"
   },
   "author": "Dotex (https://dotex.org/about)",
   "homepage": "https://github.com/dotexorg/erpc",

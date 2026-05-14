@@ -27,9 +27,9 @@ describe("security / prototype pollution via inputs", () => {
         return "ok";
       }),
     };
-    const srv = server(router, a, { auth: { psk: () => psk } });
+    const srv = server(router, a, { auth: { secret: () => psk } });
     const { api, destroy } = client(b, {
-      auth: { psk: () => psk },
+      auth: { secret: () => psk },
       timeout: 1000,
     });
     try {
@@ -65,9 +65,9 @@ describe("security / prototype pollution via inputs", () => {
         return "ok";
       }),
     };
-    const srv = server(router, a, { auth: { psk: () => psk } });
+    const srv = server(router, a, { auth: { secret: () => psk } });
     const { api, destroy } = client(b, {
-      auth: { psk: () => psk },
+      auth: { secret: () => psk },
       timeout: 1000,
     });
     try {
@@ -117,9 +117,9 @@ describe("security / prototype pollution via outputs", () => {
         mpDecode(mpEncode({ ok: true, __proto__: { stolen: "yes" } })),
       ),
     };
-    const srv = server(router, a, { auth: { psk: () => psk } });
+    const srv = server(router, a, { auth: { secret: () => psk } });
     const { api, destroy } = client(b, {
-      auth: { psk: () => psk },
+      auth: { secret: () => psk },
       timeout: 1000,
     });
     try {

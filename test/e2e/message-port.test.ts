@@ -30,10 +30,10 @@ describe("message-port (worker_threads.MessageChannel)", () => {
     };
 
     const srv = server(router, portChannel(port1 as never), {
-      auth: { psk: () => psk },
+      auth: { secret: () => psk },
     });
     const { api, destroy } = client(portChannel(port2 as never), {
-      auth: { psk: () => psk },
+      auth: { secret: () => psk },
       timeout: 2000,
     });
     try {
@@ -57,10 +57,10 @@ describe("message-port (worker_threads.MessageChannel)", () => {
       }),
     };
     const srv = server(router, portChannel(port1 as never), {
-      auth: { psk: () => psk },
+      auth: { secret: () => psk },
     });
     const { api, destroy } = client(portChannel(port2 as never), {
-      auth: { psk: () => psk },
+      auth: { secret: () => psk },
       timeout: 5000,
     });
     try {
@@ -79,10 +79,10 @@ describe("message-port (worker_threads.MessageChannel)", () => {
     const psk = randomBytes(32);
     const { port1, port2 } = new MessageChannel();
     const srv = server({} as Router, portChannel(port1 as never), {
-      auth: { psk: () => psk },
+      auth: { secret: () => psk },
     });
     const { api, destroy } = client(portChannel(port2 as never), {
-      auth: { psk: () => psk },
+      auth: { secret: () => psk },
       timeout: 1000,
     });
     try {

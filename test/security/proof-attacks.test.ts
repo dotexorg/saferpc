@@ -1,7 +1,7 @@
 /**
  * Server-identity / handshake-proof attacks.
  *
- *   - A MITM (or rogue server without the PSK) cannot produce a valid HMAC
+ *   - A MITM (or rogue server without the secret) cannot produce a valid HMAC
  *     proof, so the client's handshake fails.
  *   - A single-byte-off proof is rejected (constant-time comparison).
  *   - A reply with a wrong-sized public key is rejected.
@@ -34,7 +34,7 @@ describe("security / handshake proof", () => {
     const srv = server(
       { ping: chain().handler(async () => "pong") } as Router,
       a,
-      { auth: { psk: () => psk }, onError: (e) => errors.push(e) },
+      { auth: { secret: () => psk }, onError: (e) => errors.push(e) },
     );
 
     mitm.transformAtoB((data) => {
@@ -55,7 +55,7 @@ describe("security / handshake proof", () => {
     });
 
     const { api, destroy } = client(b, {
-      auth: { psk: () => psk },
+      auth: { secret: () => psk },
       timeout: 600,
       handshakeTimeout: 400,
     });
@@ -74,7 +74,7 @@ describe("security / handshake proof", () => {
     }
   });
 
-  it("rogue server (no PSK knowledge) cannot complete the handshake", async () => {
+  it("rogue server (no secret knowledge) cannot complete the handshake", async () => {
     const { a, b } = createChannelPair();
     const unsubscribe = a.receive(async (data) => {
       if (data[0] !== TAG_HELLO) return;
@@ -90,7 +90,7 @@ describe("security / handshake proof", () => {
     });
 
     const { api, destroy } = client(b, {
-      auth: { psk: () => randomBytes(32) },
+      auth: { secret: () => randomBytes(32) },
       timeout: 600,
       handshakeTimeout: 400,
     });
@@ -115,7 +115,7 @@ describe("security / handshake proof", () => {
     const srv = server(
       { ping: chain().handler(async () => "pong") } as Router,
       a,
-      { auth: { psk: () => psk } },
+      { auth: { secret: () => psk } },
     );
 
     mitm.transformAtoB((data) => {
@@ -134,7 +134,7 @@ describe("security / handshake proof", () => {
     });
 
     const { api, destroy } = client(b, {
-      auth: { psk: () => psk },
+      auth: { secret: () => psk },
       timeout: 600,
       handshakeTimeout: 400,
     });

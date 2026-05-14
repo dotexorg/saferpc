@@ -31,7 +31,7 @@ export interface JWTClientConfig {
  * attacker-controlled ephemeral key) within the token's lifetime.
  *
  * JWTs remain bearer tokens — anyone who steals one can impersonate the
- * principal until expiry. Pair with PSK or a real signature mode when you
+ * principal until expiry. Pair with a secret or a real signature mode when you
  * need stronger guarantees.
  */
 export function createJWTClientAuth(

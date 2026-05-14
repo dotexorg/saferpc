@@ -28,9 +28,9 @@ describe("security / tamper attacks", () => {
         return "pong";
       }),
     };
-    const srv = server(router, a, { auth: { psk: () => psk } });
+    const srv = server(router, a, { auth: { secret: () => psk } });
     const { api, destroy } = client(b, {
-      auth: { psk: () => psk },
+      auth: { secret: () => psk },
       timeout: 400,
       handshakeTimeout: 800,
     });
@@ -78,9 +78,9 @@ describe("security / tamper attacks", () => {
         return "pong";
       }),
     };
-    const srv = server(router, a, { auth: { psk: () => psk } });
+    const srv = server(router, a, { auth: { secret: () => psk } });
     const { api, destroy } = client(b, {
-      auth: { psk: () => psk },
+      auth: { secret: () => psk },
       timeout: 400,
       handshakeTimeout: 800,
     });
@@ -126,11 +126,11 @@ describe("security / tamper attacks", () => {
       }),
     };
     const srv = server(router, a, {
-      auth: { psk: () => psk },
+      auth: { secret: () => psk },
       onError: (e) => errors.push(e),
     });
     const { api, destroy } = client(b, {
-      auth: { psk: () => psk },
+      auth: { secret: () => psk },
       timeout: 1000,
     });
 
@@ -162,9 +162,9 @@ describe("security / tamper attacks", () => {
           new Promise<string>((r) => setTimeout(() => r("real"), 100)),
       ),
     };
-    const srv = server(router, a, { auth: { psk: () => psk } });
+    const srv = server(router, a, { auth: { secret: () => psk } });
     const { api, destroy } = client(b, {
-      auth: { psk: () => psk },
+      auth: { secret: () => psk },
       timeout: 500,
     });
     try {

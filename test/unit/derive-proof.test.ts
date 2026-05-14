@@ -12,14 +12,14 @@ describe("deriveSessionKey", () => {
     expect(Array.from(k1)).toEqual(Array.from(k2));
   });
 
-  it("differs when the PSK differs (same shared)", () => {
+  it("differs when the secret differs (same shared)", () => {
     const shared = randomBytes(32);
     const k1 = deriveSessionKey(shared, randomBytes(32));
     const k2 = deriveSessionKey(shared, randomBytes(32));
     expect(k1.some((v, i) => v !== k2[i])).toBe(true);
   });
 
-  it("differs when the shared secret differs (same PSK)", () => {
+  it("differs when the shared secret differs (same secret)", () => {
     const psk = randomBytes(32);
     const k1 = deriveSessionKey(randomBytes(32), psk);
     const k2 = deriveSessionKey(randomBytes(32), psk);

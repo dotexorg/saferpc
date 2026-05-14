@@ -17,7 +17,7 @@ export {
   sanitize,
   constTimeEqual,
   isPlainBytes,
-  isEmptyPsk,
+  isEmptySecret,
   toPlainBytes,
   // Msgpack
   mpEncode,
@@ -33,7 +33,7 @@ export {
   createDecryptor,
   // Auth config
   validateAuthConfig,
-  EMPTY_PSK,
+  EMPTY_SECRET,
   // Error
   RPCError,
   // Chain builder
@@ -61,7 +61,7 @@ export { server, type ServerOptions } from "./server.ts";
 
 // Auth helpers
 export {
-  deriveSessionPSK,
+  deriveSessionSecret,
   // Client-side auth helpers
   createJWTClientAuth,
   createEd25519ClientAuth,

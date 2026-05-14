@@ -34,7 +34,7 @@ function startServer(
   const sessions: Array<{ destroy: () => void }> = [];
   wss.on("connection", (sock: WebSocket) => {
     const ch = wsChannel(sock as never);
-    const s = server(router, ch, { auth: { psk: () => psk } });
+    const s = server(router, ch, { auth: { secret: () => psk } });
     sessions.push(s);
     sock.on("close", () => s.destroy());
   });
@@ -62,7 +62,7 @@ function connectClient(
     const sock = new WebSocket(url);
     sock.on("open", () => {
       const { api, destroy } = client(wsChannel(sock as never), {
-        auth: { psk: () => psk },
+        auth: { secret: () => psk },
         ...opts,
       });
       resolve({
@@ -126,7 +126,7 @@ describe("websocket / e2e", () => {
     }
   });
 
-  it("rejects mismatched PSK with HANDSHAKE or TIMEOUT", async () => {
+  it("rejects mismatched secret with HANDSHAKE or TIMEOUT", async () => {
     const port = pickPort();
     const router: Router = {
       ping: chain().handler(async () => "pong"),

@@ -22,7 +22,7 @@ eRPC does **not** protect against:
 | Property | Mechanism |
 |----------|-----------|
 | Confidentiality | XSalsa20-Poly1305 AEAD per message |
-| Authentication (session) | PSK mixed into HKDF + optional asymmetric signatures |
+| Authentication (session) | Secret mixed into HKDF + optional asymmetric signatures |
 | Server identity | HMAC proof in handshake reply (+ optional signature) |
 | Client identity | Implicit (wrong PSK ⇒ invalid ciphertext) + optional signature |
 | Forward secrecy | Fresh ephemeral X25519 keys per session |
@@ -37,21 +37,21 @@ eRPC does **not** protect against:
 
 ## Authentication modes
 
-At least one of `psk` or asymmetric auth (`sign` / `verify`) must be configured. Neither configured is a hard error at construction time — the handshake would be unauthenticated and an active MITM could impersonate either peer.
+At least one of `secret` or asymmetric auth (`sign` / `verify`) must be configured. Neither configured is a hard error at construction time. An unauthenticated handshake would let an active MITM impersonate either peer.
 
-### PSK only
+### Secret only
 
 ```typescript
-auth: { psk: () => sharedSecret }
+auth: { secret: () => sharedSecret }
 
 auth: {
-  psk: () => deriveSessionPSK(sessionToken, deviceSecret),
+  secret: () => deriveSessionSecret(sessionToken, deviceSecret),
 }
 ```
 
-Use when both endpoints are controlled by the same entity, secrets can be rotated, and individual revocation is not required. PSK is cheap — no signature operations on the hot path.
+Use when both endpoints are controlled by the same entity, secrets can be rotated, and individual revocation is not required. A pre-shared secret is cheap: no signature operations on the hot path.
 
-> The PSK buffer's lifecycle belongs to the caller. eRPC reads it during HKDF and never mutates it. Returning the same `Uint8Array` from `psk()` across handshakes is safe; if you want it zeroed, zero it yourself when the secret is no longer needed.
+> The secret buffer's lifecycle belongs to the caller. eRPC reads it during HKDF and never mutates it. Returning the same `Uint8Array` from `secret()` across handshakes is safe; if you want it zeroed, zero it yourself when the secret is no longer needed.
 
 ### Asymmetric only
 
@@ -76,18 +76,18 @@ Use when one side is a public client (browser, mobile app, IoT device), when the
 
 ```typescript
 auth: {
-  psk: () => deriveSessionPSK(sessionId, deploymentSecret),
+  secret: () => deriveSessionSecret(sessionId, deploymentSecret),
   sign: (transcript) => signWithDeviceKey(transcript),
   verify: (proof, transcript) => verifyDeviceSignature(proof, transcript),
 }
 ```
 
-Use when you want session binding *and* identity proof. An attacker must now compromise two independent things — the derivation secret and the device key — and still cannot read past sessions because of forward secrecy.
+Use when you want session binding *and* identity proof. An attacker must now compromise two independent things (the derivation secret and the device key) and still cannot read past sessions because of forward secrecy.
 
 ### Comparison
 
-| Property | Session-derived PSK | Asymmetric |
-|----------|-------------------|------------|
+| Property | Session-derived secret | Asymmetric |
+|----------|----------------------|------------|
 | Identity granularity | Per session | Per key/device |
 | Revocation | Rotate root secret (affects all) | Revoke individual keys |
 | Compromise blast radius | All sessions sharing the root | The compromised device only |
@@ -96,7 +96,7 @@ Use when you want session binding *and* identity proof. An attacker must now com
 | Cost | Low (HMAC only) | Higher (signature ops) |
 | Complexity | Simple | More moving parts |
 
-Forward secrecy comes from the ephemeral X25519 exchange in either mode. Even if a long-term secret leaks, past session ciphertexts remain unreadable — the ephemeral private keys were zeroed when the session ended.
+Forward secrecy comes from the ephemeral X25519 exchange in either mode. Even if a long-term secret leaks, past session ciphertexts remain unreadable. The ephemeral private keys were zeroed when the session ended.
 
 ## Transcript format
 
@@ -131,17 +131,23 @@ Auth runs **before** any session key is materialized. Failed verification never 
 
 A throw at any auth step rejects the handshake. The client resets to `idle`; the server resets to `waiting`. Failed verifications never silently downgrade.
 
-## Safe vs unsafe PSK patterns
+## Ephemeral key validity
+
+The peer's X25519 public key is consumed verbatim by `getSharedSecret`. eRPC relies on the curve implementation to reject the small-subgroup elements listed in RFC 7748 §6.1 (the all-zero point, the order-1 element, the four order-8 elements, and the three near-`p` variants). If those points were accepted, the ECDH output would be all zeros and an active MITM in asymmetric-only mode could rewrite the hello's `pub` to drive both sides to a deterministic `session_key = HKDF(zeros, EMPTY_SECRET, "drpc-v1", 32)`, then replay a captured bearer-style auth payload over the matching transcript and decrypt the session.
+
+The reference implementation gets this defense from `@noble/curves` (^2.2.0), which throws on every known low-order input. The pin in `package.json` is therefore load-bearing: a future curve dependency that relaxed the check would re-open the attack against asymmetric-only deployments. The regression test `test/security/f002-low-order-x25519-pubkey.test.ts` pins both halves of the contract — the library throws, and a forged hello carrying a low-order `pub` aborts the server handshake before any session state is derived. A port to another language must enforce the same rejection at the application layer if its chosen curve library does not.
+
+## Safe vs unsafe secret patterns
 
 ```typescript
-// ✅ Static PSK from a secrets vault — server-to-server
+// ✅ Static secret from a secrets vault, server-to-server
 auth: {
-  psk: async () => await vault.getSecret("erpc-server-key"),
+  secret: async () => await vault.getSecret("erpc-server-key"),
 }
 
 // ✅ Session-derived from an authenticated token + device secret
 auth: {
-  psk: async () => deriveSessionPSK(
+  secret: async () => deriveSessionSecret(
     await getValidatedSession(),
     await getSecureDeviceSecret(),
   ),
@@ -149,7 +155,7 @@ auth: {
 
 // ✅ Time-bucketed rotation
 auth: {
-  psk: () => deriveSessionPSK(
+  secret: () => deriveSessionSecret(
     String(Math.floor(Date.now() / 3_600_000)), // hourly bucket
     rotatingMasterSecret,
   ),
@@ -157,21 +163,21 @@ auth: {
 ```
 
 ```typescript
-// ❌ Hard-coded constant — leaks the moment your bundle leaks
-auth: { psk: () => new TextEncoder().encode("secret123") }
+// ❌ Hard-coded constant: leaks the moment your bundle leaks
+auth: { secret: () => new TextEncoder().encode("secret123") }
 
-// ❌ Predictable session ID — attacker just guesses it
-auth: { psk: () => deriveSessionPSK("user-123", secret) }
+// ❌ Predictable session ID: attacker just guesses it
+auth: { secret: () => deriveSessionSecret("user-123", secret) }
 
-// ❌ All-zero or weak derivation material — no security at all.
-// eRPC refuses an all-zero PSK at runtime: `HANDSHAKE` is thrown with
-// "Application returned an all-zero PSK" so this mistake fails loudly
+// ❌ All-zero or weak derivation material: no security at all.
+// eRPC refuses an all-zero secret at runtime: `HANDSHAKE` is thrown with
+// "Application returned an all-zero secret" so this mistake fails loudly
 // instead of silently degrading into the asymmetric-only mode.
-auth: { psk: () => deriveSessionPSK(sessionId, new Uint8Array(32)) }
+auth: { secret: () => deriveSessionSecret(sessionId, new Uint8Array(32)) }
 
 // ❌ Secret material in client-side bundle
 auth: {
-  psk: () => deriveSessionPSK(sessionId, new TextEncoder().encode(API_KEY)),
+  secret: () => deriveSessionSecret(sessionId, new TextEncoder().encode(API_KEY)),
 }
 ```
 
@@ -214,7 +220,7 @@ auth: { ...clientAuth }
 auth: { ...serverAuth }
 ```
 
-Uses `@noble/curves` so it works in every JS runtime — no dependency on WebCrypto Ed25519 (which is not uniformly available across browsers).
+Uses `@noble/curves` so it works in every JS runtime. No dependency on WebCrypto Ed25519, which is not uniformly available across browsers.
 
 ### ECDSA P-256 (WebCrypto)
 
@@ -247,9 +253,9 @@ const serverAuth = createJWTServerAuth({
 });
 ```
 
-The JWT helper does **not** sign the transcript — JWTs are bearer tokens. Instead, the client embeds `{ jwt, ts, th = SHA-256(transcript) }` in the auth payload, and the server validates the JWT, the timestamp (symmetric `maxAge` skew, so future-dated forgeries are rejected too), and the transcript digest in constant time. A captured payload can only be replayed within a handshake that produces the same transcript, which means the attacker cannot mount a new handshake with their own ephemeral key.
+The JWT helper does **not** sign the transcript. JWTs are bearer tokens. Instead, the client embeds `{ jwt, ts, th = SHA-256(transcript) }` in the auth payload, and the server validates the JWT, the timestamp (symmetric `maxAge` skew, so future-dated forgeries are rejected too), and the transcript digest in constant time.
 
-A leaked JWT still lets the attacker authenticate as long as the token is valid. Combine with PSK or a real signature mode when this matters.
+The transcript digest prevents replay of a captured auth payload into a different handshake — the digest was computed over the old transcript and will not match the new one. It does **not** prevent an attacker who has obtained the JWT itself from mounting a fresh handshake with their own ephemeral key and recomputing the digest. JWTs are bearer credentials: anyone holding one can authenticate until it expires. Combine with PSK or a real signature mode when this matters.
 
 ### Certificate-based
 
@@ -274,11 +280,11 @@ const serverAuth = createMultifactorServerAuth({
 });
 ```
 
-The client embeds `{ primary, secondary }` — two pre-encoded sub-payloads.
+The client embeds `{ primary, secondary }`: two pre-encoded sub-payloads.
 
 ## Replay within a session
 
-eRPC uses random 24-byte nonces (not counters) for XSalsa20-Poly1305. The collision probability is negligible — but **a captured ciphertext can be replayed by an attacker who can inject into a live channel**. The replayed message will decrypt and execute again.
+eRPC uses random 24-byte nonces (not counters) for XSalsa20-Poly1305. The collision probability is negligible. But **a captured ciphertext can be replayed by an attacker who can inject into a live channel**. The replayed message will decrypt and execute again.
 
 For non-idempotent operations, add an application-level idempotency key inside the procedure input, or maintain a request-ID set on the server keyed by the verified principal.
 
@@ -298,17 +304,17 @@ auth: { sign: async (t) => signWithSessionJWT(t) }
 auth: { sign: async (t) => getDeviceAttestation(t) }
 ```
 
-**Microservices (server ↔ server):** session-derived PSK from a service-mesh identity.
+**Microservices (server ↔ server):** session-derived secret from a service-mesh identity.
 
 ```typescript
-auth: { psk: async () => deriveSessionPSK(await serviceToken(), clusterSecret) }
+auth: { secret: async () => deriveSessionSecret(await serviceToken(), clusterSecret) }
 ```
 
-**High-security environment:** both PSK and asymmetric, with hardware key storage on at least one side.
+**High-security environment:** both secret and asymmetric, with hardware key storage on at least one side.
 
 ```typescript
 auth: {
-  psk: () => deriveSessionPSK(sessionToken, hsmSecret),
+  secret: () => deriveSessionSecret(sessionToken, hsmSecret),
   sign: (t) => signWithHardwareKey(t),
   verify: (p, t) => verifyWithPKI(p, t),
 }
@@ -324,5 +330,5 @@ auth: {
 | `MAX_AUTH_BYTES` | 32,768 | Hard cap on `auth` payload inside a hello/reply |
 | `MAX_MSG_BYTES` | 1,048,576 | Per encrypted RPC frame (configurable) |
 | `HANDSHAKE_TIMEOUT` | 5,000 ms | Default |
-| PSK minimum | 32 bytes | Validated when `psk()` returns |
+| Secret minimum | 32 bytes | Validated when `secret()` returns |
 | Encryption nonce | 24 bytes | Random per message |

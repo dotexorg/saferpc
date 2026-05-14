@@ -29,7 +29,7 @@ import {
   createMultifactorServerAuth,
   generateEd25519Keypair,
   generateECDSAKeypair,
-  deriveSessionPSK,
+  deriveSessionSecret,
   type Router,
   type Ctx,
 } from "../../src/index.ts";
@@ -48,7 +48,7 @@ describe("auth integration / JWT", () => {
     const psk = randomBytes(32);
     const srv = server(router, a, {
       auth: {
-        psk: () => psk,
+        secret: () => psk,
         ...createJWTServerAuth({
           verifyToken: async (jwt) =>
             jwt === "good" ? { sub: "u_1", role: "admin" } : null,
@@ -60,7 +60,7 @@ describe("auth integration / JWT", () => {
     });
     const { api, destroy } = client<typeof router>(b, {
       auth: {
-        psk: () => psk,
+        secret: () => psk,
         ...createJWTClientAuth({ getToken: () => "good" }),
       },
     });
@@ -82,14 +82,14 @@ describe("auth integration / JWT", () => {
     const errors: RPCError[] = [];
     const srv = server(router, a, {
       auth: {
-        psk: () => psk,
+        secret: () => psk,
         ...createJWTServerAuth({ verifyToken: async () => null }),
       },
       onError: (e) => errors.push(e as RPCError),
     });
     const { api, destroy } = client<typeof router>(b, {
       auth: {
-        psk: () => psk,
+        secret: () => psk,
         ...createJWTClientAuth({ getToken: () => "bad" }),
       },
       timeout: 800,
@@ -114,7 +114,7 @@ describe("auth integration / Ed25519", () => {
 
     const srv = server(router, a, {
       auth: {
-        psk: () => psk,
+        secret: () => psk,
         ...createEd25519ServerAuth({
           getPublicKey: async (id) => {
             if (id === "dev-A") return publicKey;
@@ -128,7 +128,7 @@ describe("auth integration / Ed25519", () => {
     });
     const { api, destroy } = client<typeof router>(b, {
       auth: {
-        psk: () => psk,
+        secret: () => psk,
         ...createEd25519ClientAuth({ privateKey, deviceId: "dev-A" }),
       },
     });
@@ -149,7 +149,7 @@ describe("auth integration / Ed25519", () => {
 
     const srv = server(router, a, {
       auth: {
-        psk: () => psk,
+        secret: () => psk,
         ...createEd25519ServerAuth({
           getPublicKey: async () => publicKey,
           validateDevice: async () => false,
@@ -159,7 +159,7 @@ describe("auth integration / Ed25519", () => {
     });
     const { api, destroy } = client<typeof router>(b, {
       auth: {
-        psk: () => psk,
+        secret: () => psk,
         ...createEd25519ClientAuth({ privateKey, deviceId: "blocked" }),
       },
       timeout: 800,
@@ -182,7 +182,7 @@ describe("auth integration / Ed25519", () => {
 
     const srv = server(router, a, {
       auth: {
-        psk: () => psk,
+        secret: () => psk,
         ...createEd25519ServerAuth({
           getPublicKey: async () => honest.publicKey,
         }),
@@ -191,7 +191,7 @@ describe("auth integration / Ed25519", () => {
     });
     const { api, destroy } = client<typeof router>(b, {
       auth: {
-        psk: () => psk,
+        secret: () => psk,
         ...createEd25519ClientAuth({
           privateKey: attacker.privateKey,
           deviceId: "spoofed",
@@ -219,7 +219,7 @@ describe("auth integration / ECDSA", () => {
 
     const srv = server(router, a, {
       auth: {
-        psk: () => psk,
+        secret: () => psk,
         ...createECDSAServerAuth({ getPublicKey: async () => publicKey }),
       },
       onError: (e) => {
@@ -228,7 +228,7 @@ describe("auth integration / ECDSA", () => {
     });
     const { api, destroy } = client<typeof router>(b, {
       auth: {
-        psk: () => psk,
+        secret: () => psk,
         ...createECDSAClientAuth({ privateKey, identifier: "entity-1" }),
       },
     });
@@ -249,7 +249,7 @@ describe("auth integration / ECDSA", () => {
 
     const srv = server(router, a, {
       auth: {
-        psk: () => psk,
+        secret: () => psk,
         ...createECDSAServerAuth({
           getPublicKey: async () => publicKey,
           validateEntity: async () => false,
@@ -259,7 +259,7 @@ describe("auth integration / ECDSA", () => {
     });
     const { api, destroy } = client<typeof router>(b, {
       auth: {
-        psk: () => psk,
+        secret: () => psk,
         ...createECDSAClientAuth({ privateKey, identifier: "denied" }),
       },
       timeout: 800,
@@ -284,7 +284,7 @@ describe("auth integration / Certificate", () => {
 
     const srv = server(router, a, {
       auth: {
-        psk: () => psk,
+        secret: () => psk,
         ...createCertificateServerAuth({
           verifyCertificate: async (cert) => {
             if (cert[0] !== 0xaa) throw new Error("bad cert");
@@ -301,7 +301,7 @@ describe("auth integration / Certificate", () => {
     const cert = new Uint8Array([0xaa, 0xbb, 0xcc]);
     const { api, destroy } = client<typeof router>(b, {
       auth: {
-        psk: () => psk,
+        secret: () => psk,
         sign: async (transcript) => {
           const sig = new Uint8Array(
             await crypto.subtle.sign(
@@ -334,7 +334,7 @@ describe("auth integration / Certificate", () => {
 
     const srv = server(router, a, {
       auth: {
-        psk: () => psk,
+        secret: () => psk,
         ...createCertificateServerAuth({
           verifyCertificate: async () => ({
             subject: { cn: "mallory" },
@@ -348,7 +348,7 @@ describe("auth integration / Certificate", () => {
 
     const { api, destroy } = client<typeof router>(b, {
       auth: {
-        psk: () => psk,
+        secret: () => psk,
         sign: async (transcript) => {
           const sig = new Uint8Array(
             await crypto.subtle.sign(
@@ -372,20 +372,20 @@ describe("auth integration / Certificate", () => {
   });
 });
 
-// ─── PSK-only / session-derived PSK ──────────────────────────
+// ─── Secret-only / session-derived secret ──────────────────────────
 
-describe("auth integration / PSK", () => {
-  it("completes a handshake using a static shared PSK", async () => {
+describe("auth integration / secret", () => {
+  it("completes a handshake using a static shared secret", async () => {
     const { a, b } = createChannelPair();
     const psk = randomBytes(32);
     const srv = server(router, a, {
-      auth: { psk: () => psk },
+      auth: { secret: () => psk },
       onError: (e) => {
         throw e;
       },
     });
     const { api, destroy } = client<typeof router>(b, {
-      auth: { psk: () => psk },
+      auth: { secret: () => psk },
     });
 
     expect(await api["ping"]!(undefined)).toBe("pong");
@@ -394,15 +394,15 @@ describe("auth integration / PSK", () => {
     srv.destroy();
   });
 
-  it("rejects an all-zero PSK at handshake time (user error guard)", async () => {
+  it("rejects an all-zero secret at handshake time (user error guard)", async () => {
     const { a, b } = createChannelPair();
     const errors: RPCError[] = [];
     const srv = server(router, a, {
-      auth: { psk: () => new Uint8Array(32) }, // all zeros
+      auth: { secret: () => new Uint8Array(32) }, // all zeros
       onError: (e) => errors.push(e as RPCError),
     });
     const { api, destroy } = client<typeof router>(b, {
-      auth: { psk: () => new Uint8Array(32) },
+      auth: { secret: () => new Uint8Array(32) },
       timeout: 800,
       handshakeTimeout: 400,
     });
@@ -414,19 +414,19 @@ describe("auth integration / PSK", () => {
     srv.destroy();
   });
 
-  it("succeeds when both sides derive the PSK from the same session ID", async () => {
+  it("succeeds when both sides derive the secret from the same session ID", async () => {
     const secret = randomBytes(32);
     const sessionId = "session-2025-05-12";
     const { a, b } = createChannelPair();
 
     const srv = server(router, a, {
-      auth: { psk: () => deriveSessionPSK(sessionId, secret) },
+      auth: { secret: () => deriveSessionSecret(sessionId, secret) },
       onError: (e) => {
         throw e;
       },
     });
     const { api, destroy } = client<typeof router>(b, {
-      auth: { psk: () => deriveSessionPSK(sessionId, secret) },
+      auth: { secret: () => deriveSessionSecret(sessionId, secret) },
     });
 
     expect(await api["ping"]!(undefined)).toBe("pong");
@@ -435,17 +435,17 @@ describe("auth integration / PSK", () => {
     srv.destroy();
   });
 
-  it("fails when the two sides derive from different session IDs (PSK mismatch)", async () => {
+  it("fails when the two sides derive from different session IDs (secret mismatch)", async () => {
     const secret = randomBytes(32);
     const { a, b } = createChannelPair();
     const errors: RPCError[] = [];
 
     const srv = server(router, a, {
-      auth: { psk: () => deriveSessionPSK("session-A", secret) },
+      auth: { secret: () => deriveSessionSecret("session-A", secret) },
       onError: (e) => errors.push(e as RPCError),
     });
     const { api, destroy } = client<typeof router>(b, {
-      auth: { psk: () => deriveSessionPSK("session-B", secret) },
+      auth: { secret: () => deriveSessionSecret("session-B", secret) },
       timeout: 800,
       handshakeTimeout: 400,
     });
@@ -474,7 +474,7 @@ describe("auth integration / Multifactor", () => {
 
     const srv = server(router, a, {
       auth: {
-        psk: () => psk,
+        secret: () => psk,
         ...createMultifactorServerAuth({
           primary: jwtServer,
           secondary: edServer,
@@ -490,7 +490,7 @@ describe("auth integration / Multifactor", () => {
 
     const { api, destroy } = client<typeof router>(b, {
       auth: {
-        psk: () => psk,
+        secret: () => psk,
         sign: async (transcript) => {
           const [primary, secondary] = await Promise.all([
             jwtClient.sign!(transcript),
@@ -520,7 +520,7 @@ describe("auth integration / Multifactor", () => {
 
     const srv = server(router, a, {
       auth: {
-        psk: () => psk,
+        secret: () => psk,
         ...createMultifactorServerAuth({
           primary: createJWTServerAuth({
             verifyToken: async () => ({ sub: "u" }),
@@ -542,7 +542,7 @@ describe("auth integration / Multifactor", () => {
 
     const { api, destroy } = client<typeof router>(b, {
       auth: {
-        psk: () => psk,
+        secret: () => psk,
         sign: async (transcript) => {
           const [primary, secondary] = await Promise.all([
             jwtClient.sign!(transcript),

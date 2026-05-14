@@ -17,7 +17,7 @@ Bidirectional byte streams. Each connection maps to one eRPC session.
 
 ### WebSocket
 
-The most common case — browser or service talking to a server over WS.
+The most common case: browser or service talking to a server over WS.
 
 ```typescript
 function wsChannel(ws: WebSocket): Channel {
@@ -48,7 +48,7 @@ const wss = new WebSocketServer({ port: 8080 });
 
 wss.on("connection", (ws) => {
   const { destroy } = server(router, wsChannel(ws), {
-    auth: { psk: () => serverSecret },
+    auth: { secret: () => serverSecret },
     onError: console.error,
   });
   ws.on("close", destroy);
@@ -60,7 +60,7 @@ ws.binaryType = "arraybuffer";
 await new Promise((r) => (ws.onopen = r));
 
 const { api } = client<typeof router>(wsChannel(ws), {
-  auth: { psk: () => serverSecret },
+  auth: { secret: () => serverSecret },
 });
 
 const user = await api.getUser({ id: "123" });
@@ -109,7 +109,7 @@ function tcpChannel(socket: net.Socket): Channel {
 ```typescript
 const tcpServer = net.createServer((socket) => {
   const { destroy } = server(router, tcpChannel(socket), {
-    auth: { psk: () => sharedSecret },
+    auth: { secret: () => sharedSecret },
     onError: console.error,
   });
   socket.on("close", destroy);
@@ -118,7 +118,7 @@ tcpServer.listen(8080);
 
 const socket = net.connect({ port: 8080, host: "localhost" });
 const { api } = client<typeof router>(tcpChannel(socket), {
-  auth: { psk: () => sharedSecret },
+  auth: { secret: () => sharedSecret },
 });
 ```
 
@@ -157,13 +157,13 @@ const iframe = document.querySelector("iframe") as HTMLIFrameElement;
 const { destroy } = server(
   router,
   postMessageChannel(iframe.contentWindow!, "https://widget.example.com"),
-  { auth: { psk: () => sharedSecret } },
+  { auth: { secret: () => sharedSecret } },
 );
 
 // iframe (client)
 const { api } = client<typeof router>(
   postMessageChannel(parent, "https://app.example.com"),
-  { auth: { psk: () => sharedSecret } },
+  { auth: { secret: () => sharedSecret } },
 );
 ```
 
@@ -175,7 +175,7 @@ Web Workers, SharedWorkers, and any code path that hands you a `MessagePort`.
 function portChannel(port: MessagePort): Channel {
   return {
     send(data) {
-      port.postMessage(data, [data.buffer]); // transferable — zero-copy
+      port.postMessage(data, [data.buffer]); // transferable: zero-copy
     },
     receive(cb) {
       const handler = (e: MessageEvent) => cb(new Uint8Array(e.data));
@@ -194,13 +194,13 @@ const { port1, port2 } = new MessageChannel();
 worker.postMessage({ port: port2 }, [port2]);
 
 const { api } = client<typeof router>(portChannel(port1), {
-  auth: { psk: () => sharedSecret },
+  auth: { secret: () => sharedSecret },
 });
 
 // worker.js
 self.onmessage = (e) => {
   const port = e.data.port as MessagePort;
-  server(router, portChannel(port), { auth: { psk: () => sharedSecret } });
+  server(router, portChannel(port), { auth: { secret: () => sharedSecret } });
 };
 ```
 
@@ -232,7 +232,7 @@ The `Array.from` round-trip is the price of `chrome.runtime`. For high-throughpu
 chrome.runtime.onConnect.addListener((port) => {
   if (port.name !== "erpc") return;
   const { destroy } = server(router, extensionPortChannel(port), {
-    auth: { psk: () => getExtensionPSK() },
+    auth: { secret: () => getExtensionPSK() },
     context: () => ({
       tabId: port.sender?.tab?.id,
       frameId: port.sender?.frameId,
@@ -244,11 +244,11 @@ chrome.runtime.onConnect.addListener((port) => {
 // content-script.js
 const port = chrome.runtime.connect({ name: "erpc" });
 const { api } = client<typeof router>(extensionPortChannel(port), {
-  auth: { psk: () => getExtensionPSK() },
+  auth: { secret: () => getExtensionPSK() },
 });
 ```
 
-`getExtensionPSK()` is whatever your extension uses to derive a key both sides agree on — extension ID + version + a stored secret, for example.
+`getExtensionPSK()` is whatever your extension uses to derive a secret both sides agree on. Extension ID + version + a stored secret, for example.
 
 ### BroadcastChannel
 
@@ -279,12 +279,12 @@ const isLeader = await electLeader();
 
 if (isLeader) {
   server(router, broadcastChannel("tab-sync"), {
-    auth: { psk: () => getLeaderPSK() },
+    auth: { secret: () => getLeaderPSK() },
   });
 }
 
 const { api } = client<typeof router>(broadcastChannel("tab-sync"), {
-  auth: { psk: () => getLeaderPSK() },
+  auth: { secret: () => getLeaderPSK() },
 });
 ```
 
@@ -324,7 +324,7 @@ const { api } = client<typeof router>(webRTCChannel(dataChannel), {
 
 ## Split-channel transports
 
-Asymmetric transports work too — you only need a `send` and a `receive`, not a single duplex socket.
+Asymmetric transports work too. You only need a `send` and a `receive`, not a single duplex socket.
 
 ### Server-Sent Events + fetch
 
@@ -368,6 +368,6 @@ The rules do not change:
 
 1. `send` accepts `Uint8Array` and gets it to the other side.
 2. `receive(cb)` calls `cb` with each incoming `Uint8Array`. It returns an unsubscribe function.
-3. The transport is allowed to drop, duplicate, or reorder messages. eRPC will time out and retry. It will not behave correctly if your transport silently corrupts bytes — wrap it in something that fails noisily if you cannot trust it.
+3. The transport is allowed to drop, duplicate, or reorder messages. eRPC will time out and retry. It will not behave correctly if your transport silently corrupts bytes. Wrap it in something that fails noisily if you cannot trust it.
 
-That is the whole API surface. Encryption, framing, retry, key management — all on the eRPC side. Your adapter does not need to care.
+That is the whole API surface. Encryption, framing, retry, key management: all on the eRPC side. Your adapter does not need to care.

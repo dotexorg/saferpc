@@ -55,7 +55,7 @@ export interface ManualSession {
  */
 export async function manualHandshake(
   channel: Channel,
-  psk: Uint8Array,
+  secret: Uint8Array,
   opts: { epoch?: number } = {},
 ): Promise<ManualSession> {
   const epoch = opts.epoch ?? 1;
@@ -84,7 +84,7 @@ export async function manualHandshake(
   };
 
   const rawShared = x25519.getSharedSecret(priv, decoded.pub);
-  const sessionKey = deriveSessionKey(rawShared, psk);
+  const sessionKey = deriveSessionKey(rawShared, secret);
   const expectedProof = computeProof(sessionKey, decoded.pub, pub, nonce);
   const proofOk =
     decoded.proof.length === expectedProof.length &&

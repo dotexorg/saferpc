@@ -33,13 +33,13 @@ describe("security / DoS — framing limits", () => {
       }),
     };
     const srv = server(router, a, {
-      auth: { psk: () => psk },
+      auth: { secret: () => psk },
       maxMessageBytes: 1024,
       onError: (e) => errors.push(e),
     });
 
     const { api, destroy } = client(b, {
-      auth: { psk: () => psk },
+      auth: { secret: () => psk },
       timeout: 1000,
     });
     try {
@@ -70,9 +70,9 @@ describe("security / DoS — client backpressure", () => {
           new Promise<string>((r) => setTimeout(() => r("done"), 200)),
       ),
     };
-    const srv = server(router, a, { auth: { psk: () => psk } });
+    const srv = server(router, a, { auth: { secret: () => psk } });
     const { api, destroy } = client(b, {
-      auth: { psk: () => psk },
+      auth: { secret: () => psk },
       timeout: 5000,
       maxPending: 4,
     });
@@ -107,9 +107,9 @@ describe("security / DoS — depth bomb input", () => {
     const router: Router = {
       sink: chain().handler(async ({ input }) => input),
     };
-    const srv = server(router, a, { auth: { psk: () => psk } });
+    const srv = server(router, a, { auth: { secret: () => psk } });
     const { api, destroy } = client(b, {
-      auth: { psk: () => psk },
+      auth: { secret: () => psk },
       timeout: 1500,
     });
     try {
@@ -139,7 +139,7 @@ describe("security / DoS — black-hole channel", () => {
     mitm.transformAtoB(() => null);
 
     const { api, destroy } = client(b, {
-      auth: { psk: () => psk },
+      auth: { secret: () => psk },
       timeout: 600,
       handshakeTimeout: 200,
     });

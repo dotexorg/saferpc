@@ -23,7 +23,7 @@ import {
   zero,
   sanitize,
   isPlainBytes,
-  isEmptyPsk,
+  isEmptySecret,
   toPlainBytes,
   mpEncode,
   mpDecode,
@@ -32,7 +32,7 @@ import {
   createEncryptor,
   createDecryptor,
   validateAuthConfig,
-  EMPTY_PSK,
+  EMPTY_SECRET,
   buildHelloTranscript,
   buildReplyTranscript,
   RPCError,
@@ -68,7 +68,7 @@ export type Client<T extends Router> = {
 
 export interface ClientOptions {
   /**
-   * Authentication configuration. At least one of `psk` OR asymmetric
+   * Authentication configuration. At least one of `secret` OR asymmetric
    * auth (`sign`/`verify`) MUST be configured.
    */
   auth: AuthOptions;
@@ -392,26 +392,26 @@ export function client<T extends Router>(
           rawShared = x25519.getSharedSecret(priv, serverPub);
           zero(priv);
 
-          const pskBytes =
-            auth.psk !== undefined ? await auth.psk() : EMPTY_PSK;
+          const secretBytes =
+            auth.secret !== undefined ? await auth.secret() : EMPTY_SECRET;
           if (state !== "handshaking" || epoch !== currentEpoch) return;
 
-          if (!(pskBytes instanceof Uint8Array) || pskBytes.length < KEY_LEN) {
+          if (!(secretBytes instanceof Uint8Array) || secretBytes.length < KEY_LEN) {
             throw new RPCError(
               "HANDSHAKE",
-              `PSK must be a Uint8Array of at least ${KEY_LEN} bytes`,
+              `secret must be a Uint8Array of at least ${KEY_LEN} bytes`,
             );
           }
-          if (auth.psk !== undefined && isEmptyPsk(pskBytes)) {
+          if (auth.secret !== undefined && isEmptySecret(secretBytes)) {
             throw new RPCError(
               "HANDSHAKE",
-              "Application returned an all-zero PSK",
+              "Application returned an all-zero secret",
             );
           }
 
-          // The caller owns the PSK buffer's lifecycle — do NOT mutate it.
+          // The caller owns the secret buffer's lifecycle — do NOT mutate it.
           // A `() => sharedSecret` pattern would break on the next handshake.
-          localSessionKey = deriveSessionKey(rawShared, pskBytes);
+          localSessionKey = deriveSessionKey(rawShared, secretBytes);
 
           const expected = computeProof(localSessionKey, serverPub, pub, nonce);
           const proofOk = constTimeEqual(proof, expected);
