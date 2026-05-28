@@ -1,7 +1,7 @@
 {
-  "name": "@dotex/erpc",
+  "name": "@dotex/saferpc",
   "version": "0.3.2",
-  "description": "Encrypted RPC for any two counterparties over any bidirectional channel",
+  "description": "Safe RPC for any two counterparties over any bidirectional channel",
   "type": "module",
   "files": [
     "esm",
@@ -27,10 +27,10 @@
     "postversion": "npm publish && git push --follow-tags"
   },
   "author": "Dotex (https://dotex.org/about)",
-  "homepage": "https://github.com/dotexorg/erpc",
+  "homepage": "https://github.com/dotexorg/saferpc",
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/dotexorg/erpc.git"
+    "url": "git+https://github.com/dotexorg/saferpc.git"
   },
   "license": "MIT",
   "dependencies": {
@@ -83,7 +83,7 @@
     "access": "public"
   },
   "keywords": [
-    "erpc",
+    "saferpc",
     "rpc",
     "encrypted",
     "messaging",

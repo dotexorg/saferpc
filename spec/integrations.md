@@ -1,6 +1,6 @@
 # Integrations
 
-eRPC asks one thing of the transport: it must move `Uint8Array` in both directions. That is the whole contract.
+Safe RPC asks one thing of the transport: it must move `Uint8Array` in both directions. That is the whole contract.
 
 ```typescript
 interface Channel {
@@ -9,11 +9,11 @@ interface Channel {
 }
 ```
 
-Everything below is a one-screen adapter that satisfies that interface. Each one is a few lines of glue around a native transport, and none of them need to know what eRPC does.
+Everything below is a one-screen adapter that satisfies that interface. Each one is a few lines of glue around a native transport, and none of them need to know what Safe RPC does.
 
 ## Duplex socket transports
 
-Bidirectional byte streams. Each connection maps to one eRPC session.
+Bidirectional byte streams. Each connection maps to one Safe RPC session.
 
 ### WebSocket
 
@@ -41,7 +41,7 @@ Make sure `ws.binaryType = "arraybuffer"` on the browser side.
 ```typescript
 // Server (Node.js, ws package)
 import { WebSocketServer } from "ws";
-import { server } from "@dotex/erpc";
+import { server } from "@dotex/saferpc";
 
 const serverSecret = crypto.getRandomValues(new Uint8Array(32));
 const wss = new WebSocketServer({ port: 8080 });
@@ -66,7 +66,7 @@ const { api } = client<typeof router>(wsChannel(ws), {
 const user = await api.getUser({ id: "123" });
 ```
 
-A WebSocket carries one logical eRPC session per connection. Reconnect = new handshake.
+A WebSocket carries one logical Safe RPC session per connection. Reconnect = new handshake.
 
 ### TCP socket (Node.js)
 
@@ -230,7 +230,7 @@ The `Array.from` round-trip is the price of `chrome.runtime`. High-throughput ex
 ```typescript
 // background.js (service worker)
 chrome.runtime.onConnect.addListener((port) => {
-  if (port.name !== "erpc") return;
+  if (port.name !== "saferpc") return;
   const { destroy } = server(router, extensionPortChannel(port), {
     auth: { secret: () => getExtensionPSK() },
     context: () => ({
@@ -242,7 +242,7 @@ chrome.runtime.onConnect.addListener((port) => {
 });
 
 // content-script.js
-const port = chrome.runtime.connect({ name: "erpc" });
+const port = chrome.runtime.connect({ name: "saferpc" });
 const { api } = client<typeof router>(extensionPortChannel(port), {
   auth: { secret: () => getExtensionPSK() },
 });
@@ -272,7 +272,7 @@ function broadcastChannel(name: string): Channel {
 }
 ```
 
-eRPC is a 1:1 protocol. To use BroadcastChannel, elect a single server tab (leader) and let other tabs become clients. The leader holds the session state; clients re-handshake when leadership moves.
+Safe RPC is a 1:1 protocol. To use BroadcastChannel, elect a single server tab (leader) and let other tabs become clients. The leader holds the session state; clients re-handshake when leadership moves.
 
 ```typescript
 const isLeader = await electLeader();
@@ -360,7 +360,7 @@ function sseChannel(url: string): Channel {
 }
 ```
 
-The server side needs an in-memory map from session to SSE stream so it knows where to send replies. The adapter is more involved than the duplex transports, but the eRPC code on top stays identical.
+The server side needs an in-memory map from session to SSE stream so it knows where to send replies. The adapter is more involved than the duplex transports, but the Safe RPC code on top stays identical.
 
 ## Custom transports
 
@@ -368,6 +368,6 @@ The rules are the same as everywhere else:
 
 1. `send` accepts `Uint8Array` and gets it to the other side.
 2. `receive(cb)` calls `cb` with each incoming `Uint8Array`. It returns an unsubscribe function.
-3. The transport is allowed to drop, duplicate, or reorder messages. eRPC will time out and retry. It will not behave correctly if your transport silently corrupts bytes. Wrap it in something that fails noisily if you cannot trust it.
+3. The transport is allowed to drop, duplicate, or reorder messages. Safe RPC will time out and retry. It will not behave correctly if your transport silently corrupts bytes. Wrap it in something that fails noisily if you cannot trust it.
 
-That is the whole API surface. Encryption, framing, retry, key management: all on the eRPC side. Your adapter does not need to care.
+That is the whole API surface. Encryption, framing, retry, key management: all on the Safe RPC side. Your adapter does not need to care.

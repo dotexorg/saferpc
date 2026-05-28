@@ -5,7 +5,7 @@ Install, define a router, configure auth, attach a channel, call functions.
 ## Install
 
 ```bash
-npm install @dotex/erpc
+npm install @dotex/saferpc
 ```
 
 The only peer dependency is `zod` (or any library exposing `.safeParse()`).
@@ -16,7 +16,7 @@ One file, shared between server and client as a **type**. The client never impor
 
 ```typescript
 // router.ts
-import { chain } from "@dotex/erpc";
+import { chain } from "@dotex/saferpc";
 import { z } from "zod";
 
 const d = chain();
@@ -45,7 +45,7 @@ crypto.getRandomValues(new Uint8Array(32)); // run once, store the result
 
 ```typescript
 // server.ts
-import { server, type Channel } from "@dotex/erpc";
+import { server, type Channel } from "@dotex/saferpc";
 import { WebSocketServer, type WebSocket } from "ws";
 import { router } from "./router.js";
 
@@ -79,7 +79,7 @@ wss.on("connection", (ws) => {
 
 ```typescript
 // app.ts
-import { client, type Channel } from "@dotex/erpc";
+import { client, type Channel } from "@dotex/saferpc";
 import type { AppRouter } from "./router";
 
 const secret = new Uint8Array([/* same 32 bytes as the server */]);
@@ -133,7 +133,7 @@ Two error classes:
 - `RemoteRPCError`: error returned from the remote peer (`code`, `message`, `data`).
 
 ```typescript
-import { RPCError, RemoteRPCError } from "@dotex/erpc";
+import { RPCError, RemoteRPCError } from "@dotex/saferpc";
 
 try {
   await api.greet({ name: "World" });
@@ -153,7 +153,7 @@ try {
 Middleware runs before the handler and extends the context. Chain it with `.use()`:
 
 ```typescript
-import { chain, RPCError } from "@dotex/erpc";
+import { chain, RPCError } from "@dotex/saferpc";
 import { z } from "zod";
 
 const d = chain();
@@ -187,14 +187,14 @@ server(router, channel, {
 
 ## Advanced auth
 
-A pre-shared secret is enough for the fast start. For public clients, per-device identity, or defense-in-depth, eRPC ships three more configurations.
+A pre-shared secret is enough for the fast start. For public clients, per-device identity, or defense-in-depth, Safe RPC ships three more configurations.
 
 ### Derived session secret
 
 Bind the secret to a per-session identifier instead of a single static key:
 
 ```typescript
-import { deriveSessionSecret } from "@dotex/erpc";
+import { deriveSessionSecret } from "@dotex/saferpc";
 
 const auth = {
   secret: async () => {
@@ -225,7 +225,7 @@ Or use the built-in Ed25519 helpers:
 import {
   createEd25519ClientAuth,
   createEd25519ServerAuth,
-} from "@dotex/erpc";
+} from "@dotex/saferpc";
 
 // Client
 const auth = createEd25519ClientAuth({ privateKey, deviceId: "device-123" });
@@ -265,4 +265,4 @@ The full trade-off breakdown lives in [Security](security.md).
 - [Security](security.md): threat model, handshake details, what each auth mode protects against
 - [Integrations](integrations.md): adapters for WebSocket, postMessage, MessagePort, Chrome extensions, BroadcastChannel, WebRTC, TCP, SSE
 - [API](api.md): full reference for `chain()`, `server()`, `client()`, and every option
-- [Protocol](protocol.md): wire format and key derivation, enough to port eRPC to another language
+- [Protocol](protocol.md): wire format and key derivation, enough to port Safe RPC to another language

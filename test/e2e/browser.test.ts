@@ -1,6 +1,6 @@
 /**
  * Browser E2E — Puppeteer drives a real Chromium with two iframes
- * communicating in-memory through eRPC. Confirms the bundle works
+ * communicating in-memory through Safe RPC. Confirms the bundle works
  * unchanged in a browser. The iframe channel adapter for postMessage
  * is documented in spec/integrations.md; here we drive an in-memory
  * pair to keep the test focused on bundle correctness.
@@ -84,7 +84,7 @@ const HOST_HTML = `<!doctype html>
 </script>
 <script type="module">
 import { chain, client, server } from "/esm/index.js";
-window.__erpc = { chain, client, server };
+window.__saferpc = { chain, client, server };
 window.__ready = true;
 </script>
 </body></html>`;
@@ -108,15 +108,15 @@ describeMaybe("browser / puppeteer", () => {
       );
 
       const result = await page.evaluate(async () => {
-        const erpc = (
+        const saferpc = (
           window as unknown as {
-            __erpc: {
+            __saferpc: {
               chain: typeof import("../../src/index.ts").chain;
               client: typeof import("../../src/index.ts").client;
               server: typeof import("../../src/index.ts").server;
             };
           }
-        ).__erpc;
+        ).__saferpc;
 
         let aCb: ((d: Uint8Array) => void) | null = null;
         let bCb: ((d: Uint8Array) => void) | null = null;
@@ -145,14 +145,14 @@ describeMaybe("browser / puppeteer", () => {
 
         const psk = crypto.getRandomValues(new Uint8Array(32));
         const router = {
-          greet: erpc
+          greet: saferpc
             .chain()
             .handler(async ({ input }: { input: unknown }) => ({
               message: "Hello, " + (input as { name: string }).name + "!",
             })),
         };
-        const srv = erpc.server(router, a, { auth: { secret: () => psk } });
-        const { api, destroy } = erpc.client(b, {
+        const srv = saferpc.server(router, a, { auth: { secret: () => psk } });
+        const { api, destroy } = saferpc.client(b, {
           auth: { secret: () => psk },
           timeout: 3000,
         });

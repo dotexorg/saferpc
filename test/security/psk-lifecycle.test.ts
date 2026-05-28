@@ -5,7 +5,7 @@ import { chain, client, server, type Router } from "../../src/index.ts";
 import { createChannelPair } from "../helpers/channels.ts";
 
 /**
- * Regression: eRPC must never mutate the secret buffer the caller returned.
+ * Regression: Safe RPC must never mutate the secret buffer the caller returned.
  * A `() => sharedSecret` pattern is documented; zeroing that buffer would
  * silently downgrade subsequent handshakes to EMPTY_SECRET.
  */

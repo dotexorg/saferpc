@@ -79,7 +79,7 @@ jobs:
         run: |
           TAG="${{ steps.tag.outputs.name }}"
           VERSION="${{ steps.tag.outputs.version }}"
-          NPM_LINK="Published to npm: https://www.npmjs.com/package/@dotex/erpc/v/${VERSION}"
+          NPM_LINK="Published to npm: https://www.npmjs.com/package/@dotex/saferpc/v/${VERSION}"
           ARTICLE=$(git show --name-only --pretty=format: "$TAG" -- 'changelog/*.md' | grep -v '^$' | head -1 || true)
           if [ -n "$ARTICLE" ] && [ -f "$ARTICLE" ]; then
             echo "generate=false" >> "$GITHUB_OUTPUT"

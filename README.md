@@ -1,20 +1,20 @@
-# eRPC
+# Safe RPC
 
-[![npm](https://img.shields.io/npm/v/@dotex/erpc.svg)](https://www.npmjs.com/package/@dotex/erpc)
-[![license](https://img.shields.io/npm/l/@dotex/erpc.svg)](./LICENSE)
+[![npm](https://img.shields.io/npm/v/@dotex/saferpc.svg)](https://www.npmjs.com/package/@dotex/saferpc)
+[![license](https://img.shields.io/npm/l/@dotex/saferpc.svg)](./LICENSE)
 [![types](https://img.shields.io/badge/types-TypeScript-blue.svg)](https://www.typescriptlang.org/)
 
-**Encrypted, typed RPC over any bidirectional channel.** Two peers, one shared secret (or one keypair). Every call is end-to-end encrypted with XSalsa20-Poly1305 AEAD. WebSocket, `postMessage`, `MessagePort`, `chrome.runtime`, `BroadcastChannel`, WebRTC — if a channel can carry bytes, eRPC encrypts and types what flows through it.
+**Encrypted, typed RPC over any bidirectional channel.** Two peers, one shared secret (or one keypair). Every call is end-to-end encrypted with XSalsa20-Poly1305 AEAD. WebSocket, `postMessage`, `MessagePort`, `chrome.runtime`, `BroadcastChannel`, WebRTC — if a channel can carry bytes, Safe RPC encrypts and types what flows through it.
 
 Think tRPC, but transport-agnostic and encrypted by default.
 
 ```bash
-npm install @dotex/erpc
+npm install @dotex/saferpc
 ```
 
-![eRPC](erpc.png)
+![Safe RPC](saferpc.png)
 
-- **Full docs and rationale:** <https://dotex.org/epic/erpc>
+- **Full docs and rationale:** <https://dotex.org/epic/saferpc>
 - [Quickstart](./spec/getting-started.md) · [API](./spec/api.md) · [Wire Protocol](./spec/protocol.md) · [Security](./spec/security.md) · [Transports](./spec/integrations.md)
 
 ## Highlights
@@ -30,7 +30,7 @@ npm install @dotex/erpc
 ## Quick start
 
 ```typescript
-import { chain, server, client } from "@dotex/erpc";
+import { chain, server, client } from "@dotex/saferpc";
 import { z } from "zod";
 
 const d = chain();
@@ -64,7 +64,7 @@ interface Channel {
 }
 ```
 
-Anything that satisfies this can host an eRPC session. Ready-made adapters for WebSocket, `postMessage`, `MessagePort`, Chrome extension ports, `BroadcastChannel`, WebRTC, TCP, and SSE live in [spec/integrations.md](./spec/integrations.md).
+Anything that satisfies this can host a Safe RPC session. Ready-made adapters for WebSocket, `postMessage`, `MessagePort`, Chrome extension ports, `BroadcastChannel`, WebRTC, TCP, and SSE live in [spec/integrations.md](./spec/integrations.md).
 
 ## Authentication
 
@@ -93,7 +93,7 @@ Built-in helpers cover Ed25519, ECDSA P-256, JWT, certificate-based, and multifa
 ## Errors
 
 ```typescript
-import { RPCError, RemoteRPCError } from "@dotex/erpc";
+import { RPCError, RemoteRPCError } from "@dotex/saferpc";
 
 try {
   await api.greet({ name: "World" });
@@ -122,11 +122,11 @@ src/
 ```
 
 ```typescript
-import { chain, server, client, RPCError } from "@dotex/erpc";
+import { chain, server, client, RPCError } from "@dotex/saferpc";
 // Subpaths are also available for tree-shaking:
-import { server } from "@dotex/erpc/server";
-import { client } from "@dotex/erpc/client";
-import { chain, RPCError } from "@dotex/erpc/common";
+import { server } from "@dotex/saferpc/server";
+import { client } from "@dotex/saferpc/client";
+import { chain, RPCError } from "@dotex/saferpc/common";
 ```
 
 ## Compatibility
@@ -135,7 +135,7 @@ Node.js 18+, modern browsers, Service / Web / Shared Workers, React Native, Verc
 
 ## Project status
 
-`0.x` with a stable wire protocol (`drpc-v1` HKDF info, `erpc-hs-{hello,reply}-v1` transcript prefixes). Test coverage for handshake attacks, replay, tampering, type confusion, prototype pollution, middleware misuse, and DoS limits lives in `test/security/`. A 1.0 release will lock the public API surface.
+`0.x` with a stable wire protocol (`saferpc-v1` HKDF info, `saferpc-hs-{hello,reply}-v1` transcript prefixes). Test coverage for handshake attacks, replay, tampering, type confusion, prototype pollution, middleware misuse, and DoS limits lives in `test/security/`. A 1.0 release will lock the public API surface.
 
 ## Releasing
 

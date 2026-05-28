@@ -10,12 +10,12 @@ import {
   chain, server, client,
   RPCError, RemoteRPCError,
   deriveSessionSecret,
-} from "@dotex/erpc";
+} from "@dotex/saferpc";
 
 // Subpaths for tree-shaking
-import { ... } from "@dotex/erpc/common";
-import { ... } from "@dotex/erpc/server";
-import { ... } from "@dotex/erpc/client";
+import { ... } from "@dotex/saferpc/common";
+import { ... } from "@dotex/saferpc/server";
+import { ... } from "@dotex/saferpc/client";
 ```
 
 ---
@@ -211,7 +211,7 @@ The only transport contract. `receive` returns an unsubscribe function. The chan
 - Deliver each call to `cb` once, in any order
 - Allow `send` and `receive` to run concurrently
 
-Dropping, duplicating, or reordering messages is allowed — eRPC will time out and retry. Ready-made adapters live in [Integrations](integrations.md).
+Dropping, duplicating, or reordering messages is allowed — Safe RPC will time out and retry. Ready-made adapters live in [Integrations](integrations.md).
 
 > Within a single session the protocol assumes the `TAG_HELLO` reply arrives before any `TAG_MSG` sent under the resulting session key. Transports that can reorder *across* the hello/reply boundary (multi-path links, fan-out buses) will hang the handshake until the timeout fires. `TAG_MSG`-to-`TAG_MSG` reordering stays safe: every encrypted frame is independently authenticated and the protocol imposes no ordering on application messages.
 
@@ -306,7 +306,7 @@ The `context` factory runs **per request**, after auth verification, and receive
 function deriveSessionSecret(sessionId: string, secret: Uint8Array): Uint8Array;
 ```
 
-HKDF-SHA-256 over `secret` with `sessionId` as salt and the fixed info string `"erpc-session-v1"`. Returns 32 bytes.
+HKDF-SHA-256 over `secret` with `sessionId` as salt and the fixed info string `"saferpc-session-v1"`. Returns 32 bytes.
 
 Throws `TypeError` if `sessionId` is empty or `secret` is shorter than 32 bytes.
 
@@ -327,7 +327,7 @@ import {
   createECDSAClientAuth,
   generateEd25519Keypair,
   generateECDSAKeypair,
-} from "@dotex/erpc";
+} from "@dotex/saferpc";
 ```
 
 | Helper | Returns | Notes |
@@ -347,7 +347,7 @@ import {
   createECDSAServerAuth,
   createCertificateServerAuth,
   createMultifactorServerAuth,
-} from "@dotex/erpc";
+} from "@dotex/saferpc";
 ```
 
 | Helper | Use |
@@ -379,7 +379,7 @@ import {
   // Type guards
   isPlainBytes,     // exact-prototype Uint8Array check for wire data
   isEmptySecret,    // constant-time check for the 32-zero secret sentinel
-} from "@dotex/erpc";
+} from "@dotex/saferpc";
 ```
 
 Exported for adapter authors. Application code rarely needs them.

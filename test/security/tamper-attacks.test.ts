@@ -1,7 +1,7 @@
 /**
  * Tamper attacks: bit-flip / truncation / forged TAG_MSG.
  *
- * eRPC drops failed-decrypt frames silently (poly1305 auth failure). The
+ * Safe RPC drops failed-decrypt frames silently (poly1305 auth failure). The
  * application-level call should TIME OUT or auto-retry — never see a
  * forged response.
  */

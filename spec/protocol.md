@@ -1,6 +1,6 @@
 # Protocol
 
-Language-agnostic specification of the eRPC wire protocol. Read this to port eRPC, audit it, or build a compatible implementation. Everything below is normative.
+Language-agnostic specification of the Safe RPC wire protocol. Read this to port Safe RPC, audit it, or build a compatible implementation. Everything below is normative.
 
 The reference implementation is in TypeScript, but this document is the contract — the code follows it.
 
@@ -43,10 +43,10 @@ All wire numbers are network-byte-order (big-endian) unless explicitly noted.
 | `HANDSHAKE_TIMEOUT_MS` | 5,000 | Default timeout for completing the handshake |
 | `RPC_TIMEOUT_MS` | 10,000 | Default per-call timeout (client side) |
 | `MAX_PENDING` | 256 | Default maximum in-flight RPCs per client |
-| `KDF_INFO` | UTF-8 bytes of `"drpc-v1"` | HKDF info parameter for session key |
-| `PSK_DERIVE_INFO` | UTF-8 bytes of `"erpc-session-v1"` | HKDF info for `deriveSessionSecret` helper |
-| `TRANSCRIPT_HELLO_MAGIC` | UTF-8 bytes of `"erpc-hs-hello-v1\0"` (17 bytes) | Domain separation for client transcript |
-| `TRANSCRIPT_REPLY_MAGIC` | UTF-8 bytes of `"erpc-hs-reply-v1\0"` (17 bytes) | Domain separation for server transcript |
+| `KDF_INFO` | UTF-8 bytes of `"saferpc-v1"` | HKDF info parameter for session key |
+| `PSK_DERIVE_INFO` | UTF-8 bytes of `"saferpc-session-v1"` | HKDF info for `deriveSessionSecret` helper |
+| `TRANSCRIPT_HELLO_MAGIC` | UTF-8 bytes of `"saferpc-hs-hello-v1\0"` (20 bytes) | Domain separation for client transcript |
+| `TRANSCRIPT_REPLY_MAGIC` | UTF-8 bytes of `"saferpc-hs-reply-v1\0"` (20 bytes) | Domain separation for server transcript |
 | `EMPTY_SECRET` | 32 zero bytes | HKDF salt when no secret is configured (asymmetric-only mode) |
 
 ## Frame format
@@ -203,7 +203,7 @@ session_key = HKDF(
   hash  = SHA-256,
   ikm   = X25519(local_priv, remote_pub),
   salt  = secret_or_EMPTY_SECRET,
-  info  = KDF_INFO,                // "drpc-v1"
+  info  = KDF_INFO,                // "saferpc-v1"
   L     = KEY_LEN,                 // 32
 )
 ```
@@ -223,7 +223,7 @@ deriveSessionSecret(sessionId, secret) := HKDF(
   hash = SHA-256,
   ikm  = secret,                  // ≥ 32 bytes
   salt = utf8(sessionId),         // non-empty
-  info = PSK_DERIVE_INFO,         // "erpc-session-v1"
+  info = PSK_DERIVE_INFO,         // "saferpc-session-v1"
   L    = KEY_LEN,                 // 32
 )
 ```
@@ -266,7 +266,7 @@ plaintext   = XSalsa20-Poly1305-decrypt(session_key, nonce, ciphertext, AD=∅)
 message     = sanitize(msgpack_decode(plaintext))
 ```
 
-A 24-byte random nonce gives 192 bits of entropy. Collisions are negligible for any realistic message volume. eRPC does **not** use a counter. The trade-off: slightly higher nonce size in exchange for stateless encoding and tolerance for out-of-order or duplicated transport delivery.
+A 24-byte random nonce gives 192 bits of entropy. Collisions are negligible for any realistic message volume. Safe RPC does **not** use a counter. The trade-off: slightly higher nonce size in exchange for stateless encoding and tolerance for out-of-order or duplicated transport delivery.
 
 ## RPC message format
 
@@ -383,7 +383,7 @@ A port to a language without prototype pollution still has to:
 
 ## Authorization data flow
 
-When `auth.verify` is configured on the server, the value it returns is the verified principal for the lifetime of the session. eRPC takes the returned `{ auth: ... }` object, sanitizes it, and:
+When `auth.verify` is configured on the server, the value it returns is the verified principal for the lifetime of the session. Safe RPC takes the returned `{ auth: ... }` object, sanitizes it, and:
 
 - Stores it on the server session.
 - Passes it as `{ auth: verified }` to the `context` factory on every request.
@@ -425,7 +425,7 @@ Silent drops are deliberate. Any feedback at the wire level gives an attacker pr
 ## Compatibility
 
 - The `auth` field on hello and reply is **optional**. Peers that do not understand it ignore it; peers that need it reject frames that lack it. Secret-only deployments stay wire-compatible with mutual-auth deployments as long as neither side has `verify` configured.
-- The transcript magic strings (`erpc-hs-hello-v1`, `erpc-hs-reply-v1`) and `KDF_INFO` (`drpc-v1`) are version markers. Any change to transcripts, key derivation inputs, or framing **must** bump these strings. Otherwise an attacker could mix and match versions in a downgrade attack.
+- The transcript magic strings (`saferpc-hs-hello-v1`, `saferpc-hs-reply-v1`) and `KDF_INFO` (`saferpc-v1`) are version markers. Any change to transcripts, key derivation inputs, or framing **must** bump these strings. Otherwise an attacker could mix and match versions in a downgrade attack.
 - New fields can be added to the request/response messages (`t: 1` and `t: 2` maps). Implementations **must** ignore unknown fields. They **must not** accept messages with wrong `t` or missing required fields.
 
 ## Implementation checklist

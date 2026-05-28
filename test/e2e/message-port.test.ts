@@ -1,6 +1,6 @@
 /**
  * E2E over a real Node MessageChannel — the same primitive used by Web
- * Workers and iframes. Validates the eRPC channel adapter against a
+ * Workers and iframes. Validates the Safe RPC channel adapter against a
  * structured-clone MessagePort transport.
  */
 import { describe, it, expect } from "vitest";

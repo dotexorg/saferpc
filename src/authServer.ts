@@ -5,7 +5,7 @@
  * payloads cannot smuggle ext types, prototype-polluting keys, or oversized
  * arrays. Every helper performs strict type validation on the decoded
  * fields and binds verification to the canonical handshake transcript that
- * eRPC passes in.
+ * Safe RPC passes in.
  */
 
 import { ed25519 } from "@noble/curves/ed25519.js";
@@ -41,7 +41,7 @@ export interface JWTServerConfig {
   /**
    * Verify a JWT and return its decoded payload. Throw or return a falsy
    * value to reject the token. Returned object becomes the verified
-   * principal — sanitized by eRPC before reaching `context`.
+   * principal — sanitized by Safe RPC before reaching `context`.
    */
   verifyToken: (
     token: string,

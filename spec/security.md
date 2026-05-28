@@ -1,6 +1,6 @@
 # Security
 
-eRPC treats the transport as hostile. This page covers what that buys you, how to configure auth so those guarantees hold, and what is *not* covered. Wire-level mechanics (frame layout, handshake steps, state machines, key derivation) live in [Protocol](protocol.md).
+Safe RPC treats the transport as hostile. This page covers what that buys you, how to configure auth so those guarantees hold, and what is *not* covered. Wire-level mechanics (frame layout, handshake steps, state machines, key derivation) live in [Protocol](protocol.md).
 
 ## Threat model
 
@@ -11,11 +11,11 @@ The transport channel is **untrusted**. The attacker may:
 - Replay captured messages
 - Drop or reorder messages
 
-eRPC does **not** protect against:
+Safe RPC does **not** protect against:
 
 - **Denial of service.** An attacker who drops every byte makes communication impossible. No protocol-layer fix.
 - **Compromised endpoints.** Once attacker code runs on either side, encryption is moot.
-- **Timing side channels in your handlers.** eRPC's own comparisons are constant-time. Your handler code is not, unless you write it that way.
+- **Timing side channels in your handlers.** Safe RPC's own comparisons are constant-time. Your handler code is not, unless you write it that way.
 
 ## Security properties
 
@@ -51,7 +51,7 @@ auth: {
 
 Use when both endpoints are controlled by the same entity, secrets can be rotated, and individual revocation is not required. A pre-shared secret is cheap: no signature operations on the hot path.
 
-> The secret buffer's lifecycle belongs to the caller. eRPC reads it during HKDF and never mutates it. Returning the same `Uint8Array` from `secret()` across handshakes is safe; if you want it zeroed, zero it yourself when the secret is no longer needed.
+> The secret buffer's lifecycle belongs to the caller. Safe RPC reads it during HKDF and never mutates it. Returning the same `Uint8Array` from `secret()` across handshakes is safe; if you want it zeroed, zero it yourself when the secret is no longer needed.
 
 ### Asymmetric only
 
@@ -100,17 +100,17 @@ Forward secrecy comes from the ephemeral X25519 exchange in either mode. Even if
 
 ## Transcript format
 
-Signatures are taken over canonical byte strings built by eRPC. Two transcripts exist, each with a domain-separated magic prefix, so a hello signature cannot be replayed as a reply (or vice versa).
+Signatures are taken over canonical byte strings built by Safe RPC. Two transcripts exist, each with a domain-separated magic prefix, so a hello signature cannot be replayed as a reply (or vice versa).
 
 ```
 HELLO transcript:
-  "erpc-hs-hello-v1\0"   (17 bytes)
+  "saferpc-hs-hello-v1\0"   (20 bytes)
   epoch                  (4 bytes, big-endian uint32)
   client_pub             (32 bytes, X25519)
   client_nonce           (32 bytes)
 
 REPLY transcript:
-  "erpc-hs-reply-v1\0"   (17 bytes)
+  "saferpc-hs-reply-v1\0"   (20 bytes)
   epoch                  (4 bytes, big-endian uint32)
   client_pub             (32 bytes)
   client_nonce           (32 bytes)
@@ -133,7 +133,7 @@ A throw at any auth step rejects the handshake. The client resets to `idle`, the
 
 ## Ephemeral key validity
 
-The peer's X25519 public key is consumed verbatim by `getSharedSecret`. eRPC relies on the curve implementation to reject the small-subgroup elements listed in RFC 7748 §6.1 (the all-zero point, the order-1 element, the four order-8 elements, and the three near-`p` variants). If those points were accepted, the ECDH output would be all zeros and an active MITM in asymmetric-only mode could rewrite the hello's `pub` to drive both sides to a deterministic `session_key = HKDF(zeros, EMPTY_SECRET, "drpc-v1", 32)`, then replay a captured bearer-style auth payload over the matching transcript and decrypt the session.
+The peer's X25519 public key is consumed verbatim by `getSharedSecret`. Safe RPC relies on the curve implementation to reject the small-subgroup elements listed in RFC 7748 §6.1 (the all-zero point, the order-1 element, the four order-8 elements, and the three near-`p` variants). If those points were accepted, the ECDH output would be all zeros and an active MITM in asymmetric-only mode could rewrite the hello's `pub` to drive both sides to a deterministic `session_key = HKDF(zeros, EMPTY_SECRET, "saferpc-v1", 32)`, then replay a captured bearer-style auth payload over the matching transcript and decrypt the session.
 
 The reference implementation gets this defense from `@noble/curves` (^2.2.0), which throws on every known low-order input. The pin in `package.json` is therefore load-bearing: a future curve dependency that relaxed the check would re-open the attack against asymmetric-only deployments. The regression test `test/security/f002-low-order-x25519-pubkey.test.ts` pins both halves of the contract — the library throws, and a forged hello carrying a low-order `pub` aborts the server handshake before any session state is derived. A port to another language must enforce the same rejection at the application layer if its chosen curve library does not.
 
@@ -142,7 +142,7 @@ The reference implementation gets this defense from `@noble/curves` (^2.2.0), wh
 ```typescript
 // ✅ Static secret from a secrets vault, server-to-server
 auth: {
-  secret: async () => await vault.getSecret("erpc-server-key"),
+  secret: async () => await vault.getSecret("saferpc-server-key"),
 }
 
 // ✅ Session-derived from an authenticated token + device secret
@@ -170,7 +170,7 @@ auth: { secret: () => new TextEncoder().encode("secret123") }
 auth: { secret: () => deriveSessionSecret("user-123", secret) }
 
 // ❌ All-zero or weak derivation material: no security at all.
-// eRPC refuses an all-zero secret at runtime: `HANDSHAKE` is thrown with
+// Safe RPC refuses an all-zero secret at runtime: `HANDSHAKE` is thrown with
 // "Application returned an all-zero secret" so this mistake fails loudly
 // instead of silently degrading into the asymmetric-only mode.
 auth: { secret: () => deriveSessionSecret(sessionId, new Uint8Array(32)) }
@@ -185,7 +185,7 @@ The unsafe list shares one pattern: the attacker can reproduce the derivation, e
 
 ## Built-in signature helpers
 
-eRPC ships ready-made helpers for the common cases. Each one binds its proof to the handshake transcript that eRPC passes in.
+Safe RPC ships ready-made helpers for the common cases. Each one binds its proof to the handshake transcript that Safe RPC passes in.
 
 ```typescript
 import {
@@ -199,7 +199,7 @@ import {
   createMultifactorServerAuth,
   generateEd25519Keypair,
   generateECDSAKeypair,
-} from "@dotex/erpc";
+} from "@dotex/saferpc";
 ```
 
 ### Ed25519 (recommended)
@@ -284,7 +284,7 @@ The client embeds `{ primary, secondary }`: two pre-encoded sub-payloads.
 
 ## Replay within a session
 
-eRPC uses random 24-byte nonces (not counters) for XSalsa20-Poly1305. The collision probability is negligible. But **a captured ciphertext can be replayed by an attacker who can inject into a live channel**. The replayed message will decrypt and execute again.
+Safe RPC uses random 24-byte nonces (not counters) for XSalsa20-Poly1305. The collision probability is negligible. But **a captured ciphertext can be replayed by an attacker who can inject into a live channel**. The replayed message will decrypt and execute again.
 
 For non-idempotent operations, add an idempotency key inside the procedure input, or keep a request-ID set on the server keyed by the verified principal.
 

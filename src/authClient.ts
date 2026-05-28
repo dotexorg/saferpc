@@ -3,7 +3,7 @@
  *
  * Each helper returns a Partial<AuthOptions> containing a `sign` function.
  * Spread it into your `auth` block. All helpers bind their proof payload
- * to the handshake transcript provided by eRPC (signature input or, for
+ * to the handshake transcript provided by Safe RPC (signature input or, for
  * bearer-token modes, an embedded transcript digest verified by the peer).
  */
 

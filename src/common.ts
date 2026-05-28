@@ -47,15 +47,19 @@ export const MAX_AUTH_BYTES = 32_768;
  * the protocol's hard limit.
  */
 export const MAX_DEPTH = 32;
-const KDF_INFO = new TextEncoder().encode("drpc-v1");
+const KDF_INFO = new TextEncoder().encode("saferpc-v1");
 
 /**
  * Domain-separated transcript prefixes. The handshake transcript is the
  * canonical byte string the application's authenticator signs / verifies
  * over. Keep these tight, versioned, and never reused across domains.
  */
-const TRANSCRIPT_HELLO_MAGIC = new TextEncoder().encode("erpc-hs-hello-v1\0");
-const TRANSCRIPT_REPLY_MAGIC = new TextEncoder().encode("erpc-hs-reply-v1\0");
+const TRANSCRIPT_HELLO_MAGIC = new TextEncoder().encode(
+  "saferpc-hs-hello-v1\0",
+);
+const TRANSCRIPT_REPLY_MAGIC = new TextEncoder().encode(
+  "saferpc-hs-reply-v1\0",
+);
 
 /**
  * Hardened ExtensionCodec — rejects ALL msgpack extension types including
@@ -124,7 +128,7 @@ export function toPlainBytes(v: Uint8Array): Uint8Array {
 
 /**
  * Constant-time check that a buffer is the protocol's "no secret" sentinel:
- * 32 zero bytes. Returns false for any other length. eRPC's internal flow
+ * 32 zero bytes. Returns false for any other length. Safe RPC's internal flow
  * uses `EMPTY_SECRET` as the HKDF salt when `auth.secret` is absent — but if a
  * user-provided `secret()` returns 32 zeros (e.g. `new Uint8Array(32)`), the
  * resulting session has no secret authentication. Refuse it at runtime.
@@ -220,7 +224,7 @@ export function deriveSessionSecret(
     throw new TypeError(`secret must be at least ${KEY_LEN} bytes`);
   }
   const sessionBytes = new TextEncoder().encode(sessionId);
-  const info = new TextEncoder().encode("erpc-session-v1");
+  const info = new TextEncoder().encode("saferpc-session-v1");
   return hkdf(sha256, secret, sessionBytes, info, KEY_LEN);
 }
 
@@ -367,7 +371,7 @@ export function validateAuthConfig(auth: AuthOptions): void {
   if (!hasSecret && !hasAsymmetric) {
     throw new TypeError(
       "At least one of `auth.secret` or asymmetric auth (`auth.sign`/`auth.verify`) must be configured. " +
-        "An eRPC handshake with neither would be unauthenticated.",
+        "A Safe RPC handshake with neither would be unauthenticated.",
     );
   }
 }
@@ -435,7 +439,7 @@ export interface Channel {
 export type VerifyResult = { auth?: Ctx } | void;
 
 /**
- * Authentication configuration for eRPC. At least one of `secret` OR
+ * Authentication configuration for Safe RPC. At least one of `secret` OR
  * asymmetric auth (`sign`/`verify`) MUST be configured.
  *
  * Three modes:
