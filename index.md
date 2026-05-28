@@ -18,7 +18,7 @@
 
 Two peers talking securely. Define your API as typed procedures. Every call is end-to-end encrypted. No TLS, no transport-layer trust. Either peer can serve and call on the same channel.
 
-![Safe RPC](saferpc.png)
+![Safe RPC](banner.png)
 
 ## What it is
 

@@ -12,7 +12,7 @@ Think tRPC, but transport-agnostic and encrypted by default.
 npm install @dotex/saferpc
 ```
 
-![Safe RPC](saferpc.png)
+![Safe RPC](banner.png)
 
 - **Full docs and rationale:** <https://dotex.org/epic/saferpc>
 - [Quickstart](./spec/getting-started.md) · [API](./spec/api.md) · [Wire Protocol](./spec/protocol.md) · [Security](./spec/security.md) · [Transports](./spec/integrations.md)
