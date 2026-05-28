@@ -1,4 +1,4 @@
-# eRPC
+# safeRPC
 
 [![npm](https://img.shields.io/npm/v/@dotex/erpc.svg)](https://www.npmjs.com/package/@dotex/erpc)
 [![license](https://img.shields.io/npm/l/@dotex/erpc.svg)](./LICENSE)
