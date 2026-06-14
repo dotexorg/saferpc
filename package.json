@@ -24,6 +24,7 @@
     "test:typecheck": "tsc -p tsconfig.test.json",
     "sync:jsr": "node scripts/sync-jsr.mjs",
     "prepublishOnly": "npm run lint && npm run test && npm run build",
+    "postpublish": "git push --follow-tags",
     "version": "npm run sync:jsr && git add jsr.json"
   },
   "author": "Dotex (https://dotex.org/about)",
