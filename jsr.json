@@ -16,7 +16,12 @@
     "zod": "jsr:@zod/zod@^4.4.3"
   },
   "publish": {
-    "include": ["src", "jsr.json", "LICENSE", "README.md"]
+    "include": [
+      "src",
+      "jsr.json",
+      "LICENSE",
+      "README.md"
+    ]
   },
   "license": "MIT"
 }
