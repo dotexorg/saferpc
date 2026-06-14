@@ -294,12 +294,15 @@ Direct connection between peers without a central relay.
 
 ### WebRTC DataChannel
 
-Peer-to-peer, no central relay. Usually paired with mutual signature auth because there is no shared infrastructure to put a PSK on.
+Peer-to-peer, no relay. `RTCDataChannel` is ordered and reliable by default. The signalling (offer/answer/ICE) is your problem. Safe RPC starts after the data channel fires `"open"`. And there is no central party to hold a PSK, so peers usually authenticate by signing the handshake transcript with device keys. PSK still works if both sides derive the same secret from a shared room code or account, it just rarely matches how WebRTC apps are wired.
 
 ```typescript
 function webRTCChannel(dc: RTCDataChannel): Channel {
+  dc.binaryType = "arraybuffer";
+
   return {
-    send(data) {
+    async send(data) {
+      if (dc.readyState !== "open") await waitDCOpen(dc);
       dc.send(data);
     },
     receive(cb) {
@@ -311,16 +314,70 @@ function webRTCChannel(dc: RTCDataChannel): Channel {
     },
   };
 }
+
+function waitDCOpen(dc: RTCDataChannel): Promise<void> {
+  return new Promise<void>((resolve, reject) => {
+    if (dc.readyState === "open") return resolve();
+    dc.addEventListener("open", () => resolve(), { once: true });
+    dc.addEventListener("error", () => reject(new Error("data channel error")), { once: true });
+    dc.addEventListener("close", () => reject(new Error("data channel closed")), { once: true });
+  });
+}
 ```
 
+Sends are parked until the channel opens, so the data channel can go straight into `client()` / `server()` — no need to wait for signalling to finish first.
+
+#### Usage
+
+No central party to hold a PSK, so peers authenticate by signing the handshake transcript with their device keys:
+
 ```typescript
-const { api } = client<typeof router>(webRTCChannel(dataChannel), {
-  auth: {
-    sign: async (transcript) => signWithMyDeviceKey(transcript),
-    verify: async (proof, transcript) => verifyPeerKey(proof, transcript),
-  },
+const auth = {
+  sign: (transcript) => myKey.sign(transcript),
+  verify: (proof, transcript) => peerKey.verify(proof, transcript),
+};
+```
+
+One side opens the channel and acts as a client, the other accepts it and acts as a server:
+
+```typescript
+// Initiator
+const dc = pc.createDataChannel("saferpc", { ordered: true });
+const { api } = client<typeof router>(webRTCChannel(dc), { auth });
+
+// Accepter
+pc.addEventListener("datachannel", (e) => {
+  if (e.channel.label !== "saferpc") return;
+  server(router, webRTCChannel(e.channel), { auth, onError: console.error });
 });
 ```
+
+#### Symmetric peer
+
+WebRTC peers are symmetric — nothing says one side is the server. To expose a router *and* call the other side's, open two channels on the same `RTCPeerConnection`: one where you serve, one where you call. They share the underlying DTLS/SCTP transport.
+
+```typescript
+function joinPeer(pc: RTCPeerConnection) {
+  // Serve our router on a channel we open
+  const outbound = pc.createDataChannel("peer", { ordered: true });
+  const serving = server(router, webRTCChannel(outbound), { auth, onError: console.error });
+
+  // Call the peer's router on the channel they open
+  const calling = new Promise<Client<typeof router>>((resolve) => {
+    pc.addEventListener("datachannel", (e) => {
+      if (e.channel.label !== "peer") return;
+      resolve(client<typeof router>(webRTCChannel(e.channel), { auth }).api);
+    });
+  });
+
+  return {
+    api: () => calling,
+    close: () => { serving.destroy(); pc.close(); },
+  };
+}
+```
+
+Both peers run the same code; neither is "the server".
 
 ## Split-channel transports
 
