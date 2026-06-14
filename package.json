@@ -23,9 +23,7 @@
     "test:browser": "vitest run test/e2e/browser.test.ts",
     "test:typecheck": "tsc -p tsconfig.test.json",
     "sync:jsr": "node scripts/sync-jsr.mjs",
-    "prepublishOnly": "npm run lint && npm run test && npm run build",
-    "version": "git add changelog.md changelog/",
-    "postversion": "npm publish && git push --follow-tags"
+    "prepublishOnly": "npm run lint && npm run test && npm run build"
   },
   "author": "Dotex (https://dotex.org/about)",
   "homepage": "https://github.com/dotexorg/saferpc",
