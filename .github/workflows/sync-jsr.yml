@@ -1,0 +1,37 @@
+name: Sync jsr.json
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "package.json"
+      - "scripts/sync-jsr.mjs"
+      - ".github/workflows/sync-jsr.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  sync:
+    name: Sync jsr.json from package.json
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - run: node scripts/sync-jsr.mjs
+
+      - name: Commit changes
+        run: |
+          if [ -z "$(git status --porcelain jsr.json)" ]; then
+            echo "jsr.json is already in sync"
+            exit 0
+          fi
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add jsr.json
+          git commit -m "chore: sync jsr.json from package.json"
+          git push

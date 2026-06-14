@@ -22,6 +22,7 @@
     "test:security": "vitest run test/security",
     "test:browser": "vitest run test/e2e/browser.test.ts",
     "test:typecheck": "tsc -p tsconfig.test.json",
+    "sync:jsr": "node scripts/sync-jsr.mjs",
     "prepublishOnly": "npm run lint && npm run test && npm run build",
     "version": "git add changelog.md changelog/",
     "postversion": "npm publish && git push --follow-tags"
@@ -66,6 +67,11 @@
       "types": "./esm/common.d.ts",
       "import": "./esm/common.js",
       "require": "./cjs/common.js"
+    },
+    "./auth": {
+      "types": "./esm/auth.d.ts",
+      "import": "./esm/auth.js",
+      "require": "./cjs/auth.js"
     },
     "./client": {
       "types": "./esm/client.d.ts",
