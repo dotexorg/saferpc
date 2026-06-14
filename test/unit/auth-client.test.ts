@@ -1,5 +1,5 @@
 /**
- * Unit tests for client-side auth helpers (authClient.ts).
+ * Unit tests for client-side auth helpers (auth/client.ts).
  *
  * These exercise the sign() return shape directly without spinning up a
  * server: each helper must produce a msgpack-encoded payload that decodes

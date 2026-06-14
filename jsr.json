@@ -4,7 +4,9 @@
   "exports": {
     ".": "./src/index.ts",
     "./common": "./src/common.ts",
-    "./auth": "./src/auth.ts",
+    "./auth": "./src/auth/index.ts",
+    "./auth/client": "./src/auth/client.ts",
+    "./auth/server": "./src/auth/server.ts",
     "./client": "./src/client.ts",
     "./server": "./src/server.ts"
   },
@@ -16,7 +18,12 @@
     "zod": "jsr:@zod/zod@^4.4.3"
   },
   "publish": {
-    "include": ["src", "jsr.json", "LICENSE", "README.md"]
+    "include": [
+      "src",
+      "jsr.json",
+      "LICENSE",
+      "README.md"
+    ]
   },
   "license": "MIT"
 }

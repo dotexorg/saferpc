@@ -16,6 +16,11 @@ import {
 import { ... } from "@dotex/saferpc/common";
 import { ... } from "@dotex/saferpc/server";
 import { ... } from "@dotex/saferpc/client";
+
+// Auth helpers: combined or split per side
+import { ... } from "@dotex/saferpc/auth";        // client + server helpers
+import { ... } from "@dotex/saferpc/auth/client"; // client helpers only
+import { ... } from "@dotex/saferpc/auth/server"; // server helpers only
 ```
 
 ---
@@ -327,7 +332,8 @@ import {
   createECDSAClientAuth,
   generateEd25519Keypair,
   generateECDSAKeypair,
-} from "@dotex/saferpc";
+} from "@dotex/saferpc/auth/client";
+// Also re-exported from "@dotex/saferpc" and "@dotex/saferpc/auth".
 ```
 
 | Helper | Returns | Notes |
@@ -347,7 +353,8 @@ import {
   createECDSAServerAuth,
   createCertificateServerAuth,
   createMultifactorServerAuth,
-} from "@dotex/saferpc";
+} from "@dotex/saferpc/auth/server";
+// Also re-exported from "@dotex/saferpc" and "@dotex/saferpc/auth".
 ```
 
 | Helper | Use |

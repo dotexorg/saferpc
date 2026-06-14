@@ -10,7 +10,7 @@
 import { ed25519 } from "@noble/curves/ed25519.js";
 import { sha256 } from "@noble/hashes/sha2.js";
 
-import { mpEncode, RPCError, type AuthOptions } from "./common.ts";
+import { mpEncode, RPCError, type AuthOptions } from "../common.ts";
 
 // ─── JWT bearer (transcript-bound) ──────────────────────────────────
 

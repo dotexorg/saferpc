@@ -115,9 +115,10 @@ src/
   common.ts       : shared types, crypto, msgpack, chain builder
   server.ts       : resilient handshake server
   client.ts       : lazy handshake client with auto-retry
-  auth.ts         : re-exports for auth helpers
-  authClient.ts   : Ed25519, ECDSA, JWT client helpers
-  authServer.ts   : Ed25519, ECDSA, JWT, certificate, multifactor server helpers
+  auth/
+    index.ts      : combined re-exports (deriveSessionSecret + client + server)
+    client.ts     : Ed25519, ECDSA, JWT client helpers
+    server.ts     : Ed25519, ECDSA, JWT, certificate, multifactor server helpers
   index.ts        : public entry point
 ```
 
@@ -127,6 +128,10 @@ import { chain, server, client, RPCError } from "@dotex/saferpc";
 import { server } from "@dotex/saferpc/server";
 import { client } from "@dotex/saferpc/client";
 import { chain, RPCError } from "@dotex/saferpc/common";
+// Auth helpers: combined or split per side
+import { createEd25519ClientAuth, createEd25519ServerAuth } from "@dotex/saferpc/auth";
+import { createEd25519ClientAuth } from "@dotex/saferpc/auth/client";
+import { createEd25519ServerAuth } from "@dotex/saferpc/auth/server";
 ```
 
 ## Compatibility

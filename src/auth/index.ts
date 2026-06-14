@@ -7,7 +7,7 @@
 /**
  * Re-export deriveSessionSecret for convenience
  */
-export { deriveSessionSecret } from "./common.ts";
+export { deriveSessionSecret } from "../common.ts";
 
 // ─── Re-exports for convenience ──────────────────────────────
 
@@ -21,7 +21,7 @@ export {
   type JWTClientConfig,
   type Ed25519ClientConfig,
   type ECDSAClientConfig,
-} from "./authClient.ts";
+} from "./client.ts";
 
 // Server-side auth helpers
 export {
@@ -35,4 +35,4 @@ export {
   type ECDSAServerConfig,
   type CertificateServerConfig,
   type MultifactorServerConfig,
-} from "./authServer.ts";
+} from "./server.ts";

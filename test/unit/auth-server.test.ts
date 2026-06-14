@@ -1,5 +1,5 @@
 /**
- * Unit tests for server-side auth helpers (authServer.ts).
+ * Unit tests for server-side auth helpers (auth/server.ts).
  *
  * Each helper exposes a `verify(proof, transcript)` function. These tests
  * call it directly with crafted payloads to exercise validation paths,

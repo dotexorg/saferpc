@@ -230,7 +230,9 @@ export function deriveSessionSecret(
 
 // ─── Encrypted message helpers ───────────────────────────
 
-export function createEncryptor(sessionKey: Uint8Array) {
+export function createEncryptor(
+  sessionKey: Uint8Array,
+): (data: unknown) => Uint8Array {
   return function encrypt(data: unknown): Uint8Array {
     const nonce = randomBytes(NONCE_LEN);
     const encoded = mpEncode(data);
@@ -244,7 +246,9 @@ export function createEncryptor(sessionKey: Uint8Array) {
   };
 }
 
-export function createDecryptor(sessionKey: Uint8Array) {
+export function createDecryptor(
+  sessionKey: Uint8Array,
+): (payload: Uint8Array) => unknown {
   return function decrypt(payload: Uint8Array): unknown {
     const nonce = payload.slice(1, 1 + NONCE_LEN);
     const ct = payload.slice(1 + NONCE_LEN);

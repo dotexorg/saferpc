@@ -69,9 +69,19 @@
       "require": "./cjs/common.js"
     },
     "./auth": {
-      "types": "./esm/auth.d.ts",
-      "import": "./esm/auth.js",
-      "require": "./cjs/auth.js"
+      "types": "./esm/auth/index.d.ts",
+      "import": "./esm/auth/index.js",
+      "require": "./cjs/auth/index.js"
+    },
+    "./auth/client": {
+      "types": "./esm/auth/client.d.ts",
+      "import": "./esm/auth/client.js",
+      "require": "./cjs/auth/client.js"
+    },
+    "./auth/server": {
+      "types": "./esm/auth/server.d.ts",
+      "import": "./esm/auth/server.js",
+      "require": "./cjs/auth/server.js"
     },
     "./client": {
       "types": "./esm/client.d.ts",

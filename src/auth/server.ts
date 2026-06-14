@@ -18,7 +18,7 @@ import {
   RPCError,
   type AuthOptions,
   type Ctx,
-} from "./common.ts";
+} from "../common.ts";
 
 // ─── Decode helpers ─────────────────────────────────────────────────
 

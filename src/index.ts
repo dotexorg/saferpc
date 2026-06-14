@@ -83,4 +83,4 @@ export {
   type ECDSAServerConfig,
   type CertificateServerConfig,
   type MultifactorServerConfig,
-} from "./auth.ts";
+} from "./auth/index.ts";
