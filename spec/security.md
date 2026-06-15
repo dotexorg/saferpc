@@ -17,6 +17,37 @@ Safe RPC does **not** protect against:
 - **Compromised endpoints.** Once attacker code runs on either side, encryption is moot.
 - **Timing side channels in your handlers.** Safe RPC's own comparisons are constant-time. Your handler code is not, unless you write it that way.
 
+## Why authentication is required
+
+A bare ephemeral X25519 exchange produces a shared key, but says nothing about *who* the key was shared with. An active attacker on the transport can run the exchange separately with each side, hold two different session keys, and sit between the peers rewriting traffic in both directions. Each side sees a clean handshake; neither sees the other. This is the textbook MITM-on-DH attack and the reason `auth` is not optional.
+
+The `auth` callbacks close that gap by binding the ephemeral keys to something the attacker does not have:
+
+- **`secret`** mixes a pre-shared 32-byte value into HKDF as the salt (see [Protocol § Key derivation](protocol.md#key-derivation)). A peer without the secret derives a different `session_key`, and the HMAC proof in the reply fails to verify.
+- **`sign` / `verify`** signs the [hello/reply transcript](#transcript-format) with a long-term key the peer can verify. The transcript covers the epoch and both ephemeral public keys, so a signature captured from one handshake will not validate in another.
+
+Without one of those configured, `client()` / `server()` throws a `TypeError` at construction. There is no anonymous fallback, and a `secret()` callback that returns 32 zero bytes is also rejected at runtime — a typo cannot silently downgrade an intended PSK deployment into asymmetric-only mode.
+
+### Transport encryption is not a substitute
+
+When a transport already provides its own encryption (TLS for WebSocket, DTLS for WebRTC), `auth` is still required. Two reasons:
+
+- **Transport encryption authenticates the transport endpoint, not the application peer.** A correctly terminated TLS connection to `api.example.com` says nothing about which process inside that deployment answers, what tenant it serves, or whether a reverse proxy is doing inspection. `auth` binds the session to a key controlled by the actual peer.
+- **The trust anchor for transport encryption is often outside your control.** For TLS, the public PKI; for WebRTC DTLS, the signalling server. Both can be subverted independently of the cryptographic transport itself.
+
+WebRTC is the clearest case. DTLS runs between the two `RTCPeerConnection` endpoints, but the DTLS certificates are self-signed and their fingerprints are exchanged through the signalling server inside SDP. A malicious or compromised signalling server can substitute fingerprints in both directions, terminating DTLS at itself rather than at the intended peer. The browser still reports an encrypted connection; the operator sees plaintext. Safe RPC's `auth` runs outside the signalling channel: as long as each peer learns the other's public key through a trusted side channel (account system, prior pairing, DID, scanned QR), `verify` rejects any handshake whose signature was not produced by that key, regardless of what the signalling server did with the SDP.
+
+### Why `sign` and `verify` are async
+
+Ed25519 itself is synchronous, but most realistic signature sources are not:
+
+- WebCrypto (`crypto.subtle.sign`) returns a `Promise`.
+- Hardware-backed keys (WebAuthn, Secure Enclave, YubiKey, TPM) are all async.
+- The peer's public key often has to be fetched (database, account API, DID resolver).
+- User-confirmation flows (modal, scanned QR, hardware tap) are async by definition.
+
+When the key is already in memory and the math is synchronous, return `Promise.resolve(sign(t))` and pay nothing for the wrapping. The async signature exists so the harder cases are possible at all, not because every caller must use it.
+
 ## Security properties
 
 | Property | Mechanism |
