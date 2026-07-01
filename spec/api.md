@@ -58,30 +58,37 @@ export const rpc = saferpc<Context>();
 ### `ProcedureBuilder`
 
 ```typescript
-interface ProcedureBuilder<TCtx = {}, TInputIn = unknown, TInput = unknown, TOutputDef = unknown> {
+interface ProcedureBuilder<
+  TBaseCtx = {},    // base context the server must supply (never grows)
+  TCtx = TBaseCtx,  // handler-visible context (grows through .use())
+  TInputIn = unknown,
+  TInput = unknown,
+  TOutputDef = unknown,
+> {
   use<TExtra = {}>(mw: (opts: {
     ctx: TCtx;
     input: TInput;
     next: NextFn;
-  }) => Promise<MiddlewareResult<TExtra>>): ProcedureBuilder<TCtx & TExtra, TInputIn, TInput, TOutputDef>;
+  }) => Promise<MiddlewareResult<TExtra>>): ProcedureBuilder<TBaseCtx, TCtx & TExtra, TInputIn, TInput, TOutputDef>;
 
-  input<S extends ZodType>(schema: S): ProcedureBuilder<TCtx, z.input<S>, z.output<S>, TOutputDef>;
-  output<S extends ZodType>(schema: S): ProcedureBuilder<TCtx, TInputIn, TInput, { handler: z.input<S>; client: z.output<S> }>;
+  input<S extends ZodType>(schema: S): ProcedureBuilder<TBaseCtx, TCtx, z.input<S>, z.output<S>, TOutputDef>;
+  output<S extends ZodType>(schema: S): ProcedureBuilder<TBaseCtx, TCtx, TInputIn, TInput, { handler: z.input<S>; client: z.output<S> }>;
 
-  handler<R>(fn: (opts: { ctx: TCtx; input: TInput }) => Promise<R>): Procedure<TInputIn, ...>;
+  // handler may be sync or async
+  handler<R>(fn: (opts: { ctx: TCtx; input: TInput }) => R | Promise<R>): Procedure<TInputIn, ..., TBaseCtx>;
 }
 ```
 
-Every method is immutable and chainable. `.handler()` terminates the builder and returns a frozen `Procedure`.
+Every method is immutable and chainable. The handler may be **sync or async**. `.handler()` terminates the builder and returns a frozen `Procedure` that records `TBaseCtx` so [`server()`](#serverrouter-channel-options) can demand a matching `context()`.
 
 ### Method semantics
 
 | Method | Effect | Notes |
 |--------|--------|-------|
-| `.use(mw)` | Adds middleware that can extend context | `mw` must return `next()` (call it exactly once). `next(extra)` merges `extra` into ctx — and its type flows into every downstream step. |
+| `.use(mw)` | Adds middleware that can extend context | `mw` may be a plain (non-`async`) function but must **return** `next()` (called exactly once). `next(extra)` merges `extra` into ctx — and its type flows into every downstream step. |
 | `.input(schema)` | Validates & parses input with Zod | Handler receives `z.output<S>`; callers send `z.input<S>`. On failure throws `RPCError("INPUT_VALIDATION", ...)`. |
 | `.output(schema)` | Validates & parses output with Zod | Handler returns `z.input<S>` (pre-transform); callers observe `z.output<S>`. On failure throws `RPCError("OUTPUT_VALIDATION", ...)`. Runs *after* handler. |
-| `.handler(fn)` | Terminates the builder | Returns a frozen `Procedure`. Without `.output()`, the caller-facing output type is inferred from `fn`'s return. |
+| `.handler(fn)` | Terminates the builder | `fn` may be **sync or async**. Returns a frozen `Procedure`. Without `.output()`, the caller-facing output is inferred from `fn`'s (awaited) return. |
 
 `schema` is anything with a `.safeParse()` method (a Zod schema in practice).
 
@@ -91,25 +98,29 @@ Every method is immutable and chainable. `.handler()` terminates the builder and
 function chain(): ProcedureBuilder; // empty, untyped context
 ```
 
-Backward-compatible alias for `saferpc().procedure`. Prefer `saferpc<Ctx>()` so the context type flows into procedures authored in separate files.
+Backward-compatible alias for the base builder — an empty, untyped context. Prefer `saferpc<Ctx>()`, which binds the context type so procedures authored in separate files get a fully-typed `ctx`.
 
 ### `Procedure`
 
 ```typescript
-interface Procedure<TInput = unknown, TOutput = unknown> {
+interface Procedure<TInput = unknown, TOutput = unknown, TContext = {}> {
   readonly _steps: ReadonlyArray<Step>;
   readonly _handler: HandlerFn;
-  readonly $types?: { input: TInput; output: TOutput }; // phantom, never present at runtime
+  // phantom, never present at runtime
+  readonly $types?: { input: TInput; output: TOutput; context: TContext };
 }
 
 type Router = Record<string, Procedure>;
 
 // Extract a procedure's caller-facing types:
-type inferInput<P>  = P extends Procedure<infer I, unknown> ? I : never;
-type inferOutput<P> = P extends Procedure<unknown, infer O> ? O : never;
+type inferInput<P>  = P extends Procedure<infer I, unknown, unknown> ? I : never;
+type inferOutput<P> = P extends Procedure<unknown, infer O, unknown> ? O : never;
+
+// Also exported — RouterContext<T>: the base context a whole router requires
+// (the intersection of its procedures' base contexts). server() uses it.
 ```
 
-Treat `Procedure` as opaque at runtime. `_steps`/`_handler` are exposed only so `server()` can introspect them; `$types` is a compile-time-only carrier that powers end-to-end inference in [`Client<Router>`](#clientt).
+Treat `Procedure` as opaque at runtime. `_steps`/`_handler` are exposed only so `server()` can introspect them; `$types` is a compile-time-only carrier that powers end-to-end inference in [`Client<Router>`](#clientt) (input/output) and the required `context()` in [`server()`](#serverrouter-channel-options) (the base context).
 
 ---
 
@@ -119,23 +130,23 @@ Treat `Procedure` as opaque at runtime. `_steps`/`_handler` are exposed only so 
 function server<T extends Router>(
   router: T,
   channel: Channel,
-  options: ServerOptions,
+  options: ServerOptions<RouterContext<T>>,
 ): { destroy: () => void };
 ```
 
-Subscribes to `channel` and serves the router. Returns synchronously.
+Subscribes to `channel` and serves the router. Returns synchronously. The options type is inferred from the router: if its procedures declare a non-empty base context (the type passed to `saferpc<Ctx>()`), `context` is **mandatory** and must return that type.
 
 ### `ServerOptions`
 
 | Field | Type | Default | Required |
 |-------|------|---------|----------|
 | `auth` | `AuthOptions` | — | ✅ |
-| `context` | `(ctx: { auth?: Ctx }) => Ctx \| Promise<Ctx>` | — | — |
+| `context` | `(ctx: { auth?: Ctx }) => TCtx \| Promise<TCtx>` | — | ✅ when `TCtx` (the router's base context) is non-empty, else — |
 | `handshakeTimeout` | `number` (ms) | `5000` | — |
 | `maxMessageBytes` | `number` | `1_048_576` | — |
 | `onError` | `(err: unknown) => void` | — | — |
 
-`context` runs per request. The `auth` argument carries whatever `auth.verify` returned for the current session. When `context` is omitted, the request context falls back to the verified auth data (or `{}` if none).
+`context` runs per request and must return the router's base context `TCtx`. The `auth` argument carries whatever `auth.verify` returned for the current session. When the base context is empty, `context` is optional and the request context falls back to the verified auth data (or `{}` if none).
 
 `onError` fires on handshake failures and non-fatal internal errors. The server does **not** destroy itself on a failed handshake — it resets and accepts the next hello.
 

@@ -578,6 +578,9 @@ export type Middleware<TCtx, TExtra> = (opts: {
   next: NextFn;
 }) => Promise<MiddlewareResult<TExtra>>;
 
+/** A value or a promise of it — handlers may be sync or async. */
+type MaybePromise<T> = T | Promise<T>;
+
 /** The type a handler must return, given the current output-schema marker. */
 type HandlerOutput<TOutputDef> = TOutputDef extends { handler: infer H }
   ? H
@@ -631,13 +634,14 @@ export interface ProcedureBuilder<
   >;
 
   /**
-   * Terminate the pipeline with a handler and build the procedure. When no
-   * `.output()` schema was set, the caller-facing output is inferred from
-   * the handler's return type. The built procedure records `TBaseCtx` so
-   * `server()` can demand a matching `context()` factory.
+   * Terminate the pipeline with a handler and build the procedure. The
+   * handler may be sync or async. When no `.output()` schema was set, the
+   * caller-facing output is inferred from the handler's (awaited) return
+   * type. The built procedure records `TBaseCtx` so `server()` can demand a
+   * matching `context()` factory.
    */
-  handler<R extends HandlerOutput<TOutputDef>>(
-    fn: (opts: { ctx: TCtx; input: TInput }) => Promise<R>,
+  handler<R extends MaybePromise<HandlerOutput<TOutputDef>>>(
+    fn: (opts: { ctx: TCtx; input: TInput }) => R,
   ): Procedure<TInputIn, ClientOutput<TOutputDef, Awaited<R>>, TBaseCtx>;
 }
 

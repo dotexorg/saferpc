@@ -137,6 +137,26 @@ describe("procedure builder — zod input/output inference", () => {
   });
 });
 
+describe("procedure builder — sync or async handlers", () => {
+  it("accepts a synchronous handler and infers its (awaited) output", () => {
+    const sync = rpc
+      .input(z.object({ x: z.number() }))
+      .handler(({ input }) => ({ doubled: input.x * 2 })); // no async
+    expectTypeOf<inferOutput<typeof sync>>().toEqualTypeOf<{
+      doubled: number;
+    }>();
+    expect(sync._handler).toBeTypeOf("function");
+  });
+
+  it("accepts a sync handler under an output schema (pre-transform)", () => {
+    const sync = rpc
+      .output(z.object({ id: z.coerce.number() }))
+      .handler(() => ({ id: "7" })); // sync + pre-transform string
+    expectTypeOf<inferOutput<typeof sync>>().toEqualTypeOf<{ id: number }>();
+    expect(sync._steps.length).toBe(1);
+  });
+});
+
 describe("Client<Router> — end-to-end inference", () => {
   it("maps each procedure to a typed call", () => {
     type Api = Client<AppRouter>;
@@ -232,6 +252,12 @@ function _typeErrors(): void {
     // @ts-expect-error 42 is not an object context extension
     next(42),
   );
+
+  // a sync handler must still satisfy the output schema
+  rpc
+    .output(z.object({ n: z.number() }))
+    // @ts-expect-error sync handler returns a string, schema wants a number
+    .handler(() => ({ n: "nope" }));
 
   // ctx keys not added by a middleware are not visible
   rpc.handler(async ({ ctx }) => {
