@@ -16,22 +16,29 @@ One file, shared between server and client as a **type**. The client never impor
 
 ```typescript
 // router.ts
-import { chain } from "@dotex/saferpc";
+import { saferpc } from "@dotex/saferpc";
 import { z } from "zod";
 
-const d = chain();
+// Bind the handler context type once. `rpc` IS the procedure builder;
+// `rpc.router` / `rpc.middleware` hang off the same instance.
+export interface Context {
+  user: { id: string } | null;
+}
+export const rpc = saferpc<Context>();
 
-export const router = {
-  greet: d
-    .input(z.object({ name: z.string() }))
-    .output(z.object({ message: z.string() }))
-    .handler(async ({ input }) => ({
-      message: `Hello, ${input.name}!`,
-    })),
-};
+const greet = rpc
+  .input(z.object({ name: z.string() }))
+  .output(z.object({ message: z.string() }))
+  .handler(async ({ ctx, input }) => ({
+    message: `Hello, ${ctx.user?.id ?? input.name}!`,
+  }));
 
-export type AppRouter = typeof router;
+export const appRouter = rpc.router({ greet });
+export type AppRouter = typeof appRouter;
 ```
+
+Because `rpc` carries `Context`, you can move procedures into their own files
+(`import { rpc }` and keep chaining) and `ctx` stays fully typed.
 
 ## Quick start: Node server, browser client over WebSocket
 
@@ -47,7 +54,7 @@ crypto.getRandomValues(new Uint8Array(32)); // run once, store the result
 // server.ts
 import { server, type Channel } from "@dotex/saferpc";
 import { WebSocketServer, type WebSocket } from "ws";
-import { router } from "./router.js";
+import { appRouter } from "./router.js";
 
 const secret = new Uint8Array([/* 32 bytes from your generator */]);
 
@@ -67,8 +74,9 @@ function wsChannel(ws: WebSocket): Channel {
 const wss = new WebSocketServer({ port: 8080 });
 
 wss.on("connection", (ws) => {
-  const { destroy } = server(router, wsChannel(ws), {
+  const { destroy } = server(appRouter, wsChannel(ws), {
     auth: { secret: () => secret },
+    context: () => ({ user: null }),
     onError: console.error,
   });
   ws.on("close", destroy);
@@ -150,35 +158,40 @@ try {
 
 ## Middleware and context
 
-Middleware runs before the handler and extends the context. Chain it with `.use()`:
+Middleware runs before the handler and extends the context. Whatever you
+pass to `next({ ... })` is merged into `ctx` **and its type is inferred** for
+every downstream step. Author reusable middleware with `middleware(...)` or
+inline it with `.use()`:
 
 ```typescript
-import { chain, RPCError } from "@dotex/saferpc";
+import { RPCError } from "@dotex/saferpc";
+import { rpc } from "./router.js";
 import { z } from "zod";
 
-const d = chain();
-
-const authed = d.use(async ({ ctx, next }) => {
-  const user = await getUser(ctx.token);
-  if (!user) throw new RPCError("UNAUTHORIZED", "Bad token");
-  return next({ user }); // merges { user } into ctx
+// Reusable, and typed against the app's Context. Narrows `user` to non-null.
+const authed = rpc.middleware(async ({ ctx, next }) => {
+  if (ctx.user === null) throw new RPCError("UNAUTHORIZED", "Login required");
+  return next({ user: ctx.user }); // downstream ctx.user is now non-null
 });
 
-const router = {
-  getProfile: authed
-    .input(z.object({ id: z.string() }))
-    .handler(async ({ ctx, input }) => db.getProfile(input.id)),
-};
+const getProfile = rpc
+  .use(authed)
+  .input(z.object({ id: z.string() }))
+  .handler(async ({ ctx, input }) => {
+    // ctx.user is { id: string } here — no null check, no cast
+    return db.getProfile(ctx.user.id, input.id);
+  });
+
+export const appRouter = rpc.router({ getProfile });
 ```
 
 The base context comes from the server. The factory runs per request, so the context is always fresh:
 
 ```typescript
-server(router, channel, {
+server(appRouter, channel, {
   auth,
   context: ({ auth: verified }) => ({
-    token: getCurrentToken(),
-    userId: verified?.userId,
+    user: verified ? { id: verified.userId } : null,
   }),
 });
 ```
@@ -264,5 +277,5 @@ The full trade-off breakdown lives in [Security](security.md).
 
 - [Security](security.md): threat model, handshake details, what each auth mode protects against
 - [Integrations](integrations.md): adapters for WebSocket, postMessage, MessagePort, Chrome extensions, BroadcastChannel, WebRTC, TCP, SSE
-- [API](api.md): full reference for `chain()`, `server()`, `client()`, and every option
+- [API](api.md): full reference for `saferpc()`, `server()`, `client()`, and every option
 - [Protocol](protocol.md): wire format and key derivation, enough to port Safe RPC to another language

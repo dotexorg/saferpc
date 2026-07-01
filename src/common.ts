@@ -419,12 +419,49 @@ export type HandlerFn = (opts: {
   input: unknown;
 }) => Promise<unknown>;
 
-export interface Procedure {
+/**
+ * A built procedure. `_steps` and `_handler` are the runtime pipeline;
+ * `$types` is a compile-time-only phantom that carries the input a caller
+ * must send, the output it receives, and the *base context* the server must
+ * supply (the type passed to `saferpc<Ctx>()`, before any middleware
+ * additions). `Client<Router>` reads input/output; `server()` reads the
+ * context to require a matching `context()` factory. `$types` is never
+ * present at runtime — it exists purely to move types across boundaries.
+ */
+export interface Procedure<TInput = unknown, TOutput = unknown, TContext = {}> {
   readonly _steps: ReadonlyArray<Step>;
   readonly _handler: HandlerFn;
+  readonly $types?: { input: TInput; output: TOutput; context: TContext };
 }
 
 export type Router = Record<string, Procedure>;
+
+/** Extract the caller-facing input type of a procedure. */
+export type inferInput<P> =
+  P extends Procedure<infer I, unknown, unknown> ? I : never;
+/** Extract the caller-facing output type of a procedure. */
+export type inferOutput<P> =
+  P extends Procedure<unknown, infer O, unknown> ? O : never;
+
+/** Collapse a union of context types into the intersection every member needs. */
+type UnionToIntersection<U> = (
+  U extends unknown ? (k: U) => void : never
+) extends (k: infer I) => void
+  ? I
+  : never;
+
+/**
+ * The base context a router requires — the intersection of every
+ * procedure's base context. `server()` uses this to demand a matching
+ * `context()` factory (and to make it optional when the context is empty).
+ */
+export type RouterContext<T extends Router> = UnionToIntersection<
+  {
+    [K in keyof T]: T[K] extends Procedure<unknown, unknown, infer C>
+      ? C
+      : never;
+  }[keyof T]
+>;
 
 export interface Channel {
   send(data: Uint8Array): void | Promise<void>;
@@ -493,32 +530,142 @@ export interface AuthOptions {
   ) => VerifyResult | Promise<VerifyResult>;
 }
 
-// ─── Chain builder ────────────────────────────────────────
+// ─── Procedure builder ────────────────────────────────────
+//
+// The builder mirrors tRPC's ergonomics: initialise once with your
+// context type (`saferpc<Ctx>()`), then author procedures anywhere with a
+// fully-typed `ctx`, Zod-inferred `input`, and end-to-end output types.
+//
+// Four type parameters ride along the builder:
+//   TCtx       — the handler context so far (grows through `.use()`)
+//   TInputIn   — what a *caller* must send   (the input schema's INPUT type)
+//   TInput     — what the *handler* receives (the input schema's OUTPUT type)
+//   TOutputDef — output-schema marker, or `unknown` when none was set
+//
+// The input/output split is what lets Zod transforms type-check: with an
+// output schema, the handler returns the schema's INPUT type (pre-parse)
+// while callers observe its OUTPUT type (post-parse).
 
-export interface Chain<TCtx extends Ctx = {}, TIn = unknown, TOut = unknown> {
-  use<E extends Ctx = {}>(
-    fn: (opts: {
-      ctx: TCtx;
-      input: TIn;
-      next: (extra?: E) => Promise<unknown>;
-    }) => Promise<unknown>,
-  ): Chain<TCtx & E, TIn, TOut>;
-
-  input<T extends ZodType>(schema: T): Chain<TCtx, z.output<T>, TOut>;
-  output<T extends ZodType>(schema: T): Chain<TCtx, TIn, z.output<T>>;
-
-  handler(fn: (opts: { ctx: TCtx; input: TIn }) => Promise<TOut>): Procedure;
+/**
+ * Opaque value a middleware must return — obtained only by calling
+ * `next()`. It carries the context extension (`TExtra`) so `.use()` can
+ * thread the added keys into every downstream step and the handler.
+ * Never constructed or inspected at runtime.
+ */
+export interface MiddlewareResult<TExtra> {
+  /** Phantom carrier for the context extension. Not present at runtime. */
+  readonly _ctxOverride: TExtra;
 }
 
-export function chain(steps: Step[] = []): Chain {
+/**
+ * The `next` function handed to a middleware. Call it with no arguments to
+ * continue unchanged, or with an object to merge extra keys into the
+ * context for everything downstream. The object's type is inferred and
+ * threaded through by `.use()`.
+ */
+export interface NextFn {
+  (): Promise<MiddlewareResult<{}>>;
+  <TExtra extends object>(extra: TExtra): Promise<MiddlewareResult<TExtra>>;
+}
+
+/**
+ * A standalone, reusable middleware bound to context `TCtx`, produced by
+ * `saferpc().middleware(...)`. Plugs directly into `procedure.use(...)`.
+ */
+export type Middleware<TCtx, TExtra> = (opts: {
+  ctx: TCtx;
+  input: unknown;
+  next: NextFn;
+}) => Promise<MiddlewareResult<TExtra>>;
+
+/** The type a handler must return, given the current output-schema marker. */
+type HandlerOutput<TOutputDef> = TOutputDef extends { handler: infer H }
+  ? H
+  : unknown;
+/** The type a caller observes, given the output marker (or the fallback). */
+type ClientOutput<TOutputDef, TFallback> = TOutputDef extends {
+  client: infer C;
+}
+  ? C
+  : TFallback;
+
+export interface ProcedureBuilder<
+  TBaseCtx = {},
+  TCtx = TBaseCtx,
+  TInputIn = unknown,
+  TInput = unknown,
+  TOutputDef = unknown,
+> {
+  /**
+   * Add a middleware. Whatever it passes to `next({ ... })` is merged into
+   * the context type for every downstream step — inferred automatically.
+   * The *base* context (`TBaseCtx`, what the server must supply) is
+   * unchanged; only the handler-visible context grows.
+   */
+  use<TExtra = {}>(
+    mw: (opts: {
+      ctx: TCtx;
+      input: TInput;
+      next: NextFn;
+    }) => Promise<MiddlewareResult<TExtra>>,
+  ): ProcedureBuilder<TBaseCtx, TCtx & TExtra, TInputIn, TInput, TOutputDef>;
+
+  /** Validate & parse input. The handler receives the parsed type. */
+  input<S extends ZodType>(
+    schema: S,
+  ): ProcedureBuilder<TBaseCtx, TCtx, z.input<S>, z.output<S>, TOutputDef>;
+
+  /**
+   * Validate & parse output. The handler must return the schema's *input*
+   * type; callers observe its *output* type. This is what makes
+   * `z.coerce`/transforms type-check on the handler side.
+   */
+  output<S extends ZodType>(
+    schema: S,
+  ): ProcedureBuilder<
+    TBaseCtx,
+    TCtx,
+    TInputIn,
+    TInput,
+    { handler: z.input<S>; client: z.output<S> }
+  >;
+
+  /**
+   * Terminate the pipeline with a handler and build the procedure. When no
+   * `.output()` schema was set, the caller-facing output is inferred from
+   * the handler's return type. The built procedure records `TBaseCtx` so
+   * `server()` can demand a matching `context()` factory.
+   */
+  handler<R extends HandlerOutput<TOutputDef>>(
+    fn: (opts: { ctx: TCtx; input: TInput }) => Promise<R>,
+  ): Procedure<TInputIn, ClientOutput<TOutputDef, Awaited<R>>, TBaseCtx>;
+}
+
+/**
+ * Low-level procedure builder with an empty, untyped context.
+ *
+ * @deprecated Prefer `saferpc<Ctx>().procedure`, which binds your context
+ * type so procedures authored in separate files get a fully-typed `ctx`.
+ * Retained as an alias for backward compatibility.
+ */
+export type Chain<
+  TCtx = {},
+  TInput = unknown,
+  _TOutput = unknown,
+> = ProcedureBuilder<TCtx, TCtx, unknown, TInput, unknown>;
+
+// Shared runtime factory for every builder. Types are supplied by the
+// `ProcedureBuilder` interface via the casts below; the runtime shape is
+// identical regardless of the phantom type parameters.
+function buildProcedure(steps: Step[]): ProcedureBuilder {
   return {
-    use(fn: MwFn): Chain {
+    use(fn: MwFn): ProcedureBuilder {
       if (typeof fn !== "function") {
         throw new TypeError("use() requires a function");
       }
-      return chain([...steps, { t: "m", fn }]);
+      return buildProcedure([...steps, { t: "m", fn }]);
     },
-    input(schema: ZodType): Chain {
+    input(schema: ZodType): ProcedureBuilder {
       if (
         schema === null ||
         schema === undefined ||
@@ -526,9 +673,9 @@ export function chain(steps: Step[] = []): Chain {
       ) {
         throw new TypeError("input() requires a Zod schema");
       }
-      return chain([...steps, { t: "i", schema }]);
+      return buildProcedure([...steps, { t: "i", schema }]);
     },
-    output(schema: ZodType): Chain {
+    output(schema: ZodType): ProcedureBuilder {
       if (
         schema === null ||
         schema === undefined ||
@@ -536,7 +683,7 @@ export function chain(steps: Step[] = []): Chain {
       ) {
         throw new TypeError("output() requires a Zod schema");
       }
-      return chain([...steps, { t: "o", schema }]);
+      return buildProcedure([...steps, { t: "o", schema }]);
     },
     handler(fn: HandlerFn): Procedure {
       if (typeof fn !== "function") {
@@ -547,5 +694,84 @@ export function chain(steps: Step[] = []): Chain {
         _handler: fn,
       });
     },
-  } as Chain;
+  } as unknown as ProcedureBuilder;
+}
+
+/**
+ * @deprecated Prefer `saferpc<Ctx>().procedure`. Kept as an alias.
+ *
+ * Start a procedure with an empty, untyped context.
+ */
+export function chain(steps: Step[] = []): ProcedureBuilder {
+  return buildProcedure(steps);
+}
+
+// ─── saferpc() — typed entry point ────────────────────────
+
+/**
+ * The value returned by `saferpc<Ctx>()`. It **is** a procedure builder
+ * bound to context `Ctx` — `rpc.input(...).handler(...)` — and it also
+ * namespaces the two typed helpers `rpc.router` and `rpc.middleware`.
+ * Chained calls (`.use()`, `.input()`, …) return a plain
+ * `ProcedureBuilder`; only the root carries `router`/`middleware`.
+ */
+export interface SafeRPC<TCtx = {}> extends ProcedureBuilder<
+  TCtx,
+  TCtx,
+  unknown,
+  unknown,
+  unknown
+> {
+  /**
+   * Assemble a router. An identity function at runtime; its job is to
+   * preserve each procedure's precise input/output types so
+   * `Client<typeof appRouter>` infers a typed call for every route.
+   * Equivalent to `{ ... } satisfies Router` — use whichever reads better.
+   */
+  router<R extends Router>(routes: R): R;
+
+  /**
+   * Author a reusable middleware bound to `TCtx`. Plugs into `.use(...)`;
+   * its context extension is inferred from what it passes to `next()`.
+   */
+  middleware<TExtra>(mw: Middleware<TCtx, TExtra>): Middleware<TCtx, TExtra>;
+}
+
+/**
+ * Initialise saferpc for an application, binding the handler context type
+ * once (à la tRPC's `initTRPC.context<Ctx>().create()`). The returned value
+ * is itself the procedure builder — no `.procedure` indirection — with
+ * `.router` and `.middleware` alongside.
+ *
+ * ```ts
+ * interface Context { user: User | null; db: Db }
+ * const rpc = saferpc<Context>();       // rpc IS the procedure
+ *
+ * const greet = rpc
+ *   .input(z.object({ name: z.string() }))
+ *   .handler(async ({ ctx, input }) => ...); // ctx: Context, in any file
+ *
+ * const authed = rpc.middleware(async ({ ctx, next }) => next({ ... }));
+ * const appRouter = rpc.router({ greet });
+ * ```
+ */
+export function saferpc<TCtx = {}>(): SafeRPC<TCtx> {
+  const router = function router<R extends Router>(routes: R): R {
+    if (typeof routes !== "object" || routes === null) {
+      throw new TypeError("router() requires an object of procedures");
+    }
+    return routes;
+  };
+  const middleware = function middleware<TExtra>(
+    mw: Middleware<TCtx, TExtra>,
+  ): Middleware<TCtx, TExtra> {
+    if (typeof mw !== "function") {
+      throw new TypeError("middleware() requires a function");
+    }
+    return mw;
+  };
+  return Object.assign(buildProcedure([]), {
+    router,
+    middleware,
+  }) as unknown as SafeRPC<TCtx>;
 }

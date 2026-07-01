@@ -37,6 +37,7 @@ import {
   buildReplyTranscript,
   RPCError,
   type Router,
+  type Procedure,
   type Channel,
   type AuthOptions,
 } from "./common.ts";
@@ -62,8 +63,22 @@ export class RemoteRPCError extends RPCError {
   }
 }
 
+/**
+ * The caller-facing API for a router, inferred end-to-end. Each procedure
+ * becomes a call whose argument is that procedure's input type and whose
+ * result is its output type. A loose `Router` (e.g. `Record<string,
+ * Procedure>`) collapses to `(input: unknown) => Promise<unknown>`, so
+ * untyped usage keeps working; pass a precise router
+ * (`client<typeof appRouter>(...)`) to get real inference.
+ */
 export type Client<T extends Router> = {
-  [K in keyof T & string]: (input: unknown) => Promise<unknown>;
+  [K in keyof T & string]: T[K] extends Procedure<
+    infer TInput,
+    infer TOutput,
+    unknown
+  >
+    ? (input: TInput) => Promise<TOutput>
+    : (input: unknown) => Promise<unknown>;
 };
 
 export interface ClientOptions {

@@ -7,7 +7,7 @@ Reference for every exported symbol. End-to-end walkthrough lives in [Getting St
 ```typescript
 // Root entry: everything
 import {
-  chain, server, client,
+  saferpc, chain, server, client,
   RPCError, RemoteRPCError,
   deriveSessionSecret,
 } from "@dotex/saferpc";
@@ -25,52 +25,91 @@ import { ... } from "@dotex/saferpc/auth/server"; // server helpers only
 
 ---
 
-## `chain()`
+## `saferpc()`
 
 ```typescript
-function chain(): Chain;
-```
+function saferpc<TCtx = {}>(): SafeRPC<TCtx>;
 
-Returns a procedure builder. Every method is immutable and chainable. `.handler()` terminates the chain and returns a frozen `Procedure`.
-
-```typescript
-interface Chain<TCtx = {}, TIn = unknown, TOut = unknown> {
-  use<E>(fn: (opts: {
-    ctx: TCtx;
-    input: TIn;
-    next: (extra?: E) => Promise<unknown>;
-  }) => Promise<unknown>): Chain<TCtx & E, TIn, TOut>;
-
-  input<S extends ZodType>(schema: S): Chain<TCtx, z.output<S>, TOut>;
-  output<S extends ZodType>(schema: S): Chain<TCtx, TIn, z.output<S>>;
-
-  handler(fn: (opts: { ctx: TCtx; input: TIn }) => Promise<TOut>): Procedure;
+// SafeRPC *is* a ProcedureBuilder (bound to TCtx) that also namespaces
+// two typed helpers. The returned value is the procedure itself.
+interface SafeRPC<TCtx = {}> extends ProcedureBuilder<TCtx> {
+  router<R extends Router>(routes: R): R;
+  middleware<TExtra>(mw: Middleware<TCtx, TExtra>): Middleware<TCtx, TExtra>;
 }
 ```
+
+Initialise once, binding the handler context type `TCtx` (mirrors tRPC's
+`initTRPC.context<Ctx>().create()`; the flat, chainable root mirrors oRPC's
+`os`). The returned value is itself the [`ProcedureBuilder`](#procedurebuilder)
+— no `.procedure` indirection — so procedures authored in any file get a
+fully-typed `ctx`.
+
+```typescript
+interface Context { user: { id: string } | null }
+
+// rpc IS the procedure builder; rpc.router / rpc.middleware hang off it.
+export const rpc = saferpc<Context>();
+```
+
+- **`rpc`** — the root [`ProcedureBuilder`](#procedurebuilder) whose handler `ctx` is `TCtx`. `rpc.input(...).handler(...)` builds a procedure; `rpc.use(...)` derives a middleware-bearing builder. Chained calls return a plain `ProcedureBuilder` (no `router`/`middleware`).
+- **`rpc.router(routes)`** — validates and returns the map unchanged, keeping each procedure's precise input/output types so `Client<typeof appRouter>` infers a typed call per route. Equivalent to `{ ... } satisfies Router`.
+- **`rpc.middleware(mw)`** — authors a reusable middleware bound to `TCtx`; its context extension is inferred from what it passes to `next()`. Plugs into `rpc.use(...)`.
+
+### `ProcedureBuilder`
+
+```typescript
+interface ProcedureBuilder<TCtx = {}, TInputIn = unknown, TInput = unknown, TOutputDef = unknown> {
+  use<TExtra = {}>(mw: (opts: {
+    ctx: TCtx;
+    input: TInput;
+    next: NextFn;
+  }) => Promise<MiddlewareResult<TExtra>>): ProcedureBuilder<TCtx & TExtra, TInputIn, TInput, TOutputDef>;
+
+  input<S extends ZodType>(schema: S): ProcedureBuilder<TCtx, z.input<S>, z.output<S>, TOutputDef>;
+  output<S extends ZodType>(schema: S): ProcedureBuilder<TCtx, TInputIn, TInput, { handler: z.input<S>; client: z.output<S> }>;
+
+  handler<R>(fn: (opts: { ctx: TCtx; input: TInput }) => Promise<R>): Procedure<TInputIn, ...>;
+}
+```
+
+Every method is immutable and chainable. `.handler()` terminates the builder and returns a frozen `Procedure`.
 
 ### Method semantics
 
 | Method | Effect | Notes |
 |--------|--------|-------|
-| `.use(fn)` | Adds middleware that can extend context | `fn` must call `next()` exactly once. `next(extra)` merges `extra` into ctx. |
-| `.input(schema)` | Validates incoming input with Zod | On failure throws `RPCError("INPUT_VALIDATION", ...)`. |
-| `.output(schema)` | Validates handler output with Zod | On failure throws `RPCError("OUTPUT_VALIDATION", ...)`. Runs *after* handler. |
-| `.handler(fn)` | Terminates the chain | Returns a frozen `Procedure`. |
+| `.use(mw)` | Adds middleware that can extend context | `mw` must return `next()` (call it exactly once). `next(extra)` merges `extra` into ctx — and its type flows into every downstream step. |
+| `.input(schema)` | Validates & parses input with Zod | Handler receives `z.output<S>`; callers send `z.input<S>`. On failure throws `RPCError("INPUT_VALIDATION", ...)`. |
+| `.output(schema)` | Validates & parses output with Zod | Handler returns `z.input<S>` (pre-transform); callers observe `z.output<S>`. On failure throws `RPCError("OUTPUT_VALIDATION", ...)`. Runs *after* handler. |
+| `.handler(fn)` | Terminates the builder | Returns a frozen `Procedure`. Without `.output()`, the caller-facing output type is inferred from `fn`'s return. |
 
 `schema` is anything with a `.safeParse()` method (a Zod schema in practice).
+
+### `chain()`
+
+```typescript
+function chain(): ProcedureBuilder; // empty, untyped context
+```
+
+Backward-compatible alias for `saferpc().procedure`. Prefer `saferpc<Ctx>()` so the context type flows into procedures authored in separate files.
 
 ### `Procedure`
 
 ```typescript
-interface Procedure {
+interface Procedure<TInput = unknown, TOutput = unknown> {
   readonly _steps: ReadonlyArray<Step>;
   readonly _handler: HandlerFn;
+  readonly $types?: { input: TInput; output: TOutput }; // phantom, never present at runtime
 }
 
 type Router = Record<string, Procedure>;
+
+// Extract a procedure's caller-facing types:
+type inferInput<P>  = P extends Procedure<infer I, unknown> ? I : never;
+type inferOutput<P> = P extends Procedure<unknown, infer O> ? O : never;
 ```
 
-Treat `Procedure` as opaque. The fields are exposed only so `server()` can introspect them.
+Treat `Procedure` as opaque at runtime. `_steps`/`_handler` are exposed only so `server()` can introspect them; `$types` is a compile-time-only carrier that powers end-to-end inference in [`Client<Router>`](#clientt).
 
 ---
 
@@ -170,11 +209,13 @@ Returns synchronously. The handshake stays lazy: it starts on the first `api` ca
 
 ```typescript
 type Client<T extends Router> = {
-  [K in keyof T & string]: (input: unknown) => Promise<unknown>;
+  [K in keyof T & string]: T[K] extends Procedure<infer TInput, infer TOutput>
+    ? (input: TInput) => Promise<TOutput>
+    : (input: unknown) => Promise<unknown>;
 };
 ```
 
-The proxy types check against `T`. Use `typeof router` from the server side as the type argument to get full procedure inference.
+Each procedure maps to a call whose argument and result are inferred from that procedure. Pass `typeof appRouter` as the type argument — `client<typeof appRouter>(...)` — to get full end-to-end inference. A loose `Router` collapses to `(input: unknown) => Promise<unknown>`, so untyped usage keeps working.
 
 ### Client lifecycle
 
@@ -276,30 +317,27 @@ try {
 Middleware extends the context. Signature is `({ ctx, input, next })`, and `next(extra?)` must be called exactly once.
 
 ```typescript
-const d = chain();
-
-const authed = d.use(async ({ ctx, input, next }) => {
-  const user = await getUser(ctx.token);
-  if (!user) throw new RPCError("UNAUTHORIZED", "Bad token");
-  return next({ user }); // merges into ctx
+const authed = rpc.middleware(async ({ ctx, next }) => {
+  if (ctx.user === null) throw new RPCError("UNAUTHORIZED", "Login required");
+  return next({ user: ctx.user }); // merges into ctx; type flows downstream
 });
 
-const router = {
-  getProfile: authed
-    .input(z.object({ id: z.string() }))
-    .handler(async ({ ctx, input }) => db.getProfile(input.id)),
-};
+const getProfile = rpc
+  .use(authed)
+  .input(z.object({ id: z.string() }))
+  .handler(async ({ ctx, input }) => db.getProfile(ctx.user.id, input.id));
 
-server(router, channel, {
+const appRouter = rpc.router({ getProfile });
+
+server(appRouter, channel, {
   auth,
   context: ({ auth: verified }) => ({
-    token: getCurrentToken(),
-    userId: verified?.userId,
+    user: verified ? { id: verified.userId } : null,
   }),
 });
 ```
 
-Calling `next()` twice in the same middleware throws `RPCError("MIDDLEWARE", ...)`. So does passing a non-object `extra`.
+The middleware must **return** `next(...)`. Calling `next()` twice throws `RPCError("MIDDLEWARE", ...)`; so does passing a non-object `extra`.
 
 The `context` factory runs **per request**, after auth verification, and receives `{ auth }` carrying the data returned by `auth.verify` for that session.
 

@@ -30,30 +30,44 @@ npm install @dotex/saferpc
 ## Quick start
 
 ```typescript
-import { chain, server, client } from "@dotex/saferpc";
+import { saferpc, server, client } from "@dotex/saferpc";
 import { z } from "zod";
 
-const d = chain();
+// Initialise once, binding your handler context type (à la tRPC).
+interface Context {
+  user: { id: string } | null;
+}
+const rpc = saferpc<Context>(); // rpc IS the procedure builder
 
-const router = {
-  greet: d
-    .input(z.object({ name: z.string() }))
-    .output(z.object({ message: z.string() }))
-    .handler(async ({ input }) => ({
-      message: `Hello, ${input.name}!`,
-    })),
-};
+// `rpc` carries `Context`, so you can author procedures in any file and
+// `ctx` stays fully typed — no manual casts. `rpc.router` / `rpc.middleware`
+// hang off the same instance.
+const greet = rpc
+  .input(z.object({ name: z.string() }))
+  .output(z.object({ message: z.string() }))
+  .handler(async ({ ctx, input }) => ({
+    message: `Hello, ${ctx.user?.id ?? input.name}!`,
+  }));
+
+const appRouter = rpc.router({ greet });
+export type AppRouter = typeof appRouter;
 
 const secret = crypto.getRandomValues(new Uint8Array(32));
 const auth = { secret: () => secret };
 
-const { destroy: stopServer } = server(router, serverChannel, { auth });
-const { api, destroy: stopClient } = client<typeof router>(clientChannel, { auth });
+const { destroy: stopServer } = server(appRouter, serverChannel, {
+  auth,
+  context: () => ({ user: null }),
+});
+// Pass the router type to `client` for a fully-inferred API.
+const { api, destroy: stopClient } = client<AppRouter>(clientChannel, { auth });
 
-const { message } = await api.greet({ name: "World" });
+const { message } = await api.greet({ name: "World" }); // input & output typed
 ```
 
 `client()` and `server()` are synchronous. No top-level `await`. The handshake runs lazily on the first procedure call. If the session drops, the next call retries once with a fresh handshake.
+
+Because `rpc` carries `Context`, procedures can be authored in any file with a fully-typed `ctx`, and `server()` requires a `context()` that returns the type your procedures expect.
 
 ## Channel: the only transport contract
 
@@ -112,7 +126,7 @@ try {
 
 ```
 src/
-  common.ts       : shared types, crypto, msgpack, chain builder
+  common.ts       : shared types, crypto, msgpack, procedure builder
   server.ts       : resilient handshake server
   client.ts       : lazy handshake client with auto-retry
   auth/
@@ -123,11 +137,11 @@ src/
 ```
 
 ```typescript
-import { chain, server, client, RPCError } from "@dotex/saferpc";
+import { saferpc, server, client, RPCError } from "@dotex/saferpc";
 // Subpaths are also available for tree-shaking:
 import { server } from "@dotex/saferpc/server";
 import { client } from "@dotex/saferpc/client";
-import { chain, RPCError } from "@dotex/saferpc/common";
+import { saferpc, RPCError } from "@dotex/saferpc/common";
 // Auth helpers: combined or split per side
 import { createEd25519ClientAuth, createEd25519ServerAuth } from "@dotex/saferpc/auth";
 import { createEd25519ClientAuth } from "@dotex/saferpc/auth/client";

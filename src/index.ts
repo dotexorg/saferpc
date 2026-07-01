@@ -36,7 +36,8 @@ export {
   EMPTY_SECRET,
   // Error
   RPCError,
-  // Chain builder
+  // Procedure builder + typed entry point
+  saferpc,
   chain,
   // Types
   type Ctx,
@@ -45,10 +46,18 @@ export {
   type HandlerFn,
   type Procedure,
   type Router,
+  type RouterContext,
   type Channel,
+  type ProcedureBuilder,
+  type SafeRPC,
+  type NextFn,
+  type MiddlewareResult,
+  type Middleware,
   type Chain,
   type AuthOptions,
   type VerifyResult,
+  type inferInput,
+  type inferOutput,
 } from "./common.ts";
 
 export {
@@ -57,7 +66,12 @@ export {
   type Client,
   type ClientOptions,
 } from "./client.ts";
-export { server, type ServerOptions } from "./server.ts";
+export {
+  server,
+  type ServerOptions,
+  type ServerOptionsBase,
+  type ContextFactory,
+} from "./server.ts";
 
 // Auth helpers
 export {

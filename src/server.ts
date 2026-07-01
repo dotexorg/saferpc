@@ -36,6 +36,7 @@ import {
   type HandlerFn,
   type Ctx,
   type Router,
+  type RouterContext,
   type Channel,
   type AuthOptions,
 } from "./common.ts";
@@ -44,25 +45,28 @@ const MAX_ID_LEN = 64;
 
 // ─── Server types ─────────────────────────────────────────
 
-export interface ServerOptions {
+/**
+ * Per-request context factory. Runs after auth verification, receiving
+ * `{ auth }` with whatever `auth.verify` returned so the application can
+ * merge it however it wants. MUST NOT hang — there is no server-side
+ * per-request timeout (consistent with tRPC/oRPC); a blocking factory
+ * accumulates hanging closures until the client-side timeout fires.
+ *
+ * Its return type must match the router's base context (the type passed to
+ * `saferpc<Ctx>()`). When that context is empty the factory is optional, and
+ * omitting it uses the verified auth data directly as the request context.
+ */
+export type ContextFactory<TCtx> = (ctx: {
+  auth?: Ctx;
+}) => TCtx | Promise<TCtx>;
+
+/** Options common to every `server()` call, independent of context. */
+export interface ServerOptionsBase {
   /**
    * Authentication configuration. At least one of `secret` OR asymmetric
    * auth (`sign`/`verify`) MUST be configured.
    */
   auth: AuthOptions;
-  /**
-   * Factory called per-request to create context for handlers.
-   * MUST NOT hang — there is no server-side per-request timeout
-   * (consistent with tRPC/oRPC). A blocking context() will accumulate
-   * hanging closures until the client-side timeout fires.
-   *
-   * If `auth.verify` is configured and returns `auth` data,
-   * it is passed to this factory as the optional first argument so the
-   * application can merge it however it wants. The default behaviour
-   * (when `context` is undefined) is to use the auth data directly as
-   * the request context.
-   */
-  context?: (ctx: { auth?: Ctx }) => Ctx | Promise<Ctx>;
   /**
    * Max time (ms) to complete a handshake AFTER a client hello arrives.
    * The server waits indefinitely for a client to connect — this timeout
@@ -79,6 +83,18 @@ export interface ServerOptions {
    */
   onError?: (err: unknown) => void;
 }
+
+/** `context` becomes mandatory exactly when `TCtx` has required members. */
+type ContextOption<TCtx> = {} extends TCtx
+  ? { context?: ContextFactory<TCtx> }
+  : { context: ContextFactory<TCtx> };
+
+/**
+ * Options for `server()`. `TCtx` is the router's base context, inferred from
+ * the router value: if its procedures require a non-empty context, `context`
+ * is **mandatory** here and must return that type.
+ */
+export type ServerOptions<TCtx = Ctx> = ServerOptionsBase & ContextOption<TCtx>;
 
 // ─── Pipeline executor ───────────────────────────────────
 
@@ -191,7 +207,16 @@ function execute(
 export function server<T extends Router>(
   router: T,
   channel: Channel,
-  opts: ServerOptions,
+  opts: ServerOptions<RouterContext<T>>,
+): { destroy: () => void };
+export function server(
+  router: Router,
+  channel: Channel,
+  // Loose implementation signature: a required, interface-typed `context`
+  // (from the strict overload) must remain assignable here, so the factory
+  // is optional and its return is widened. The public overload above keeps
+  // callers honest.
+  opts: ServerOptionsBase & { context?: (ctx: { auth?: Ctx }) => unknown },
 ): { destroy: () => void } {
   if (typeof router !== "object" || router === null) {
     throw new TypeError("server() requires a router object");
@@ -564,7 +589,9 @@ export function server<T extends Router>(
           const ctxArg = authData !== null ? { auth: authData } : {};
           let ctx: Ctx;
           if (opts.context !== undefined) {
-            ctx = await opts.context(ctxArg);
+            // Return type is widened to `unknown` on the loose impl
+            // signature; the application owns the concrete shape.
+            ctx = (await opts.context(ctxArg)) as Ctx;
           } else if ("auth" in ctxArg && ctxArg.auth !== undefined) {
             ctx = Object.assign(Object.create(null), ctxArg.auth);
           } else {
