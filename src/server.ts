@@ -1,9 +1,12 @@
 /**
  * drpc/server — Resilient RPC server
  *
- * LIFECYCLE: Survives handshake failures and re-handshakes. Resets to
- * waiting on timeout, failure, or new hello (even in ready state).
- * Only explicit destroy() is permanent.
+ * LIFECYCLE: Survives handshake failures and re-handshakes. A new hello
+ * opens a handshake ATTEMPT on attempt-local state (D1 deferred reset); the
+ * live session keeps serving and is torn down only when the attempt fully
+ * validates and publishes — so a garbage / unauthenticated hello cannot
+ * displace an established session. Resets to waiting on confirmation timeout
+ * or post-publish send failure. Only explicit destroy() is permanent.
  */
 
 import {
@@ -12,6 +15,7 @@ import {
   TAG_HELLO,
   TAG_MSG,
   KEY_LEN,
+  NONCE_LEN,
   MAX_HELLO_BYTES,
   MAX_MSG_BYTES,
   MAX_AUTH_BYTES,
@@ -42,6 +46,7 @@ import {
 } from "./common.ts";
 
 const MAX_ID_LEN = 64;
+const DEFAULT_REPLAY_WINDOW = 4096;
 
 // ─── Server types ─────────────────────────────────────────
 
@@ -76,6 +81,15 @@ export interface ServerOptionsBase {
    */
   handshakeTimeout?: number;
   maxMessageBytes?: number;
+  /**
+   * Size of the per-session replay window: how many recently-seen AEAD
+   * nonces the server remembers so it can drop duplicate (replayed)
+   * request frames within a single session. FIFO-evicted — a replay older
+   * than the last `replayWindow` accepted messages still executes, so this
+   * narrows the window to N rather than closing it. Cleared on every
+   * re-handshake. `0` disables the defense. Default: 4096.
+   */
+  replayWindow?: number;
   /**
    * Called on handshake failures and non-fatal internal errors.
    * The server does NOT destroy on handshake failure — it resets to
@@ -247,12 +261,28 @@ export function server(
   }
   const maxBytes =
     opts.maxMessageBytes !== undefined ? opts.maxMessageBytes : MAX_MSG_BYTES;
+  const replayWindow =
+    opts.replayWindow !== undefined ? opts.replayWindow : DEFAULT_REPLAY_WINDOW;
+  if (
+    typeof replayWindow !== "number" ||
+    !Number.isInteger(replayWindow) ||
+    replayWindow < 0
+  ) {
+    throw new TypeError("server() replayWindow must be an integer ≥ 0");
+  }
   const onError = opts.onError ?? null;
 
   let state: "waiting" | "pending" | "ready" = "waiting";
+  // Two counters (D1). `epoch` advances only when a NEW session is
+  // PUBLISHED; TAG_MSG responses are guarded by it so a re-handshake drops
+  // stale in-flight replies. `attemptEpoch` advances on every incoming
+  // hello so concurrent handshake attempts self-cancel WITHOUT tearing
+  // down the live session before the new one is proven.
   let epoch = 0;
-  let privateKey = x25519.utils.randomSecretKey();
-  let publicKey = x25519.getPublicKey(privateKey);
+  let attemptEpoch = 0;
+  // Server ephemeral keys are now attempt-local (generated per hello inside
+  // the handshake coroutine) and never held at module scope — a failed
+  // attempt cannot corrupt an established session's state.
   let sessionKey: Uint8Array | null = null;
   let encrypt: ((data: unknown) => Uint8Array) | null = null;
   let decrypt: ((payload: Uint8Array) => unknown) | null = null;
@@ -261,7 +291,48 @@ export function server(
   // never leaks across handshake attempts.
   let authData: Ctx | null = null;
   let destroyed = false;
+  // Confirmation timer for a published-but-unconfirmed (pending) session.
   let hsTimer: ReturnType<typeof setTimeout> | null = null;
+
+  // ── D2: bounded seen-nonce set (in-session replay defense) ────────
+  // Ring buffer of the last `replayWindow` accepted nonce keys + a Set for
+  // O(1) membership. Nonces are inserted ONLY after Poly1305 verifies (see
+  // the TAG_MSG handler), so an attacker who cannot forge ciphertexts
+  // cannot pump the set and force eviction churn. Lifetime is tied to the
+  // session key: cleared on every reset / re-handshake.
+  const seenSet: Set<string> | null = replayWindow > 0 ? new Set() : null;
+  let seenRing: string[] = [];
+  let seenHead = 0;
+
+  function nonceKey(nonce: Uint8Array): string {
+    let s = "";
+    for (let i = 0; i < nonce.length; i++) {
+      s += String.fromCharCode(nonce[i]!);
+    }
+    return s;
+  }
+  function seenHas(key: string): boolean {
+    return seenSet !== null && seenSet.has(key);
+  }
+  function seenAdd(key: string): void {
+    if (seenSet === null || seenSet.has(key)) return;
+    if (seenRing.length >= replayWindow) {
+      const evicted = seenRing[seenHead];
+      seenRing[seenHead] = key;
+      seenHead = (seenHead + 1) % replayWindow;
+      if (evicted !== undefined) seenSet.delete(evicted);
+    } else {
+      seenRing.push(key);
+    }
+    seenSet.add(key);
+  }
+  function seenClear(): void {
+    if (seenSet !== null) {
+      seenSet.clear();
+      seenRing = [];
+      seenHead = 0;
+    }
+  }
 
   function clearHsTimer(): void {
     if (hsTimer !== null) {
@@ -270,7 +341,13 @@ export function server(
     }
   }
 
-  /** Zero current keys, regenerate fresh ephemeral pair, return to waiting. */
+  /**
+   * Tear down the CURRENT session, clear replay state, return to waiting.
+   * Advances `epoch` so any in-flight response from the dead session is
+   * dropped by the guard in the TAG_MSG handler. Called only when an
+   * ESTABLISHED-or-pending session must be abandoned (confirmation
+   * timeout, post-publish send failure) — NOT on an incoming hello (D1).
+   */
   function resetHandshake(): void {
     clearHsTimer();
     epoch++;
@@ -281,10 +358,7 @@ export function server(
     encrypt = null;
     decrypt = null;
     authData = null;
-    zero(privateKey);
-    zero(publicKey);
-    privateKey = x25519.utils.randomSecretKey();
-    publicKey = x25519.getPublicKey(privateKey);
+    seenClear();
     state = "waiting";
   }
 
@@ -292,8 +366,6 @@ export function server(
     if (destroyed) return;
     destroyed = true;
     clearHsTimer();
-    zero(privateKey);
-    zero(publicKey);
     if (sessionKey !== null) {
       zero(sessionKey);
       sessionKey = null;
@@ -301,6 +373,7 @@ export function server(
     encrypt = null;
     decrypt = null;
     authData = null;
+    seenClear();
     if (unsubscribe !== null) {
       unsubscribe();
       unsubscribe = null;
@@ -315,36 +388,27 @@ export function server(
     const data = toPlainBytes(raw);
     const tag = data[0];
 
-    // Every hello — regardless of current state — is a new attempt.
-    // Reset unconditionally so the epoch is bumped even when a previous
-    // attempt is still suspended at an `await`; in-flight stale coroutines
-    // will detect the mismatch via the epoch guard and bail.
+    // D1 (deferred reset): a hello opens a handshake ATTEMPT. The live
+    // session (if any) keeps serving on its own key throughout — it is torn
+    // down and replaced ONLY when this attempt fully validates and publishes
+    // below. A garbage or bad-signature hello therefore cannot displace an
+    // established session. `attemptEpoch` bumps per hello so a newer attempt
+    // cancels this one at its guards without touching the session.
     if (tag === TAG_HELLO) {
       if (data.length > MAX_HELLO_BYTES) return;
 
-      resetHandshake();
-
-      const myEpoch = epoch;
-
-      // Handshake timeout covers hello processing + waiting for
-      // first encrypted message (session confirmation).
-      hsTimer = setTimeout(function onHsTimeout() {
-        if (epoch !== myEpoch || destroyed) return;
-        resetHandshake();
-        if (onError !== null) {
-          onError(new RPCError("HANDSHAKE", "Handshake timeout"));
-        }
-      }, hsTimeout);
+      attemptEpoch++;
+      const myAttempt = attemptEpoch;
 
       (async function handleHello() {
-        // Snapshot ephemeral keys by value. resetHandshake() may zero the
-        // live buffers in place while we await; owning a copy means our
-        // derivation is correct regardless of races.
-        const myPriv = privateKey.slice();
-        const myPub = publicKey.slice();
+        // Attempt-local ephemeral pair — never published to module scope
+        // until the final synchronous publish, so a failed attempt leaves
+        // the established session untouched.
+        const myPriv = x25519.utils.randomSecretKey();
+        const myPub = x25519.getPublicKey(myPriv);
 
         // Local accumulators — only published to module-level state under
-        // the FINAL epoch guard below. Cleaned up in finally on any exit.
+        // the FINAL attempt guard below. Cleaned up in finally on any exit.
         let rawShared: Uint8Array | null = null;
         let localSessionKey: Uint8Array | null = null;
         let localProof: Uint8Array | null = null;
@@ -404,7 +468,7 @@ export function server(
               nonce,
             );
             const verifyResult = await auth.verify(helloAuth, transcript);
-            if (epoch !== myEpoch || destroyed) return;
+            if (attemptEpoch !== myAttempt || destroyed) return;
             if (verifyResult && typeof verifyResult === "object") {
               const a = (verifyResult as { auth?: unknown }).auth;
               if (a !== undefined) {
@@ -428,7 +492,7 @@ export function server(
 
           const secretBytes =
             auth.secret !== undefined ? await auth.secret() : EMPTY_SECRET;
-          if (epoch !== myEpoch || destroyed) return;
+          if (attemptEpoch !== myAttempt || destroyed) return;
 
           if (
             !(secretBytes instanceof Uint8Array) ||
@@ -465,7 +529,7 @@ export function server(
               myPub,
             );
             const signed = await auth.sign(replyTranscript);
-            if (epoch !== myEpoch || destroyed) return;
+            if (attemptEpoch !== myAttempt || destroyed) return;
             if (
               !(signed instanceof Uint8Array) ||
               signed.length === 0 ||
@@ -479,17 +543,38 @@ export function server(
             localServerAuth = signed;
           }
 
-          // FINAL epoch guard. The block below is fully synchronous, so the
-          // module-level publishes (sessionKey, encrypt, decrypt, authData,
-          // state) cannot race against an incoming hello.
-          if (epoch !== myEpoch || destroyed) return;
+          // FINAL publish guard. The block below is fully synchronous: it
+          // atomically swaps the live session for the newly-proven one, so
+          // the publishes cannot race against a newer attempt or a request.
+          if (attemptEpoch !== myAttempt || destroyed) return;
 
+          // Tear down the OLD session and publish the new one. `epoch++`
+          // makes any in-flight response from the old session self-drop at
+          // the TAG_MSG guard; `seenClear()` drops the old replay window
+          // (new key → old nonces are irrelevant and would only waste budget).
+          clearHsTimer();
+          if (sessionKey !== null) zero(sessionKey);
+          epoch++;
+          seenClear();
           sessionKey = localSessionKey;
           localSessionKey = null; // ownership transferred — skip finally zero
           encrypt = createEncryptor(sessionKey);
           decrypt = createDecryptor(sessionKey);
           authData = localAuthData;
           state = "pending";
+
+          // Arm the confirmation timer for the new pending session. Budget
+          // covers waiting for the first valid TAG_MSG that promotes
+          // pending → ready. Keyed on the session epoch so a later publish
+          // (which clears this timer) or reset cancels it cleanly.
+          const sessionEpoch = epoch;
+          hsTimer = setTimeout(function onHsTimeout() {
+            if (epoch !== sessionEpoch || destroyed) return;
+            resetHandshake();
+            if (onError !== null) {
+              onError(new RPCError("HANDSHAKE", "Handshake timeout"));
+            }
+          }, hsTimeout);
 
           const replyMsg: Record<string, unknown> = {
             pub: myPub,
@@ -505,7 +590,7 @@ export function server(
           localProof = null;
 
           await channel.send(reply);
-          if (epoch !== myEpoch || destroyed) return;
+          if (epoch !== sessionEpoch || destroyed) return;
 
           // Timer continues running — waiting for first valid TAG_MSG
           // to transition pending → ready. Total budget = hsTimeout.
@@ -518,8 +603,9 @@ export function server(
           zero(myPub);
         }
       })().catch(function onHsError(err: unknown) {
-        if (epoch !== myEpoch || destroyed) return;
-        resetHandshake();
+        // The attempt failed. Under D1 the live session (if any) was never
+        // touched, so there is nothing to reset — only report the failure.
+        if (attemptEpoch !== myAttempt || destroyed) return;
         if (onError !== null) {
           onError(
             err instanceof RPCError
@@ -534,6 +620,18 @@ export function server(
     if (tag === TAG_MSG && decrypt !== null && encrypt !== null) {
       if (data.length > maxBytes) return;
 
+      // D2: cheap replay reject BEFORE decrypt. The AEAD nonce is the
+      // NONCE_LEN bytes right after the tag. If a frame with this nonce was
+      // already accepted in the current session, it is a duplicate/replay —
+      // drop it silently. The membership record itself is only written AFTER
+      // Poly1305 verifies (below), so unforgeable frames can never pollute
+      // the window.
+      const nKey =
+        data.length >= 1 + NONCE_LEN
+          ? nonceKey(data.subarray(1, 1 + NONCE_LEN))
+          : null;
+      if (nKey !== null && seenHas(nKey)) return;
+
       const reqEpoch = epoch;
 
       (async function handleRequest() {
@@ -543,8 +641,13 @@ export function server(
         try {
           raw = decrypt(data);
         } catch {
-          return; // poly1305 failure → silently drop
+          return; // poly1305 failure → silently drop (nonce NOT recorded)
         }
+
+        // Poly1305 verified — record the nonce now so a later duplicate of
+        // this exact frame is rejected. Synchronous (runs before any await),
+        // so back-to-back duplicates cannot both slip through.
+        if (nKey !== null) seenAdd(nKey);
 
         // First valid decrypt confirms the session.
         // The client proved it has the correct sessionKey (which

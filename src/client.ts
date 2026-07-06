@@ -1,10 +1,12 @@
 /**
- * drpc/client — Lazy RPC client with auto-retry
+ * drpc/client — Lazy RPC client (no auto-retry)
  *
- * LIFECYCLE: Handshake triggers lazily on first RPC call. On session
- * failure (timeout/send error), resets and retries once with a fresh
- * handshake — transparent to the caller. Concurrent calls coordinate
- * via epoch to avoid redundant resets.
+ * LIFECYCLE: Handshake triggers lazily on first RPC call. On a local
+ * failure while `ready` (TIMEOUT or CHANNEL send error) the session is
+ * reset — but the failed call is NOT resent; the error surfaces to the
+ * caller, who alone knows whether the procedure is idempotent. The reset
+ * only ensures the NEXT call lazily re-handshakes. Concurrent calls
+ * coordinate via epoch to avoid redundant resets.
  */
 
 import { randomBytes } from "@noble/ciphers/utils.js";
@@ -118,7 +120,11 @@ export interface ClientOptions {
 export function client<T extends Router>(
   channel: Channel,
   opts: ClientOptions,
-): { api: Client<T>; destroy: () => void } {
+): {
+  api: Client<T>;
+  abortPending: (err?: RPCError) => void;
+  destroy: () => void;
+} {
   if (typeof channel.send !== "function") {
     throw new TypeError("client() channel.send must be a function");
   }
@@ -152,10 +158,11 @@ export function client<T extends Router>(
   // ready:       session key established. RPC calls go through.
   // closed:      destroyed. All calls throw.
   //
-  // RETRY: On handshake failure, state → idle. Next call retries.
-  // AUTO-RESET: On RPC timeout or send error while ready, zeros crypto
-  //   and goes idle. Pending calls keep their timers — they retry
-  //   individually when they time out. Epoch prevents redundant resets.
+  // On handshake failure, state → idle; the next call re-handshakes.
+  // AUTO-RESET: On a TIMEOUT or CHANNEL failure while ready, zeros crypto
+  //   and goes idle WITHOUT resending. Other pending calls keep their
+  //   timers; the next call re-handshakes lazily. Epoch prevents
+  //   redundant resets. Guardrail (CLIENT) errors never reset.
   let state: "idle" | "handshaking" | "ready" | "closed" = "idle";
 
   // Ephemeral keys — regenerated per handshake attempt
@@ -475,7 +482,13 @@ export function client<T extends Router>(
           zero(nonce);
         }
       })().catch(function onReplyError(err: unknown) {
-        if (state === "closed" || epoch !== currentEpoch) return;
+        // Only fail the handshake if we're STILL actively handshaking this
+        // attempt. A reply coroutine that rejects after the attempt already
+        // completed (state "ready") or was reset ("idle") is a stale or
+        // MITM-injected frame carrying the current epoch — drop it silently
+        // instead of tearing down the session a concurrent valid reply just
+        // established. (Client-side analog of the server's D1 deferred reset.)
+        if (state !== "handshaking" || epoch !== currentEpoch) return;
         failHandshake(err);
       });
       return;
@@ -572,7 +585,18 @@ export function client<T extends Router>(
       Promise.resolve(channel.send(encrypted)).catch(function onSendError(err) {
         pending.delete(id);
         clearTimeout(timer);
-        rej(err);
+        // Give the send path a typed failure code. A raw adapter rejection
+        // (bare Error / DOMException) would slip past the caller's documented
+        // `instanceof RPCError` taxonomy; `CHANNEL` means "request provably
+        // never left", the retry predicate's clean trigger. The original
+        // error is preserved on `.cause` for debugging.
+        rej(
+          err instanceof RPCError
+            ? err
+            : new RPCError("CHANNEL", "Channel send failed", undefined, {
+                cause: err,
+              }),
+        );
       });
     });
   }
@@ -601,20 +625,29 @@ export function client<T extends Router>(
         try {
           return await sendRequest(prop, input);
         } catch (err: unknown) {
-          // If session was ready and the call failed (timeout, send error),
-          // the server likely died. Auto-reset and retry ONCE with a fresh
-          // handshake — transparent to the caller.
-          if ((state as any) === "closed") throw err; // @TODO: Invistigae error
-          // Don't retry RemoteRPCError — the server responded, session is fine
-          if (err instanceof RemoteRPCError) throw err;
-
-          // Only reset if still in the same session. If epoch moved on,
-          // another call already reset — just ride the new handshake.
-          if (epoch === sentEpoch) {
+          // No auto-retry. A TIMEOUT leaves the outcome UNKNOWN (the request
+          // may have executed — auto-resending it is a silent double-execution
+          // hazard for non-idempotent handlers); a CHANNEL error means the
+          // request provably never left. Either way the error surfaces and the
+          // CALLER decides whether to retry — it alone knows if the procedure
+          // is idempotent.
+          //
+          // We still reset the session (but do NOT resend) on TIMEOUT/CHANNEL
+          // so the NEXT call lazily re-handshakes: a desynced peer (e.g. a
+          // restarted server that silently drops TAG_MSG over a sync transport)
+          // would otherwise wedge every future call. Guardrail (CLIENT) and
+          // SESSION errors must NOT reset — a healthy session has to survive
+          // local backpressure instead of tearing down its own good key.
+          if (
+            state === "ready" &&
+            epoch === sentEpoch &&
+            err instanceof RPCError &&
+            !(err instanceof RemoteRPCError) &&
+            (err.code === "TIMEOUT" || err.code === "CHANNEL")
+          ) {
             reset();
           }
-          await ensureHandshake();
-          return sendRequest(prop, input);
+          throw err;
         }
       };
     },
@@ -650,6 +683,30 @@ export function client<T extends Router>(
     state = "idle";
   }
 
+  // ── abortPending ───────────────────────────────────────────
+  // Adapter-driven teardown: called from a transport `onclose` event when
+  // no `send` is in progress, so the adapter can hand channel-death to the
+  // client. Rejects every in-flight call (and any hello-waiter) immediately
+  // with a retryable code instead of letting them stack up to their
+  // timeouts, then returns the client to `idle` (NOT `closed`) so the next
+  // call lazily re-handshakes over the revived transport. The caller-visible
+  // client object never changes identity.
+
+  function abortPending(err?: RPCError): void {
+    if (state === "closed") return;
+    const e = err ?? new RPCError("CHANNEL", "Channel down");
+    // Reject all pending RPC calls (clears their timers).
+    rejectPending(e);
+    if (state === "handshaking") {
+      // failHandshake rejects the shared handshake promise (so hello-waiters
+      // don't hang until handshakeTimeout), zeros keys, and goes idle.
+      failHandshake(e);
+    } else {
+      zeroKeys();
+      state = "idle";
+    }
+  }
+
   // ── Destroy ───────────────────────────────────────────────
 
   function destroy(): void {
@@ -671,5 +728,5 @@ export function client<T extends Router>(
     rejectPending(new RPCError("SESSION", "Session destroyed"));
   }
 
-  return { api, destroy };
+  return { api, abortPending, destroy };
 }

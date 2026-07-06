@@ -386,14 +386,19 @@ export class RPCError extends Error {
   public readonly code: string;
   public readonly data: unknown;
 
-  constructor(code: string, message: string, data?: unknown) {
+  constructor(
+    code: string,
+    message: string,
+    data?: unknown,
+    options?: { cause?: unknown },
+  ) {
     if (typeof code !== "string" || code.length === 0) {
       throw new TypeError("RPCError: code must be a non-empty string");
     }
     if (typeof message !== "string") {
       throw new TypeError("RPCError: message must be a string");
     }
-    super(message);
+    super(message, options);
     this.code = code;
     this.data = data !== undefined ? data : null;
   }
