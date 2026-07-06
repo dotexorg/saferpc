@@ -21,7 +21,7 @@ npm install @dotex/saferpc
 
 - **Typed procedures** with Zod input/output validation
 - **End-to-end encryption.** X25519 ECDH, XSalsa20-Poly1305 AEAD, HKDF-SHA-256, with forward secrecy by design
-- **Lazy handshake** on the first call. Transparent auto-retry when the session drops
+- **Lazy handshake** on the first call. Lazy re-handshake on the next call when the session drops — failures surface with a typed code, never silently resent
 - **Three auth modes:** pre-shared secret, asymmetric (Ed25519 / ECDSA / JWT / cert / multifactor), or both for defense-in-depth
 - **Synchronous** `client()` and `server()`. Runs in Node.js, browsers, Service Workers, React Native, Vercel Edge, Cloudflare Workers, Deno Deploy
 - **Tiny surface.** `@noble/*` crypto, `@msgpack/msgpack`, `zod`, and nothing else
@@ -65,7 +65,7 @@ const { api, destroy: stopClient } = client<AppRouter>(clientChannel, { auth });
 const { message } = await api.greet({ name: "World" }); // input & output typed
 ```
 
-`client()` and `server()` are synchronous. No top-level `await`. The handshake runs lazily on the first procedure call. If the session drops, the next call retries once with a fresh handshake.
+`client()` and `server()` are synchronous. No top-level `await`. The handshake runs lazily on the first procedure call. If the session drops, the failed call surfaces a typed error (`TIMEOUT` / `CHANNEL`) and the next call re-handshakes — the client never silently resends (that would double-execute non-idempotent handlers). A transport adapter can call `abortPending()` to fail in-flight calls instantly on channel death and keep the client usable.
 
 Because `rpc` carries `Context`, procedures can be authored in any file with a fully-typed `ctx`, and `server()` requires a `context()` that returns the type your procedures expect.
 
@@ -129,7 +129,7 @@ try {
 src/
   common.ts       : shared types, crypto, msgpack, procedure builder
   server.ts       : resilient handshake server
-  client.ts       : lazy handshake client with auto-retry
+  client.ts       : lazy handshake client (no auto-retry)
   auth/
     index.ts      : combined re-exports (deriveSessionSecret + client + server)
     client.ts     : Ed25519, ECDSA, JWT client helpers

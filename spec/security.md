@@ -59,7 +59,7 @@ When the key is already in memory and the math is synchronous, return `Promise.r
 | Forward secrecy          | Fresh ephemeral X25519 keys per session                                                                                                |
 | Replay across handshakes | Random nonce + epoch counter + transcript-bound signatures                                                                             |
 | Replay across peers      | Domain-separated transcript prefixes                                                                                                   |
-| Replay within a session  | Random 24-byte nonces per message (probabilistic)                                                                                      |
+| Replay within a session  | Random 24-byte nonces + bounded seen-nonce set (server, default 4096)                                                                  |
 | Stale responses          | Epoch counter echoed in reply                                                                                                          |
 | Prototype pollution      | `sanitize()` strips `__proto__`, `constructor`, `prototype`                                                                            |
 | Type confusion           | msgpack extension types disabled (including Timestamp); inbound `bin` fields require exact `Uint8Array` prototype                      |
@@ -315,11 +315,11 @@ The client embeds `{ primary, secondary }`: two pre-encoded sub-payloads.
 
 ## Replay within a session
 
-Safe RPC uses random 24-byte nonces (not counters) for XSalsa20-Poly1305. The collision probability is negligible. But **a captured ciphertext can be replayed by an attacker who can inject into a live channel**. The replayed message will decrypt and execute again.
+Safe RPC uses random 24-byte nonces (not counters) for XSalsa20-Poly1305. The collision probability is negligible. A captured ciphertext could otherwise be replayed by an attacker who can inject into a live channel, and the replayed message would decrypt and execute again.
 
-For non-idempotent operations, add an idempotency key inside the procedure input, or keep a request-ID set on the server keyed by the verified principal.
+As of 0.7.0 the server keeps a **bounded seen-nonce set** per session (`replayWindow`, default 4096): it records the nonce of every frame that passes Poly1305 and silently drops any later frame carrying a nonce it has already seen. This closes the replay window for the last `replayWindow` messages of a session, with no wire change and no ordering requirement (so lossy / reordering transports stay supported). The set is cleared on every re-handshake, and only the server needs it — the client already matches responses to a monotonic request `id` that is never reused.
 
-This is the only known replay window in the protocol. A counter-based scheme would close it, but it would also require strict transport ordering, and several supported transports (BroadcastChannel, lossy WebRTC, multi-path links) cannot promise that.
+The window is **narrowed to N, not closed**: a replay older than the last `replayWindow` accepted messages still executes. For non-idempotent operations on long-lived sessions, still add an idempotency key inside the procedure input, or keep a request-ID set keyed by the verified principal. Set `replayWindow: 0` to disable the defense. Counter-based nonces would close the window fully but require strict transport ordering and directional keys (keystream reuse otherwise on the single shared key); that is deferred to a future protocol version.
 
 ## Recommended configurations
 

@@ -2,12 +2,12 @@
 
 An internal line-by-line review of the implementation against the [Protocol](protocol.md) and [Security](security.md) specs, published as-is. We would rather ship an honest list of residual risks than a clean-looking page. Threat model and configuration guidance live in [Security](security.md); this page is about how well the code holds up against them.
 
-**Reviewed version:** 0.6.1 · **Date:** 2026-07 · **Reviewer:** internal (Dotex), independent of the original author
+**Reviewed version:** 0.7.0 · **Date:** 2026-07 · **Reviewer:** internal (Dotex), independent of the original author
 
 ## Method
 
 - Full read of `src/` (client, server, common, auth helpers) against every normative statement in `spec/protocol.md` and `spec/security.md`.
-- Full test suite run (245 tests, including `test/security/`: handshake attacks, replay, tampering, type confusion, prototype pollution, DoS limits).
+- Full test suite run (262 tests, including `test/security/`: handshake attacks, replay, tampering, type confusion, prototype pollution, DoS limits, deferred reset, replay window).
 - Instrumented probes for behavioral claims that the suite does not pin (execution counts, handshake counts under fault injection).
 
 An internal review is not a third-party audit. It catches spec/code drift and design-level issues; it does not replace external cryptographic review. If you need the latter for a deployment, treat this page as the starting inventory.
@@ -27,25 +27,25 @@ Checked line-by-line against the spec, no findings:
 
 ## Residual risks
 
-Ordered by how much they should influence a deployment decision. "By design" means the trade-off is deliberate and documented; "open" means a fix is planned.
+Ordered by how much they should influence a deployment decision. "By design" means the trade-off is deliberate and documented; "fixed in 0.7.0" means the 0.7.0 release closed it (see the per-risk status).
 
-### 1. Replay within a session — by design, documented
+### 1. Replay within a session — narrowed in 0.7.0, residual by design
 
-Per-message nonces are random, not counter-derived. An attacker who can inject into a live channel can replay a captured ciphertext and the receiver will execute it again. This is the protocol's one known replay window; the mitigation (idempotency keys, a server-side request-ID set) is the application's job. Full discussion in [Security § Replay within a session](security.md#replay-within-a-session).
+Per-message nonces are random, not counter-derived. An attacker who can inject into a live channel can replay a captured ciphertext; without a dedup window the receiver executes it again. Full discussion in [Security § Replay within a session](security.md#replay-within-a-session).
 
-Status: a bounded seen-nonce set on the server is planned — replays within the last N messages of a session will be dropped, narrowing the window to N without any wire change. Replays older than the window remain the application's problem; counter-based nonces (which would close it fully) require directional keys and are deferred to a future protocol version.
+Status: **fixed (narrowed) in 0.7.0.** The server keeps a bounded seen-nonce set (`replayWindow`, default 4096) and silently drops any frame whose nonce it has already accepted in the current session — the nonce is recorded only after Poly1305 verifies, and the set is cleared on re-handshake, with no wire change. Residual by design: a replay older than the last `replayWindow` accepted messages still executes (the window is narrowed to N, not closed), so non-idempotent handlers on very long sessions should still carry idempotency keys. Counter-based nonces (which would close it fully) require directional keys and are deferred to a future protocol version.
 
-### 2. Auto-retry can double-execute — open bug
+### 2. Auto-retry double-execution — fixed in 0.7.0
 
-The client's transparent retry is specified to fire only on `TIMEOUT` or a send error. The implementation retries on **any** local error, including the `CLIENT` backpressure error (`maxPending` exceeded). Consequence, reproduced with an instrumented probe: a single backpressure error on a healthy session tears the session down, forces a re-handshake, and re-executes every in-flight call — callers observe clean success while handlers ran twice. No attacker or network fault is required.
+Before 0.7.0 the client's transparent retry fired on **any** local error, including the `CLIENT` backpressure error, and — more fundamentally — resent a call after a `TIMEOUT` whose outcome is unknown. An instrumented probe reproduced a single backpressure error on a healthy session tearing the session down and re-executing every in-flight call, callers observing clean success while handlers ran twice.
 
-Until the fix lands: treat non-idempotent procedures exactly as you would for risk #1 (idempotency keys), and size `maxPending` so backpressure is not hit in normal operation. Status: fix planned; the retry predicate will match the spec.
+Status: **fixed in 0.7.0.** The auto-retry is removed entirely. A `TIMEOUT` or `CHANNEL` send error resets the session but is **not** resent — the error surfaces with its typed code and the caller decides whether to retry (a `TIMEOUT` is never blind-resent because the request may have executed). Guardrail (`CLIENT`) and `RemoteRPCError` never reset the session. See [Protocol § Failure handling](protocol.md#failure-handling-no-auto-retry).
 
-### 3. Unauthenticated session teardown — fix planned, know your transport
+### 3. Unauthenticated session teardown — fixed in 0.7.0 (with `verify`), residual in PSK-only
 
-Per spec, a server in any state that receives a `TAG_HELLO` resets its session — this is what makes crash recovery coordination-free. The flip side: a single injected garbage hello (≤ 64 KiB, no authentication needed) tears down an established session — today the reset happens **before** the hello is validated, so this holds even when `auth.verify` is configured and rejects the attacker. Each hello also costs the server an ECDH plus an optional `verify` call. Denial of service is explicitly outside the threat model, but the practical exposure depends on the transport: on TLS-protected WebSocket an injector already owns the channel; on `BroadcastChannel` or `postMessage`, **any code in the same origin** can reset sessions in a loop. Do not put Safe RPC on a shared-origin bus you do not fully control.
+Before 0.7.0 a server in any state that received a `TAG_HELLO` reset its session **before** validating the hello, so a single injected garbage hello (≤ 64 KiB, no authentication needed) tore down an established session — even when `auth.verify` was configured and would reject the attacker.
 
-Status: fix planned — the destructive reset will be deferred until the incoming hello fully validates. With `verify` configured, an attacker without a valid signature will no longer be able to displace an established session. In PSK-only mode a well-formed hello still displaces (there is nothing to authenticate at hello time); that residual stays, as does the unauthenticated-compute cost — rate-limit hellos in your channel adapter if your transport is exposed.
+Status: **fixed in 0.7.0 (deferred reset, D1).** A hello now opens a handshake attempt on attempt-local state; the live session keeps serving and is replaced only when the attempt fully validates and publishes. With `verify` configured, an attacker without a valid signature can no longer displace an established session. Residual by design: in PSK-only mode a well-formed hello still displaces (there is nothing to authenticate at hello time), and each hello still costs the server an ECDH plus an optional `verify` — denial of service stays outside the threat model, so rate-limit hellos in your channel adapter on exposed transports (on `BroadcastChannel` / `postMessage`, any same-origin code can still force handshake work). Do not put Safe RPC on a shared-origin bus you do not fully control.
 
 ### 4. No server-side concurrency cap — documented, application concern
 

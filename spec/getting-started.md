@@ -127,7 +127,7 @@ const { message } = await api.greet({ name: "World" });
 console.log(message); // "Hello, World!"
 ```
 
-That is the whole loop. The handshake runs on the first call, every payload is XSalsa20-Poly1305 AEAD over the WS, and the client retries once if the session drops.
+That is the whole loop. The handshake runs on the first call, every payload is XSalsa20-Poly1305 AEAD over the WS, and if the session drops the client re-handshakes on the next call — the failed call surfaces a typed error (it is never silently resent).
 
 ## What just happened
 

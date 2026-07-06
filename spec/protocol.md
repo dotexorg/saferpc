@@ -18,39 +18,39 @@ Non-goals: streaming RPCs in-protocol, multiplexing over a single channel, forma
 
 ## Primitives
 
-| Primitive | Algorithm | Notes |
-|-----------|-----------|-------|
-| Key exchange | X25519 | 32-byte keys |
-| Symmetric encryption | XSalsa20-Poly1305 (AEAD) | 24-byte nonce, 32-byte key, 16-byte tag |
-| Hash | SHA-256 | — |
-| Key derivation | HKDF-Extract+Expand-SHA-256 | RFC 5869 |
-| MAC | HMAC-SHA-256 | RFC 2104 |
-| Serialization | msgpack | All extension types **disabled** (see Sanitization) |
+| Primitive            | Algorithm                   | Notes                                               |
+| -------------------- | --------------------------- | --------------------------------------------------- |
+| Key exchange         | X25519                      | 32-byte keys                                        |
+| Symmetric encryption | XSalsa20-Poly1305 (AEAD)    | 24-byte nonce, 32-byte key, 16-byte tag             |
+| Hash                 | SHA-256                     | —                                                   |
+| Key derivation       | HKDF-Extract+Expand-SHA-256 | RFC 5869                                            |
+| MAC                  | HMAC-SHA-256                | RFC 2104                                            |
+| Serialization        | msgpack                     | All extension types **disabled** (see Sanitization) |
 
 All wire numbers are network-byte-order (big-endian) unless explicitly noted.
 
 ## Constant reference
 
-| Name | Value | Purpose |
-|------|-------|---------|
-| `NONCE_LEN` | 24 | XSalsa20-Poly1305 nonce length (per encrypted message) |
-| `KEY_LEN` | 32 | Symmetric session key length, X25519 key length, **client hello nonce length** |
-| `TAG_HELLO` | `0x00` | First byte of a handshake frame |
-| `TAG_MSG` | `0x01` | First byte of an encrypted RPC frame |
-| `MAX_HELLO_BYTES` | 65,536 | Max size of a handshake frame, **tag byte included** |
-| `MAX_AUTH_BYTES` | 32,768 | Max size of the optional `auth` payload |
-| `MAX_MSG_BYTES` | 1,048,576 | Max size of an encrypted RPC frame (configurable) |
-| `HANDSHAKE_TIMEOUT_MS` | 5,000 | Default timeout for completing the handshake |
-| `RPC_TIMEOUT_MS` | 10,000 | Default per-call timeout (client side) |
-| `MAX_PENDING` | 256 | Default maximum in-flight RPCs per client |
-| `MAX_ID_LEN` | 64 | Max request `id` length accepted by the server |
-| `PROOF_LEN` | 32 | Length of the HMAC proof in the reply |
-| `REPLAY_WINDOW` | 4,096 | Default seen-nonce set capacity (see Replay protection) |
-| `KDF_INFO` | UTF-8 bytes of `"saferpc-v1"` | HKDF info parameter for session key |
-| `PSK_DERIVE_INFO` | UTF-8 bytes of `"saferpc-session-v1"` | HKDF info for `deriveSessionSecret` helper |
-| `TRANSCRIPT_HELLO_MAGIC` | UTF-8 bytes of `"saferpc-hs-hello-v1\0"` (20 bytes) | Domain separation for client transcript |
-| `TRANSCRIPT_REPLY_MAGIC` | UTF-8 bytes of `"saferpc-hs-reply-v1\0"` (20 bytes) | Domain separation for server transcript |
-| `EMPTY_SECRET` | 32 zero bytes | HKDF salt when no secret is configured (asymmetric-only mode) |
+| Name                     | Value                                               | Purpose                                                                        |
+| ------------------------ | --------------------------------------------------- | ------------------------------------------------------------------------------ |
+| `NONCE_LEN`              | 24                                                  | XSalsa20-Poly1305 nonce length (per encrypted message)                         |
+| `KEY_LEN`                | 32                                                  | Symmetric session key length, X25519 key length, **client hello nonce length** |
+| `TAG_HELLO`              | `0x00`                                              | First byte of a handshake frame                                                |
+| `TAG_MSG`                | `0x01`                                              | First byte of an encrypted RPC frame                                           |
+| `MAX_HELLO_BYTES`        | 65,536                                              | Max size of a handshake frame, **tag byte included**                           |
+| `MAX_AUTH_BYTES`         | 32,768                                              | Max size of the optional `auth` payload                                        |
+| `MAX_MSG_BYTES`          | 1,048,576                                           | Max size of an encrypted RPC frame (configurable)                              |
+| `HANDSHAKE_TIMEOUT_MS`   | 5,000                                               | Default timeout for completing the handshake                                   |
+| `RPC_TIMEOUT_MS`         | 10,000                                              | Default per-call timeout (client side)                                         |
+| `MAX_PENDING`            | 256                                                 | Default maximum in-flight RPCs per client                                      |
+| `MAX_ID_LEN`             | 64                                                  | Max request `id` length accepted by the server                                 |
+| `PROOF_LEN`              | 32                                                  | Length of the HMAC proof in the reply                                          |
+| `REPLAY_WINDOW`          | 4,096                                               | Default seen-nonce set capacity (see Replay protection)                        |
+| `KDF_INFO`               | UTF-8 bytes of `"saferpc-v1"`                       | HKDF info parameter for session key                                            |
+| `PSK_DERIVE_INFO`        | UTF-8 bytes of `"saferpc-session-v1"`               | HKDF info for `deriveSessionSecret` helper                                     |
+| `TRANSCRIPT_HELLO_MAGIC` | UTF-8 bytes of `"saferpc-hs-hello-v1\0"` (20 bytes) | Domain separation for client transcript                                        |
+| `TRANSCRIPT_REPLY_MAGIC` | UTF-8 bytes of `"saferpc-hs-reply-v1\0"` (20 bytes) | Domain separation for server transcript                                        |
+| `EMPTY_SECRET`           | 32 zero bytes                                       | HKDF salt when no secret is configured (asymmetric-only mode)                  |
 
 ## Frame format
 
@@ -90,7 +90,7 @@ The payload is a msgpack-encoded map. The frame is sent in both handshake direct
 }
 ```
 
-A frame longer than `MAX_HELLO_BYTES` (tag included) **must** be dropped without state change. A frame that fails msgpack decoding, or decodes to anything other than a map with the required fields, **must** fail the handshake *attempt* it belongs to (and call `onError` if observed by the server). On the server an invalid hello **must not** disturb an established session — see Re-handshake.
+A frame longer than `MAX_HELLO_BYTES` (tag included) **must** be dropped without state change. A frame that fails msgpack decoding, or decodes to anything other than a map with the required fields, **must** fail the handshake _attempt_ it belongs to (and call `onError` if observed by the server). On the server an invalid hello **must not** disturb an established session — see Re-handshake.
 
 ### `TAG_MSG = 0x01`
 
@@ -201,11 +201,11 @@ The client encrypts and sends its first RPC request. On the server, successful A
 
 ### Re-handshake
 
-A server in **any** state that receives a `TAG_HELLO` opens a new handshake *attempt* and processes it — this is how transparent recovery works: a client whose session died sends a fresh hello and gets a fresh session without application-layer coordination.
+A server in **any** state that receives a `TAG_HELLO` opens a new handshake _attempt_ and processes it — this is how transparent recovery works: a client whose session died sends a fresh hello and gets a fresh session without application-layer coordination.
 
 The established session, if one exists, **must survive until the new attempt succeeds** (step 10 above). An invalid hello — malformed, oversized auth, failed `verify`, bad secret — discards only the attempt. This ordering is load-bearing: without it, a single injected garbage hello (no authentication required) tears down a live session, handing any traffic injector a trivial denial-of-service. With it, a deployment with `verify` configured cannot have its sessions displaced by an attacker who cannot produce a valid signature.
 
-Residual (accepted): in secret-only mode nothing in the hello itself is authenticated, so a *well-formed* forged hello still opens an attempt that reaches step 10 and displaces the session. Rate-limit hellos at the transport layer if that matters for your deployment.
+Residual (accepted): in secret-only mode nothing in the hello itself is authenticated, so a _well-formed_ forged hello still opens an attempt that reaches step 10 and displaces the session. Rate-limit hellos at the transport layer if that matters for your deployment.
 
 Each incoming hello **must** invalidate any prior in-flight attempt (bump the attempt counter/epoch before any `await`-equivalent suspension), so stale suspended attempts detect the change and abandon all writes.
 
@@ -281,7 +281,7 @@ message     = sanitize(msgpack_decode(plaintext))
 
 A 24-byte random nonce gives 192 bits of entropy. Collisions are negligible for any realistic message volume. Safe RPC does **not** use a counter. The trade-off: slightly higher nonce size in exchange for stateless encoding and tolerance for out-of-order or duplicated transport delivery.
 
-> **Directionality.** Both directions encrypt under the **same** session key. With random nonces this is safe for confidentiality (no keystream reuse in practice), but it means a captured frame decrypts on *either* side. The only thing preventing a reflected client request from being accepted by that same client is the message-type check (`t: 1` vs `t: 2`, below). That check is therefore **mandatory, security-relevant, and must run before any other processing of the decrypted payload**. A port that treats it as optional shape validation loses reflection protection entirely. (A future protocol revision may introduce directional keys; any such change bumps the version strings.)
+> **Directionality.** Both directions encrypt under the **same** session key. With random nonces this is safe for confidentiality (no keystream reuse in practice), but it means a captured frame decrypts on _either_ side. The only thing preventing a reflected client request from being accepted by that same client is the message-type check (`t: 1` vs `t: 2`, below). That check is therefore **mandatory, security-relevant, and must run before any other processing of the decrypted payload**. A port that treats it as optional shape validation loses reflection protection entirely. (A future protocol revision may introduce directional keys; any such change bumps the version strings.)
 
 ### Replay protection (seen-nonce set)
 
@@ -291,7 +291,7 @@ The **server** (the side that executes requests) keeps a per-session set of the 
 
 1. **Check before decrypt.** On an inbound `TAG_MSG`, if the 24-byte nonce is in the set, drop the frame silently. (Cheap exact-replay rejection, no AEAD work.)
 2. **Insert only after successful Poly1305 verification.** A frame that fails to decrypt must **not** add its nonce to the set. Otherwise an attacker who cannot forge ciphertexts can still flood arbitrary nonces, forcing eviction churn and re-opening the window for entries evicted early.
-3. **Bounded, FIFO eviction.** When the set holds `REPLAY_WINDOW` entries, inserting a new nonce evicts the oldest. The honest consequence: a replay older than the last `REPLAY_WINDOW` accepted messages executes again — the window is *narrowed*, not closed. Non-idempotent procedures still want an application-level idempotency key.
+3. **Bounded, FIFO eviction.** When the set holds `REPLAY_WINDOW` entries, inserting a new nonce evicts the oldest. The honest consequence: a replay older than the last `REPLAY_WINDOW` accepted messages executes again — the window is _narrowed_, not closed. Non-idempotent procedures still want an application-level idempotency key.
 4. **Cleared on re-handshake.** A new session key makes old nonces unreplayable (AEAD fails under the new key); keeping them wastes the budget. The set's lifetime is the session key's lifetime.
 
 The client does not need a seen-nonce set for security: response `id`s are matched against the pending-call table and each `id` is used once, so a replayed response is dropped at the RPC layer. A client-side set is permitted but adds nothing.
@@ -343,11 +343,11 @@ Nuances a port must reproduce:
 
 The error map's fields:
 
-| Field | Meaning |
-|-------|---------|
-| `c` | Error code. Strings like `"INPUT_VALIDATION"`, `"NOT_FOUND"`, `"UNAUTHORIZED"`, or any application-defined string. |
-| `m` | Human-readable message. Untrusted from the receiver's perspective. |
-| `d` | Optional structured data, sanitized before transmission. |
+| Field | Meaning                                                                                                            |
+| ----- | ------------------------------------------------------------------------------------------------------------------ |
+| `c`   | Error code. Strings like `"INPUT_VALIDATION"`, `"NOT_FOUND"`, `"UNAUTHORIZED"`, or any application-defined string. |
+| `m`   | Human-readable message. Untrusted from the receiver's perspective.                                                 |
+| `d`   | Optional structured data, sanitized before transmission.                                                           |
 
 The receiving client must treat every error field as hostile and coerce defensively: if `e` is not a map, surface code `"UNKNOWN"` with an empty message; if `c` is not a non-empty string, use `"UNKNOWN"`; if `m` is not a string, use `""`. Never `String()`-coerce arbitrary values into codes — a stringified `undefined`/object makes a misleading code.
 
@@ -387,29 +387,36 @@ destroy() ⇒ [destroyed], terminal
    │  reply OK + proof OK
    ▼
 [ready]
-   │  call timeout / send error
+   │  call TIMEOUT / CHANNEL send error
    ▼
-[idle]  (auto-reset, retry once on next call)
+[idle]  (auto-reset, NO resend; next call re-handshakes)
 
-destroy() ⇒ [closed], terminal
+destroy()      ⇒ [closed], terminal
+abortPending() ⇒ [idle]   (reject in-flight, client stays usable)
 ```
 
-The client uses an **epoch counter** to coordinate concurrent failure-and-retry. When multiple calls fail at once, only the first one increments the epoch and resets; the rest see the new epoch and join the in-progress handshake.
+The client uses an **epoch counter** to coordinate concurrent failure-and-reset. When multiple calls fail at once, only the first one increments the epoch and resets; the rest see the new epoch and join the in-progress handshake.
 
-## Auto-retry semantics
+## Failure handling (no auto-retry)
 
-When a call fails with a local `TIMEOUT` or send error on a `ready` session — **and only then**:
+As of 0.7.0 the client does **not** auto-retry. When a call fails with a local `TIMEOUT` or `CHANNEL` send error on a `ready` session — **and only then**:
 
-1. If `epoch === sentEpoch` (no other call has already reset), call `reset()`: zero the session key, drop encryptor/decryptor, state ← `idle`.
-2. Call `ensureHandshake()`. If `state === handshaking`, await the existing promise; otherwise start a new handshake.
-3. Once `ready`, resend the original request **once**.
-4. If that also fails, surface the error. No further retries.
+1. If `epoch === sentEpoch` (no other call has already reset), call `reset()`: zero the session key, drop encryptor/decryptor, state ← `idle`. The failed call is **not** resent.
+2. The error surfaces to the caller with its typed code. The caller — the only party that knows whether the procedure is idempotent — decides whether to retry.
 
-Calls that received a `RemoteRPCError` (the server responded with `ok: false`) are **not** retried. The server is alive and gave a real answer.
+**Why no resend.** A `TIMEOUT` does not prove the server did not execute the request, only that no response arrived in time. Resending after a timeout can silently execute a non-idempotent procedure twice — a first-party double-execution mechanism for fund-moving handlers, layered on top of any attacker replay window. A `CHANNEL` send error means the request provably never left, so it is safe for the _caller_ to retry; the library still defers that choice to the caller so both cases follow one predictable rule.
 
-Local guardrail errors **must not** trigger the reset-and-retry path either. The `CLIENT` backpressure error (`maxPending` exceeded), id-counter exhaustion, and any other error that does not indicate a dead session leave the session exactly as it was: resetting a healthy session on a guardrail error tears down the encryption state for every in-flight call, forces them all into timeout-and-retry, and re-executes their handlers — double execution with no attacker involved. The retry trigger set is exactly: local per-call timeout, channel send failure. Nothing else.
+**Why still reset (without resending).** A desynced peer — e.g. a restarted server that silently drops `TAG_MSG` over a synchronous transport where no channel error is ever raised — would otherwise wedge every future call. Reset keeps healing lazy: the failed call fails, the _next_ call re-handshakes. The trade-off: `reset()` nulls `decrypt`, so replies to _other_ concurrent in-flight calls on the same session are dropped and those calls also fail; give slow procedures a longer per-call `timeout` so they do not share a short default.
 
-Note the trade-off this retry makes: a `TIMEOUT` does not prove the server did not execute the request — only that no response arrived in time. Retrying after a timeout can execute a non-idempotent procedure twice. This is a deliberate availability-over-exactness choice; procedures that cannot tolerate it need an idempotency key in their input.
+Calls that received a `RemoteRPCError` (the server responded with `ok: false`) are **not** reset or retried. The server is alive and gave a real answer.
+
+Local guardrail errors **must not** trigger the reset path either. The `CLIENT` backpressure error (`maxPending` exceeded), id-counter exhaustion, and any other error that does not indicate a dead session leave the session exactly as it was: resetting a healthy session on a guardrail error would tear down the encryption state for every in-flight call, force them into timeout, and re-execute their handlers — double execution with no attacker involved. The reset trigger set is exactly: local per-call `TIMEOUT`, `CHANNEL` send failure. Nothing else.
+
+Concurrent failures share one re-handshake via the epoch counter, so there are no reset storms.
+
+### abortPending
+
+A transport adapter that learns the channel died from an event (`ws.onclose`) at a moment when no `send` is in progress calls `abortPending(err?)`. It rejects every in-flight call and any hello-waiter immediately with a retryable code (`err ?? RPCError("CHANNEL", "Channel down")`), fails an in-progress handshake so waiters do not hang until `handshakeTimeout`, zeros the keys, and returns the client to `idle` — **not** `closed`. The client object keeps its identity; the next call lazily re-handshakes over the revived transport. No-op once `closed`.
 
 ## Sanitization
 
@@ -452,22 +459,22 @@ Clients can also configure `verify`. On the client side the return value is unus
 
 ## Failure modes
 
-| Failure | Server response | Client response |
-|---------|----------------|-----------------|
-| Bad frame tag | Drop silently | Drop silently |
-| Frame > max size | Drop silently | Drop silently |
-| msgpack decode error (hello) | Discard attempt, `onError`; session survives | Fail handshake |
-| Sanitization failure (hello) | Discard attempt, `onError`; session survives | Fail handshake |
-| Bad secret / missing secret bytes | Discard attempt (`HANDSHAKE`), `onError` | Fail handshake (`HANDSHAKE`) |
-| `verify` throws | Discard attempt, `onError`; session survives | Fail handshake |
-| `sign` returns invalid payload | Discard attempt | Fail handshake |
-| Proof mismatch (client) | — | Fail handshake |
-| Poly1305 mismatch (post-handshake) | Drop frame silently | Drop frame silently |
-| Replayed `TAG_MSG` nonce (within window) | Drop frame silently | Optional (see Replay protection) |
-| Stale reply (`epoch` mismatch) | — | Drop reply silently |
-| Stale request (after session replaced) | Drop response (epoch guard) | Eventually times out, retries |
-| RPC handler throws non-`RPCError` | Send `{ c: "INTERNAL", m: "Internal error" }` | Surface as `RemoteRPCError` |
-| Local guardrail (`maxPending`, id exhaustion) | — | Reject that call only; session untouched, **no retry** |
+| Failure                                       | Server response                               | Client response                                           |
+| --------------------------------------------- | --------------------------------------------- | --------------------------------------------------------- |
+| Bad frame tag                                 | Drop silently                                 | Drop silently                                             |
+| Frame > max size                              | Drop silently                                 | Drop silently                                             |
+| msgpack decode error (hello)                  | Discard attempt, `onError`; session survives  | Fail handshake                                            |
+| Sanitization failure (hello)                  | Discard attempt, `onError`; session survives  | Fail handshake                                            |
+| Bad secret / missing secret bytes             | Discard attempt (`HANDSHAKE`), `onError`      | Fail handshake (`HANDSHAKE`)                              |
+| `verify` throws                               | Discard attempt, `onError`; session survives  | Fail handshake                                            |
+| `sign` returns invalid payload                | Discard attempt                               | Fail handshake                                            |
+| Proof mismatch (client)                       | —                                             | Fail handshake                                            |
+| Poly1305 mismatch (post-handshake)            | Drop frame silently                           | Drop frame silently                                       |
+| Replayed `TAG_MSG` nonce (within window)      | Drop frame silently                           | Optional (see Replay protection)                          |
+| Stale reply (`epoch` mismatch)                | —                                             | Drop reply silently                                       |
+| Stale request (after session replaced)        | Drop response (epoch guard)                   | Times out; error surfaces, caller decides (no auto-retry) |
+| RPC handler throws non-`RPCError`             | Send `{ c: "INTERNAL", m: "Internal error" }` | Surface as `RemoteRPCError`                               |
+| Local guardrail (`maxPending`, id exhaustion) | —                                             | Reject that call only; session untouched, **no retry**    |
 
 Silent drops are deliberate. Any feedback at the wire level gives an attacker probing material.
 
@@ -499,7 +506,7 @@ A new-language port that ticks every item is conformant:
 - [ ] The X25519 raw shared secret is zeroed in a try/finally so a thrown `psk()` does not leak it.
 - [ ] Ephemeral private keys captured for the duration of an `await` are owned by the in-flight attempt (copied, not aliased), so a concurrent reset that zeroes the live buffer does not corrupt the in-flight derivation.
 - [ ] Server accepts new hellos in any state (including `ready`).
-- [ ] Client auto-retries exactly once per call on `TIMEOUT` / send error; never on `RemoteRPCError`, never on local guardrail errors (`maxPending`, counter exhaustion) — those reject the call and leave the session intact.
+- [ ] Client does **not** auto-retry. On a local `TIMEOUT` / `CHANNEL` send error while `ready` it resets the session (zeros the key, state → `idle`) **without resending**, then surfaces the error; the caller decides whether to retry. It never resets on `RemoteRPCError` or on local guardrail errors (`maxPending`, counter exhaustion) — those reject the call and leave the session intact. `abortPending()` rejects in-flight calls with a retryable code and returns the client to `idle`, not `closed`.
 - [ ] The application's secret buffer is never mutated or zeroed by the protocol; only protocol-owned copies and derived material are zeroed.
 - [ ] Request `id` is validated: non-empty string, ≤ `MAX_ID_LEN`; `p` non-empty string; violations are silent drops.
 - [ ] Absent call input omits the `i` key entirely (never nil).

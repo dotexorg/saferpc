@@ -147,9 +147,12 @@ Subscribes to `channel` and serves the router. Returns synchronously. The option
 | `context`          | `(ctx: { auth?: Ctx }) => TCtx \| Promise<TCtx>` | —           | ✅ when `TCtx` (the router's base context) is non-empty, else — |
 | `handshakeTimeout` | `number` (ms)                                    | `5000`      | —                                                               |
 | `maxMessageBytes`  | `number`                                         | `1_048_576` | —                                                               |
+| `replayWindow`     | `number`                                         | `4096`      | —                                                               |
 | `onError`          | `(err: unknown) => void`                         | —           | —                                                               |
 
 `context` runs per request and must return the router's base context `TCtx`. The `auth` argument carries whatever `auth.verify` returned for the current session. When the base context is empty, `context` is optional and the request context falls back to the verified auth data (or `{}` if none).
+
+`replayWindow` is the number of recently-seen AEAD nonces the server remembers per session so it can drop replayed request frames (in-session replay defense). FIFO-evicted: a replay older than the last `replayWindow` accepted messages executes again, so the window is narrowed to N, not closed. Cleared on every re-handshake. Set `0` to disable.
 
 `onError` fires on handshake failures and non-fatal internal errors. The server does **not** destroy itself on a failed handshake — it resets and accepts the next hello.
 
@@ -200,10 +203,14 @@ waiting → pending → ready
 function client<T extends Router>(
   channel: Channel,
   options: ClientOptions,
-): { api: Client<T>; destroy: () => void };
+): {
+  api: Client<T>;
+  abortPending: (err?: RPCError) => void;
+  destroy: () => void;
+};
 ```
 
-Returns synchronously. The handshake stays lazy: it starts on the first `api` call.
+Returns synchronously. The handshake stays lazy: it starts on the first `api` call. `abortPending(err?)` lets a transport adapter reject all in-flight calls (and any in-progress handshake) with a retryable code and return the client to `idle` without destroying it — see [Failure handling](#failure-handling-no-auto-retry).
 
 ### `ClientOptions`
 
@@ -217,7 +224,7 @@ Returns synchronously. The handshake stays lazy: it starts on the first `api` ca
 
 `maxPending` caps concurrent in-flight calls. Past the cap, calls reject with `RPCError("CLIENT", "Too many pending requests")`.
 
-`timeout` is per call. On timeout the client throws `RPCError("TIMEOUT", "Timed out: <procedure>")` and triggers an auto-retry.
+`timeout` is per call. On timeout the client throws `RPCError("TIMEOUT", "Timed out: <procedure>")` and resets the session (no auto-retry — the error surfaces and the caller decides whether to retry; the next call re-handshakes).
 
 ### `Client<T>`
 
@@ -246,9 +253,11 @@ idle → handshaking → ready
 
 ---
 
-## Auto-retry
+## Failure handling (no auto-retry)
 
-A call that fails on a `ready` session with a local `TIMEOUT` or send error triggers a single retry: the client zeros its session key, returns to `idle`, runs a fresh handshake, and resends the request **exactly once**. `RemoteRPCError` (server returned an error) is **not** retried — the server is alive and answered. Concurrent failures share one re-handshake via an epoch counter, so there are no retry storms. Full state-machine and wire-level semantics in [Protocol § Auto-retry semantics](protocol.md#auto-retry-semantics).
+As of 0.7.0 a call that fails on a `ready` session with a local `TIMEOUT` or `CHANNEL` send error resets the session (zeros the key, returns to `idle`) but is **not** resent — the error surfaces so the caller, the only party that knows whether the procedure is idempotent, decides. Resending after a `TIMEOUT` (outcome unknown) would silently double-execute non-idempotent handlers. `RemoteRPCError` (server answered) and local guardrail errors (`CLIENT`) never reset the session. The reset alone keeps a desynced peer from wedging future calls: the next call re-handshakes lazily. Concurrent failures share one re-handshake via an epoch counter. Full state-machine and wire-level semantics in [Protocol § Failure handling](protocol.md#failure-handling-no-auto-retry).
+
+`abortPending(err?)` is the adapter-driven counterpart: on a transport `onclose` event it rejects every in-flight call and any hello-waiter immediately with `err ?? RPCError("CHANNEL", "Channel down")`, fails an in-progress handshake, zeros the keys, and returns the client to `idle` (not `closed`) so it stays usable.
 
 ## Replay within a session
 
@@ -271,7 +280,7 @@ The only transport contract. `receive` should return an unsubscribe function; re
 - Deliver each call to `cb` once, in any order
 - Allow `send` and `receive` to run concurrently
 
-Dropping, duplicating, or reordering messages is allowed — Safe RPC will time out and retry. Ready-made adapters live in [Integrations](integrations.md).
+Dropping, duplicating, or reordering messages is allowed — Safe RPC will time out and surface a typed error (no auto-retry; the caller decides whether to resend). Ready-made adapters live in [Integrations](integrations.md).
 
 > Within a single session the protocol assumes the `TAG_HELLO` reply arrives before any `TAG_MSG` sent under the resulting session key. Transports that can reorder _across_ the hello/reply boundary (multi-path links, fan-out buses) will hang the handshake until the timeout fires. `TAG_MSG`-to-`TAG_MSG` reordering stays safe: every encrypted frame is independently authenticated and the protocol imposes no ordering on application messages.
 
@@ -294,17 +303,18 @@ class RemoteRPCError extends RPCError {}
 
 ### Standard local error codes
 
-| Code                | Thrown when                                                 |
-| ------------------- | ----------------------------------------------------------- |
-| `TIMEOUT`           | RPC call exceeded `timeout` ms                              |
-| `SESSION`           | `destroy()` called or session closed                        |
-| `CLIENT`            | Client-side guardrail tripped (e.g., `maxPending` exceeded) |
-| `HANDSHAKE`         | Handshake failed or timed out, auth payload malformed       |
-| `INPUT_VALIDATION`  | `.input(schema)` rejected the input                         |
-| `OUTPUT_VALIDATION` | `.output(schema)` rejected the handler output               |
-| `INVALID_DATA`      | Wire-level data rejected by `sanitize()`                    |
-| `INTERNAL`          | Defensive: should not be reachable                          |
-| `MIDDLEWARE`        | Middleware misuse (`next()` called twice, bad `extra` arg)  |
+| Code                | Thrown when                                                                                                           |
+| ------------------- | --------------------------------------------------------------------------------------------------------------------- |
+| `TIMEOUT`           | RPC call exceeded `timeout` ms                                                                                        |
+| `SESSION`           | `destroy()` called or session closed                                                                                  |
+| `CLIENT`            | Client-side guardrail tripped (e.g., `maxPending` exceeded)                                                           |
+| `CHANNEL`           | `channel.send` failed (request provably never left); also the default `abortPending` code. Original error on `.cause` |
+| `HANDSHAKE`         | Handshake failed or timed out, auth payload malformed                                                                 |
+| `INPUT_VALIDATION`  | `.input(schema)` rejected the input                                                                                   |
+| `OUTPUT_VALIDATION` | `.output(schema)` rejected the handler output                                                                         |
+| `INVALID_DATA`      | Wire-level data rejected by `sanitize()`                                                                              |
+| `INTERNAL`          | Defensive: should not be reachable                                                                                    |
+| `MIDDLEWARE`        | Middleware misuse (`next()` called twice, bad `extra` arg)                                                            |
 
 `INPUT_VALIDATION`, `OUTPUT_VALIDATION`, `MIDDLEWARE`, and `NOT_FOUND` are raised **server-side**. The client never validates locally, so these always arrive wrapped as `RemoteRPCError` (the remote branch of the pattern below), never as a bare local `RPCError`. Only `TIMEOUT`, `SESSION`, `CLIENT`, and `HANDSHAKE` are genuinely client-local.
 

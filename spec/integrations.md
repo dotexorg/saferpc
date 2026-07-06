@@ -319,8 +319,16 @@ function waitDCOpen(dc: RTCDataChannel): Promise<void> {
   return new Promise<void>((resolve, reject) => {
     if (dc.readyState === "open") return resolve();
     dc.addEventListener("open", () => resolve(), { once: true });
-    dc.addEventListener("error", () => reject(new Error("data channel error")), { once: true });
-    dc.addEventListener("close", () => reject(new Error("data channel closed")), { once: true });
+    dc.addEventListener(
+      "error",
+      () => reject(new Error("data channel error")),
+      { once: true },
+    );
+    dc.addEventListener(
+      "close",
+      () => reject(new Error("data channel closed")),
+      { once: true },
+    );
   });
 }
 ```
@@ -354,13 +362,16 @@ pc.addEventListener("datachannel", (e) => {
 
 #### Symmetric peer
 
-WebRTC peers are symmetric — nothing says one side is the server. To expose a router *and* call the other side's, open two channels on the same `RTCPeerConnection`: one where you serve, one where you call. They share the underlying DTLS/SCTP transport.
+WebRTC peers are symmetric — nothing says one side is the server. To expose a router _and_ call the other side's, open two channels on the same `RTCPeerConnection`: one where you serve, one where you call. They share the underlying DTLS/SCTP transport.
 
 ```typescript
 function joinPeer(pc: RTCPeerConnection) {
   // Serve our router on a channel we open
   const outbound = pc.createDataChannel("peer", { ordered: true });
-  const serving = server(router, webRTCChannel(outbound), { auth, onError: console.error });
+  const serving = server(router, webRTCChannel(outbound), {
+    auth,
+    onError: console.error,
+  });
 
   // Call the peer's router on the channel they open
   const calling = new Promise<Client<typeof router>>((resolve) => {
@@ -372,7 +383,10 @@ function joinPeer(pc: RTCPeerConnection) {
 
   return {
     api: () => calling,
-    close: () => { serving.destroy(); pc.close(); },
+    close: () => {
+      serving.destroy();
+      pc.close();
+    },
   };
 }
 ```
@@ -425,6 +439,21 @@ The rules are the same as everywhere else:
 
 1. `send` accepts `Uint8Array` and gets it to the other side.
 2. `receive(cb)` calls `cb` with each incoming `Uint8Array`. It returns an unsubscribe function.
-3. The transport is allowed to drop, duplicate, or reorder messages. Safe RPC will time out and retry. It will not behave correctly if your transport silently corrupts bytes. Wrap it in something that fails noisily if you cannot trust it.
+3. The transport is allowed to drop, duplicate, or reorder messages. Safe RPC will time out and surface a typed error (it does not auto-retry — the caller decides whether to resend). It will not behave correctly if your transport silently corrupts bytes. Wrap it in something that fails noisily if you cannot trust it.
 
-That is the whole API surface. Encryption, framing, retry, key management: all on the Safe RPC side. Your adapter does not need to care.
+That is the whole API surface. Encryption, framing, key management: all on the Safe RPC side. Your adapter does not need to care.
+
+### Browser WebSocket: guard `send`, wire `onclose`
+
+`WebSocket.send()` on a **CLOSED** socket silently drops the frame (it only throws while `CONNECTING`). So over the single most common transport the send-error path never fires on its own: every failure degrades into a stacked RPC + handshake timeout (~15s with defaults) surfacing as a misleading `HANDSHAKE "Handshake timeout"`. Two lines fix it:
+
+- In `send`, check `readyState` and throw when the socket is not open, so the client gets an immediate `CHANNEL` error (request provably never left) instead of a slow timeout:
+  ```ts
+  send(data) {
+    if (ws.readyState !== WebSocket.OPEN) throw new Error("socket not open");
+    ws.send(data);
+  }
+  ```
+- Wire the socket's `onclose` to `abortPending()` so calls in flight at the moment the socket dies (when no `send` is running) reject instantly with a retryable `CHANNEL` code and the client returns to `idle`, ready to re-handshake over the next socket — without changing the client object's identity.
+
+Whether `send` should fail fast, wait for a reconnect, or queue is **adapter policy**, not core policy: `send` may return a `Promise`, and the pending RPC's own timeout caps the wait. A self-healing adapter can recreate the socket inside `send` and resolve when flushed; a fail-fast adapter throws immediately. The client core stays dumb.
