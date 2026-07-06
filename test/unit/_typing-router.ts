@@ -32,5 +32,10 @@ export const me = rpc
   .use(authed)
   .handler(async ({ ctx }) => ({ id: ctx.user.id, name: ctx.user.name }));
 
-export const appRouter = rpc.router({ greet, add, parseId, me });
+// Optional input schema: callers may omit the argument entirely.
+export const ping = rpc
+  .input(z.string().optional())
+  .handler(async ({ input }) => ({ pong: input ?? "default" }));
+
+export const appRouter = rpc.router({ greet, add, parseId, me, ping });
 export type AppRouter = typeof appRouter;

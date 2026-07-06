@@ -465,7 +465,7 @@ export type RouterContext<T extends Router> = UnionToIntersection<
 
 export interface Channel {
   send(data: Uint8Array): void | Promise<void>;
-  receive(cb: (data: Uint8Array) => void): () => void;
+  receive(cb: (data: Uint8Array) => void): (() => void) | void;
 }
 
 // ─── Authentication (secret + asymmetric handshake authentication) ─

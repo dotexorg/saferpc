@@ -31,6 +31,7 @@ import {
   add,
   parseId,
   me,
+  ping,
   appRouter,
   type AppRouter,
 } from "./_typing-router.ts";
@@ -166,15 +167,21 @@ describe("Client<Router> — end-to-end inference", () => {
     expectTypeOf<Api["parseId"]>().toEqualTypeOf<
       (input: { raw: string }) => Promise<{ id: number }>
     >();
+    // no `.input()` schema at all → the argument is optional
     expectTypeOf<Api["me"]>().toEqualTypeOf<
-      (input: unknown) => Promise<{ id: string; name: string }>
+      (input?: unknown) => Promise<{ id: string; name: string }>
+    >();
+    // `.input(z.string().optional())` → `undefined` is a valid input, so
+    // the argument is still optional
+    expectTypeOf<Api["ping"]>().toEqualTypeOf<
+      (input?: string | undefined) => Promise<{ pong: string }>
     >();
   });
 
-  it("a loose Router stays callable as (unknown) => Promise<unknown>", () => {
+  it("a loose Router stays callable as (input?: unknown) => Promise<unknown>", () => {
     type Loose = Client<Router>;
     expectTypeOf<Loose[string]>().toEqualTypeOf<
-      (input: unknown) => Promise<unknown>
+      (input?: unknown) => Promise<unknown>
     >();
   });
 
@@ -217,6 +224,16 @@ describe("end-to-end — a typed client over a real handshake", () => {
       const parsed = await api.parseId({ raw: "42" });
       expectTypeOf(parsed).toEqualTypeOf<{ id: number }>();
       expect(parsed).toEqual({ id: 42 });
+
+      // no `.input()` schema → callable with no argument at all
+      const identity = await api.me();
+      expectTypeOf(identity).toEqualTypeOf<{ id: string; name: string }>();
+      expect(identity).toEqual({ id: "u1", name: "Ada" });
+
+      // optional input schema → callable with no argument
+      const pong = await api.ping();
+      expectTypeOf(pong).toEqualTypeOf<{ pong: string }>();
+      expect(pong).toEqual({ pong: "default" });
     } finally {
       destroy();
       srv.destroy();

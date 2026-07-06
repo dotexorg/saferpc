@@ -307,9 +307,7 @@ export function server(
     }
   }
 
-  let unsubscribe: (() => void) | null = channel.receive(function onMessage(
-    raw: Uint8Array,
-  ) {
+  const rawUnsubscribe = channel.receive(function onMessage(raw: Uint8Array) {
     if (destroyed || raw.length === 0) return;
     // Normalize so the inbound buffer is a plain Uint8Array; Node's
     // `Buffer` propagates its subclass through `subarray()` into msgpack
@@ -640,6 +638,7 @@ export function server(
       });
     }
   });
+  let unsubscribe: (() => void) | null = rawUnsubscribe ?? null;
 
   return { destroy };
 }

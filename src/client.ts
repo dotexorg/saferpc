@@ -64,10 +64,23 @@ export class RemoteRPCError extends RPCError {
 }
 
 /**
+ * A procedure's call signature. The input argument is optional when it
+ * isn't actually required to call the procedure — no `.input()` schema was
+ * set (`TInput` is `unknown`) or the schema itself accepts `undefined`
+ * (e.g. `.optional()`/`.default()`, where `undefined` is part of `TInput`).
+ * Otherwise the argument is mandatory.
+ */
+type ClientMethod<TInput, TOutput> = unknown extends TInput
+  ? (input?: TInput) => Promise<TOutput>
+  : undefined extends TInput
+    ? (input?: TInput) => Promise<TOutput>
+    : (input: TInput) => Promise<TOutput>;
+
+/**
  * The caller-facing API for a router, inferred end-to-end. Each procedure
  * becomes a call whose argument is that procedure's input type and whose
  * result is its output type. A loose `Router` (e.g. `Record<string,
- * Procedure>`) collapses to `(input: unknown) => Promise<unknown>`, so
+ * Procedure>`) collapses to `(input?: unknown) => Promise<unknown>`, so
  * untyped usage keeps working; pass a precise router
  * (`client<typeof appRouter>(...)`) to get real inference.
  */
@@ -77,8 +90,8 @@ export type Client<T extends Router> = {
     infer TOutput,
     unknown
   >
-    ? (input: TInput) => Promise<TOutput>
-    : (input: unknown) => Promise<unknown>;
+    ? ClientMethod<TInput, TOutput>
+    : (input?: unknown) => Promise<unknown>;
 };
 
 export interface ClientOptions {
@@ -540,7 +553,13 @@ export function client<T extends Router>(
       );
     }
     const id = String(++counter);
-    const encrypted = enc({ t: 1, id, p: prop, i: input });
+    // Omit `i` entirely for `undefined` input rather than encoding it —
+    // msgpack has no `undefined` primitive and would round-trip it as
+    // `null`, which a `.optional()` (as opposed to `.nullish()`) Zod schema
+    // rejects. A dropped key decodes back to `undefined` on the server.
+    const req: Record<string, unknown> = { t: 1, id, p: prop };
+    if (input !== undefined) req["i"] = input;
+    const encrypted = enc(req);
 
     return new Promise(function rpcExec(res, rej) {
       const timer = setTimeout(function onRpcTimeout() {
@@ -639,7 +658,7 @@ export function client<T extends Router>(
     state = "closed";
     clearHsTimer();
     zeroKeys();
-    unsubscribe();
+    unsubscribe?.();
 
     if (wasHandshaking && handshakeReject !== null) {
       const rej = handshakeReject;
