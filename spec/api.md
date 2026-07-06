@@ -45,7 +45,9 @@ Initialise once, binding the handler context type `TCtx` (mirrors tRPC's
 fully-typed `ctx`.
 
 ```typescript
-interface Context { user: { id: string } | null }
+interface Context {
+  user: { id: string } | null;
+}
 
 // rpc IS the procedure builder; rpc.router / rpc.middleware hang off it.
 export const rpc = saferpc<Context>();
@@ -83,12 +85,12 @@ Every method is immutable and chainable. The handler may be **sync or async**. `
 
 ### Method semantics
 
-| Method | Effect | Notes |
-|--------|--------|-------|
-| `.use(mw)` | Adds middleware that can extend context | `mw` may be a plain (non-`async`) function but must **return** `next()` (called exactly once). `next(extra)` merges `extra` into ctx — and its type flows into every downstream step. |
-| `.input(schema)` | Validates & parses input with Zod | Handler receives `z.output<S>`; callers send `z.input<S>`. On failure throws `RPCError("INPUT_VALIDATION", ...)`. |
-| `.output(schema)` | Validates & parses output with Zod | Handler returns `z.input<S>` (pre-transform); callers observe `z.output<S>`. On failure throws `RPCError("OUTPUT_VALIDATION", ...)`. Runs *after* handler. |
-| `.handler(fn)` | Terminates the builder | `fn` may be **sync or async**. Returns a frozen `Procedure`. Without `.output()`, the caller-facing output is inferred from `fn`'s (awaited) return. |
+| Method            | Effect                                  | Notes                                                                                                                                                                                 |
+| ----------------- | --------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `.use(mw)`        | Adds middleware that can extend context | `mw` may be a plain (non-`async`) function but must **return** `next()` (called exactly once). `next(extra)` merges `extra` into ctx — and its type flows into every downstream step. |
+| `.input(schema)`  | Validates & parses input with Zod       | Handler receives `z.output<S>`; callers send `z.input<S>`. On failure throws `RPCError("INPUT_VALIDATION", ...)`.                                                                     |
+| `.output(schema)` | Validates & parses output with Zod      | Handler returns `z.input<S>` (pre-transform); callers observe `z.output<S>`. On failure throws `RPCError("OUTPUT_VALIDATION", ...)`. Runs _after_ handler.                            |
+| `.handler(fn)`    | Terminates the builder                  | `fn` may be **sync or async**. Returns a frozen `Procedure`. Without `.output()`, the caller-facing output is inferred from `fn`'s (awaited) return.                                  |
 
 `schema` is anything with a `.safeParse()` method (a Zod schema in practice).
 
@@ -113,8 +115,9 @@ interface Procedure<TInput = unknown, TOutput = unknown, TContext = {}> {
 type Router = Record<string, Procedure>;
 
 // Extract a procedure's caller-facing types:
-type inferInput<P>  = P extends Procedure<infer I, unknown, unknown> ? I : never;
-type inferOutput<P> = P extends Procedure<unknown, infer O, unknown> ? O : never;
+type inferInput<P> = P extends Procedure<infer I, unknown, unknown> ? I : never;
+type inferOutput<P> =
+  P extends Procedure<unknown, infer O, unknown> ? O : never;
 
 // Also exported — RouterContext<T>: the base context a whole router requires
 // (the intersection of its procedures' base contexts). server() uses it.
@@ -138,13 +141,13 @@ Subscribes to `channel` and serves the router. Returns synchronously. The option
 
 ### `ServerOptions`
 
-| Field | Type | Default | Required |
-|-------|------|---------|----------|
-| `auth` | `AuthOptions` | — | ✅ |
-| `context` | `(ctx: { auth?: Ctx }) => TCtx \| Promise<TCtx>` | — | ✅ when `TCtx` (the router's base context) is non-empty, else — |
-| `handshakeTimeout` | `number` (ms) | `5000` | — |
-| `maxMessageBytes` | `number` | `1_048_576` | — |
-| `onError` | `(err: unknown) => void` | — | — |
+| Field              | Type                                             | Default     | Required                                                        |
+| ------------------ | ------------------------------------------------ | ----------- | --------------------------------------------------------------- |
+| `auth`             | `AuthOptions`                                    | —           | ✅                                                              |
+| `context`          | `(ctx: { auth?: Ctx }) => TCtx \| Promise<TCtx>` | —           | ✅ when `TCtx` (the router's base context) is non-empty, else — |
+| `handshakeTimeout` | `number` (ms)                                    | `5000`      | —                                                               |
+| `maxMessageBytes`  | `number`                                         | `1_048_576` | —                                                               |
+| `onError`          | `(err: unknown) => void`                         | —           | —                                                               |
 
 `context` runs per request and must return the router's base context `TCtx`. The `auth` argument carries whatever `auth.verify` returned for the current session. When the base context is empty, `context` is optional and the request context falls back to the verified auth data (or `{}` if none).
 
@@ -167,11 +170,11 @@ type VerifyResult = { auth?: Ctx } | void;
 
 Set at least one of `secret` or asymmetric (`sign` / `verify`). Configuring neither throws a `TypeError` at construction.
 
-| Field | Called | Notes |
-|-------|--------|-------|
-| `secret` | Per handshake attempt | Returned bytes must be ≥ 32. Empty secret used when `secret` is omitted but asymmetric auth is configured. |
-| `sign` | Per handshake attempt, if set | Signature payload, ≤ 32 KiB. |
-| `verify` | Per handshake attempt, if set | Throw to reject. Returned `auth` is bound to the resulting session. |
+| Field    | Called                        | Notes                                                                                                      |
+| -------- | ----------------------------- | ---------------------------------------------------------------------------------------------------------- |
+| `secret` | Per handshake attempt         | Returned bytes must be ≥ 32. Empty secret used when `secret` is omitted but asymmetric auth is configured. |
+| `sign`   | Per handshake attempt, if set | Signature payload, ≤ 32 KiB.                                                                               |
+| `verify` | Per handshake attempt, if set | Throw to reject. Returned `auth` is bound to the resulting session.                                        |
 
 Returned `auth` data is sanitized (poison keys stripped) before reaching `context`.
 
@@ -204,13 +207,13 @@ Returns synchronously. The handshake stays lazy: it starts on the first `api` ca
 
 ### `ClientOptions`
 
-| Field | Type | Default | Required |
-|-------|------|---------|----------|
-| `auth` | `AuthOptions` | — | ✅ |
-| `timeout` | `number` (ms) | `10_000` | — |
-| `maxPending` | `number` | `256` | — |
-| `handshakeTimeout` | `number` (ms) | `5000` | — |
-| `maxMessageBytes` | `number` | `1_048_576` | — |
+| Field              | Type          | Default     | Required |
+| ------------------ | ------------- | ----------- | -------- |
+| `auth`             | `AuthOptions` | —           | ✅       |
+| `timeout`          | `number` (ms) | `10_000`    | —        |
+| `maxPending`       | `number`      | `256`       | —        |
+| `handshakeTimeout` | `number` (ms) | `5000`      | —        |
+| `maxMessageBytes`  | `number`      | `1_048_576` | —        |
 
 `maxPending` caps concurrent in-flight calls. Past the cap, calls reject with `RPCError("CLIENT", "Too many pending requests")`.
 
@@ -262,7 +265,7 @@ interface Channel {
 }
 ```
 
-The only transport contract. `receive` returns an unsubscribe function. The channel must:
+The only transport contract. `receive` should return an unsubscribe function; returning `void` is tolerated but then `destroy()` cannot detach the listener (a leak on long-lived channels — prefer returning the unsubscribe). The channel must:
 
 - Transmit bytes intact (no silent corruption)
 - Deliver each call to `cb` once, in any order
@@ -270,7 +273,7 @@ The only transport contract. `receive` returns an unsubscribe function. The chan
 
 Dropping, duplicating, or reordering messages is allowed — Safe RPC will time out and retry. Ready-made adapters live in [Integrations](integrations.md).
 
-> Within a single session the protocol assumes the `TAG_HELLO` reply arrives before any `TAG_MSG` sent under the resulting session key. Transports that can reorder *across* the hello/reply boundary (multi-path links, fan-out buses) will hang the handshake until the timeout fires. `TAG_MSG`-to-`TAG_MSG` reordering stays safe: every encrypted frame is independently authenticated and the protocol imposes no ordering on application messages.
+> Within a single session the protocol assumes the `TAG_HELLO` reply arrives before any `TAG_MSG` sent under the resulting session key. Transports that can reorder _across_ the hello/reply boundary (multi-path links, fan-out buses) will hang the handshake until the timeout fires. `TAG_MSG`-to-`TAG_MSG` reordering stays safe: every encrypted frame is independently authenticated and the protocol imposes no ordering on application messages.
 
 ---
 
@@ -291,17 +294,19 @@ class RemoteRPCError extends RPCError {}
 
 ### Standard local error codes
 
-| Code | Thrown when |
-|------|-------------|
-| `TIMEOUT` | RPC call exceeded `timeout` ms |
-| `SESSION` | `destroy()` called or session closed |
-| `CLIENT` | Client-side guardrail tripped (e.g., `maxPending` exceeded) |
-| `HANDSHAKE` | Handshake failed or timed out, auth payload malformed |
-| `INPUT_VALIDATION` | `.input(schema)` rejected the input |
-| `OUTPUT_VALIDATION` | `.output(schema)` rejected the handler output |
-| `INVALID_DATA` | Wire-level data rejected by `sanitize()` |
-| `INTERNAL` | Defensive: should not be reachable |
-| `MIDDLEWARE` | Middleware misuse (`next()` called twice, bad `extra` arg) |
+| Code                | Thrown when                                                 |
+| ------------------- | ----------------------------------------------------------- |
+| `TIMEOUT`           | RPC call exceeded `timeout` ms                              |
+| `SESSION`           | `destroy()` called or session closed                        |
+| `CLIENT`            | Client-side guardrail tripped (e.g., `maxPending` exceeded) |
+| `HANDSHAKE`         | Handshake failed or timed out, auth payload malformed       |
+| `INPUT_VALIDATION`  | `.input(schema)` rejected the input                         |
+| `OUTPUT_VALIDATION` | `.output(schema)` rejected the handler output               |
+| `INVALID_DATA`      | Wire-level data rejected by `sanitize()`                    |
+| `INTERNAL`          | Defensive: should not be reachable                          |
+| `MIDDLEWARE`        | Middleware misuse (`next()` called twice, bad `extra` arg)  |
+
+`INPUT_VALIDATION`, `OUTPUT_VALIDATION`, `MIDDLEWARE`, and `NOT_FOUND` are raised **server-side**. The client never validates locally, so these always arrive wrapped as `RemoteRPCError` (the remote branch of the pattern below), never as a bare local `RPCError`. Only `TIMEOUT`, `SESSION`, `CLIENT`, and `HANDSHAKE` are genuinely client-local.
 
 Handlers may throw `RPCError(...)` with any code; those codes surface as `RemoteRPCError.code` on the client.
 
@@ -385,13 +390,13 @@ import {
 // Also re-exported from "@dotex/saferpc" and "@dotex/saferpc/auth".
 ```
 
-| Helper | Returns | Notes |
-|--------|---------|-------|
-| `createJWTClientAuth({ getToken })` | `{ sign }` | Embeds `{ jwt, ts, th }` where `th` is `SHA-256(transcript)`. |
-| `createEd25519ClientAuth({ privateKey, deviceId })` | `{ sign }` | Signs the transcript via `@noble/curves` (no WebCrypto needed). |
-| `createECDSAClientAuth({ privateKey, identifier })` | `{ sign }` | WebCrypto P-256, `privateKey` is a `CryptoKey`. |
-| `generateEd25519Keypair()` | `{ privateKey: Uint8Array, publicKey: Uint8Array }` | Pure JS, works everywhere. |
-| `generateECDSAKeypair()` | `{ privateKey: CryptoKey, publicKey: CryptoKey }` | Non-extractable. |
+| Helper                                              | Returns                                             | Notes                                                           |
+| --------------------------------------------------- | --------------------------------------------------- | --------------------------------------------------------------- |
+| `createJWTClientAuth({ getToken })`                 | `{ sign }`                                          | Embeds `{ jwt, ts, th }` where `th` is `SHA-256(transcript)`.   |
+| `createEd25519ClientAuth({ privateKey, deviceId })` | `{ sign }`                                          | Signs the transcript via `@noble/curves` (no WebCrypto needed). |
+| `createECDSAClientAuth({ privateKey, identifier })` | `{ sign }`                                          | WebCrypto P-256, `privateKey` is a `CryptoKey`.                 |
+| `generateEd25519Keypair()`                          | `{ privateKey: Uint8Array, publicKey: Uint8Array }` | Pure JS, works everywhere.                                      |
+| `generateECDSAKeypair()`                            | `{ privateKey: CryptoKey, publicKey: CryptoKey }`   | Non-extractable.                                                |
 
 ### Server-side
 
@@ -406,13 +411,13 @@ import {
 // Also re-exported from "@dotex/saferpc" and "@dotex/saferpc/auth".
 ```
 
-| Helper | Use |
-|--------|-----|
-| `createJWTServerAuth({ verifyToken, maxAge? })` | Verifies JWT + timestamp (symmetric skew check) + transcript digest. Returns the `verifyToken` result as `auth`. |
-| `createEd25519ServerAuth({ getPublicKey, validateDevice? })` | Verifies Ed25519 signature against a device's 32-byte public key. |
-| `createECDSAServerAuth({ getPublicKey, validateEntity? })` | Verifies ECDSA P-256 signature via WebCrypto. |
-| `createCertificateServerAuth({ verifyCertificate, validateSubject? })` | Verifies a presented certificate chain + ECDSA P-256 signature. |
-| `createMultifactorServerAuth({ primary, secondary, combineAuth? })` | Composes two verifiers; both must pass. |
+| Helper                                                                 | Use                                                                                                              |
+| ---------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------- |
+| `createJWTServerAuth({ verifyToken, maxAge? })`                        | Verifies JWT + timestamp (symmetric skew check) + transcript digest. Returns the `verifyToken` result as `auth`. |
+| `createEd25519ServerAuth({ getPublicKey, validateDevice? })`           | Verifies Ed25519 signature against a device's 32-byte public key.                                                |
+| `createECDSAServerAuth({ getPublicKey, validateEntity? })`             | Verifies ECDSA P-256 signature via WebCrypto.                                                                    |
+| `createCertificateServerAuth({ verifyCertificate, validateSubject? })` | Verifies a presented certificate chain + ECDSA P-256 signature.                                                  |
+| `createMultifactorServerAuth({ primary, secondary, combineAuth? })`    | Composes two verifiers; both must pass.                                                                          |
 
 Auth payloads decode through the hardened msgpack codec: extension types rejected, prototype-pollution keys stripped, recursion depth capped. Returned `auth` data is sanitized before reaching `context`.
 
@@ -422,19 +427,19 @@ Auth payloads decode through the hardened msgpack codec: extension types rejecte
 
 ```typescript
 import {
-  NONCE_LEN,        // 24: XSalsa20-Poly1305 message nonce
-  KEY_LEN,          // 32: symmetric key / X25519 key / hello nonce
-  TAG_HELLO,        // 0x00
-  TAG_MSG,          // 0x01
-  MAX_MSG_BYTES,    // 1_048_576
-  MAX_HELLO_BYTES,  // 65_536
-  MAX_AUTH_BYTES,   // 32_768
-  MAX_DEPTH,        // 32: max `sanitize()` recursion depth
-  HANDSHAKE_TIMEOUT,// 5000
-  EMPTY_SECRET,     // Uint8Array(32) of zeros: internal "no secret" sentinel
+  NONCE_LEN, // 24: XSalsa20-Poly1305 message nonce
+  KEY_LEN, // 32: symmetric key / X25519 key / hello nonce
+  TAG_HELLO, // 0x00
+  TAG_MSG, // 0x01
+  MAX_MSG_BYTES, // 1_048_576
+  MAX_HELLO_BYTES, // 65_536
+  MAX_AUTH_BYTES, // 32_768
+  MAX_DEPTH, // 32: max `sanitize()` recursion depth
+  HANDSHAKE_TIMEOUT, // 5000
+  EMPTY_SECRET, // Uint8Array(32) of zeros: internal "no secret" sentinel
   // Type guards
-  isPlainBytes,     // exact-prototype Uint8Array check for wire data
-  isEmptySecret,    // constant-time check for the 32-zero secret sentinel
+  isPlainBytes, // exact-prototype Uint8Array check for wire data
+  isEmptySecret, // constant-time check for the 32-zero secret sentinel
 } from "@dotex/saferpc";
 ```
 
@@ -448,7 +453,9 @@ Call `destroy()` when you are done with a session.
 
 ```typescript
 const { destroy: destroyServer } = server(router, channel, { auth });
-const { api, destroy: destroyClient } = client<typeof router>(channel, { auth });
+const { api, destroy: destroyClient } = client<typeof router>(channel, {
+  auth,
+});
 
 // later
 destroyClient(); // rejects pending calls, zeros keys, unsubscribes

@@ -115,7 +115,8 @@ try {
   if (err instanceof RemoteRPCError) {
     // The remote peer threw. err.code / err.message / err.data come from there.
   } else if (err instanceof RPCError) {
-    // Local failure: TIMEOUT, SESSION, HANDSHAKE, INPUT_VALIDATION, ...
+    // Local failure: TIMEOUT, SESSION, HANDSHAKE, CLIENT, ...
+    // (validation errors like INPUT_VALIDATION run server-side and arrive as RemoteRPCError)
   } else {
     throw err;
   }
@@ -143,7 +144,10 @@ import { server } from "@dotex/saferpc/server";
 import { client } from "@dotex/saferpc/client";
 import { saferpc, RPCError } from "@dotex/saferpc/common";
 // Auth helpers: combined or split per side
-import { createEd25519ClientAuth, createEd25519ServerAuth } from "@dotex/saferpc/auth";
+import {
+  createEd25519ClientAuth,
+  createEd25519ServerAuth,
+} from "@dotex/saferpc/auth";
 import { createEd25519ClientAuth } from "@dotex/saferpc/auth/client";
 import { createEd25519ServerAuth } from "@dotex/saferpc/auth/server";
 ```

@@ -8,7 +8,7 @@ Install, define a router, configure auth, attach a channel, call functions.
 npm install @dotex/saferpc
 ```
 
-The only peer dependency is `zod` (or any library exposing `.safeParse()`).
+`zod` ships as a bundled dependency (along with `@noble/*` and `@msgpack/msgpack`) — nothing else to install. Schema objects passed to `.input()`/`.output()` only need a `.safeParse()` method, so any zod-compatible library works there, but the `zod` dependency ships regardless.
 
 ## Define a router
 
@@ -56,7 +56,9 @@ import { server, type Channel } from "@dotex/saferpc";
 import { WebSocketServer, type WebSocket } from "ws";
 import { appRouter } from "./router.js";
 
-const secret = new Uint8Array([/* 32 bytes from your generator */]);
+const secret = new Uint8Array([
+  /* 32 bytes from your generator */
+]);
 
 function wsChannel(ws: WebSocket): Channel {
   return {
@@ -90,16 +92,18 @@ wss.on("connection", (ws) => {
 import { client, type Channel } from "@dotex/saferpc";
 import type { AppRouter } from "./router";
 
-const secret = new Uint8Array([/* same 32 bytes as the server */]);
+const secret = new Uint8Array([
+  /* same 32 bytes as the server */
+]);
 
 function wsChannel(url: string): Channel {
   const ws = new WebSocket(url);
   ws.binaryType = "arraybuffer";
-  
+
   const ready = new Promise<void>((resolve) =>
     ws.addEventListener("open", () => resolve(), { once: true }),
   );
-  
+
   return {
     async send(data) {
       await ready;
@@ -253,7 +257,7 @@ All built-in helpers (Ed25519, ECDSA, JWT, certificate, multifactor) bind their 
 
 ### Both (defense-in-depth)
 
-Combine a pre-shared secret and asymmetric when you need session binding *and* individual revocation.
+Combine a pre-shared secret and asymmetric when you need session binding _and_ individual revocation.
 
 ```typescript
 const auth = {
@@ -269,7 +273,7 @@ const auth = {
 
 **Asymmetric** when one side is untrusted or there is no shared secret: public web clients, mobile apps, IoT devices. Per-device revocation.
 
-**Both** when you want session binding *and* per-device identity: regulated environments, high-value systems.
+**Both** when you want session binding _and_ per-device identity: regulated environments, high-value systems.
 
 The full trade-off breakdown lives in [Security](security.md).
 
