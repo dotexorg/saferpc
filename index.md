@@ -9,6 +9,7 @@
 
 ## Learn
 - [Security & Auth](spec/security.md)
+- [Security Assessment](spec/assessment.md)
 - [Transports & Integrations](spec/integrations.md)
 
 ## Reference

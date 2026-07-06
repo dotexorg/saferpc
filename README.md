@@ -15,7 +15,7 @@ npm install @dotex/saferpc
 ![Safe RPC](banner.png)
 
 - **Full docs and rationale:** <https://dotex.org/epic/saferpc>
-- [Quickstart](./spec/getting-started.md) · [API](./spec/api.md) · [Wire Protocol](./spec/protocol.md) · [Security](./spec/security.md) · [Transports](./spec/integrations.md)
+- [Quickstart](./spec/getting-started.md) · [API](./spec/api.md) · [Wire Protocol](./spec/protocol.md) · [Security](./spec/security.md) · [Assessment](./spec/assessment.md) · [Transports](./spec/integrations.md)
 
 ## Highlights
 
@@ -154,7 +154,7 @@ Node.js 18+, modern browsers, Service / Web / Shared Workers, React Native, Verc
 
 ## Project status
 
-`0.x` with a stable wire protocol (`saferpc-v1` HKDF info, `saferpc-hs-{hello,reply}-v1` transcript prefixes). Test coverage for handshake attacks, replay, tampering, type confusion, prototype pollution, middleware misuse, and DoS limits lives in `test/security/`. A 1.0 release will lock the public API surface.
+`0.x` with a stable wire protocol (`saferpc-v1` HKDF info, `saferpc-hs-{hello,reply}-v1` transcript prefixes). Test coverage for handshake attacks, replay, tampering, type confusion, prototype pollution, middleware misuse, and DoS limits lives in `test/security/`. An internal line-by-line security review — including the honest list of residual risks and open issues — is published in [spec/assessment.md](./spec/assessment.md). A 1.0 release will lock the public API surface.
 
 ## Releasing
 
