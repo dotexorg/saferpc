@@ -582,14 +582,16 @@ export function client<T extends Router>(
 
       pending.set(id, { resolve: res, reject: rej, timer });
 
-      Promise.resolve(channel.send(encrypted)).catch(function onSendError(err) {
+      // Give the send path a typed failure code. A raw adapter error (bare
+      // Error / DOMException) would slip past the caller's documented
+      // `instanceof RPCError` taxonomy; `CHANNEL` means "request provably
+      // never left", the retry predicate's clean trigger. The original error
+      // is preserved on `.cause` for debugging. Handles BOTH a synchronous
+      // throw (e.g. a closed MessagePort) and an async rejection (WS/queue
+      // adapters) from `channel.send`.
+      function onSendError(err: unknown): void {
         pending.delete(id);
         clearTimeout(timer);
-        // Give the send path a typed failure code. A raw adapter rejection
-        // (bare Error / DOMException) would slip past the caller's documented
-        // `instanceof RPCError` taxonomy; `CHANNEL` means "request provably
-        // never left", the retry predicate's clean trigger. The original
-        // error is preserved on `.cause` for debugging.
         rej(
           err instanceof RPCError
             ? err
@@ -597,7 +599,19 @@ export function client<T extends Router>(
                 cause: err,
               }),
         );
-      });
+      }
+      try {
+        const sent = channel.send(encrypted) as unknown;
+        if (
+          sent !== null &&
+          typeof sent === "object" &&
+          typeof (sent as { then?: unknown }).then === "function"
+        ) {
+          (sent as Promise<void>).catch(onSendError);
+        }
+      } catch (err: unknown) {
+        onSendError(err);
+      }
     });
   }
 
