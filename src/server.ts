@@ -1,12 +1,16 @@
 /**
  * drpc/server — Resilient RPC server
  *
- * LIFECYCLE: Survives handshake failures and re-handshakes. A new hello
- * opens a handshake ATTEMPT on attempt-local state (D1 deferred reset); the
- * live session keeps serving and is torn down only when the attempt fully
- * validates and publishes — so a garbage / unauthenticated hello cannot
- * displace an established session. Resets to waiting on confirmation timeout
- * or post-publish send failure. Only explicit destroy() is permanent.
+ * LIFECYCLE: Survives handshake failures and re-handshakes (make-before-break).
+ * A new hello opens a handshake ATTEMPT on attempt-local state; a fully
+ * validated attempt is installed as a CANDIDATE that runs alongside the live
+ * session. The live session keeps serving and is retired ONLY when a frame
+ * decrypts under the candidate key — proof the counterparty holds the key
+ * material. A garbage / unauthenticated / replayed hello therefore cannot
+ * displace an established session: it can at most create a candidate that
+ * expires unconfirmed. An unconfirmed candidate is dropped on its confirmation
+ * timeout, leaving the live session intact. Only explicit destroy() is
+ * permanent.
  */
 
 import {
@@ -272,27 +276,50 @@ export function server(
   }
   const onError = opts.onError ?? null;
 
-  let state: "waiting" | "pending" | "ready" = "waiting";
-  // Two counters (D1). `epoch` advances only when a NEW session is
-  // PUBLISHED; TAG_MSG responses are guarded by it so a re-handshake drops
-  // stale in-flight replies. `attemptEpoch` advances on every incoming
-  // hello so concurrent handshake attempts self-cancel WITHOUT tearing
-  // down the live session before the new one is proven.
+  // There is no explicit `state` enum: the session state is fully described
+  // by the two key slots — waiting = neither set, pending = candidate set
+  // (live may still be serving), ready = live set with no candidate. The
+  // TAG_MSG handler keys on slot nullness directly.
+  // Three counters, three jobs (make-before-break):
+  //   `epoch`         — advances on every PROMOTION; TAG_MSG responses are
+  //                     guarded by it so a re-handshake drops stale in-flight
+  //                     replies.
+  //   `attemptEpoch`  — advances on every incoming hello (D1); concurrent
+  //                     handshake attempts self-cancel at their await guards
+  //                     WITHOUT touching the live session.
+  //   `candidateEpoch`— advances only when a candidate is INSTALLED; guards
+  //                     the candidate confirmation timer so a later hello that
+  //                     bumps `attemptEpoch` but fails validation cannot disarm
+  //                     an existing candidate's timeout.
   let epoch = 0;
   let attemptEpoch = 0;
-  // Server ephemeral keys are now attempt-local (generated per hello inside
-  // the handshake coroutine) and never held at module scope — a failed
-  // attempt cannot corrupt an established session's state.
-  let sessionKey: Uint8Array | null = null;
-  let encrypt: ((data: unknown) => Uint8Array) | null = null;
-  let decrypt: ((payload: Uint8Array) => unknown) | null = null;
-  // Verified auth data from auth.verify (server-only). Bound to
-  // the current session; cleared on every reset so stale auth data
-  // never leaks across handshake attempts.
-  let authData: Ctx | null = null;
+  let candidateEpoch = 0;
+  // Server ephemeral keys are attempt-local (generated per hello inside the
+  // handshake coroutine) and never held at module scope — a failed attempt
+  // cannot corrupt an established session's state.
+
+  // ── LIVE slot ── the confirmed session. Serves all traffic (encrypt out,
+  // decrypt in). May be null before the first handshake completes.
+  let liveKey: Uint8Array | null = null;
+  let liveEncrypt: ((data: unknown) => Uint8Array) | null = null;
+  let liveDecrypt: ((payload: Uint8Array) => unknown) | null = null;
+  // Verified auth data from auth.verify (server-only), bound to the live
+  // session. Promoted from the candidate; cleared on teardown.
+  let liveAuthData: Ctx | null = null;
+
+  // ── CANDIDATE slot ── a session proven by a hello attempt but NOT yet
+  // confirmed. Used only to TRY decrypting inbound frames; never encrypts.
+  // Make-before-break: installing a candidate does not touch the live
+  // session — the live key is retired only when a frame decrypts under the
+  // candidate (proof the counterparty holds the key material).
+  let candidateKey: Uint8Array | null = null;
+  let candidateDecrypt: ((payload: Uint8Array) => unknown) | null = null;
+  let candidateAuthData: Ctx | null = null;
+
   let destroyed = false;
-  // Confirmation timer for a published-but-unconfirmed (pending) session.
-  let hsTimer: ReturnType<typeof setTimeout> | null = null;
+  // Confirmation timer for the pending candidate. On expiry the candidate is
+  // dropped; the live session (if any) is untouched.
+  let candidateTimer: ReturnType<typeof setTimeout> | null = null;
 
   // ── D2: bounded seen-nonce set (in-session replay defense) ────────
   // Ring buffer of the last `replayWindow` accepted nonce keys + a Set for
@@ -334,45 +361,69 @@ export function server(
     }
   }
 
-  function clearHsTimer(): void {
-    if (hsTimer !== null) {
-      clearTimeout(hsTimer);
-      hsTimer = null;
+  function clearCandidateTimer(): void {
+    if (candidateTimer !== null) {
+      clearTimeout(candidateTimer);
+      candidateTimer = null;
     }
   }
 
   /**
-   * Tear down the CURRENT session, clear replay state, return to waiting.
-   * Advances `epoch` so any in-flight response from the dead session is
-   * dropped by the guard in the TAG_MSG handler. Called only when an
-   * ESTABLISHED-or-pending session must be abandoned (confirmation
-   * timeout, post-publish send failure) — NOT on an incoming hello (D1).
+   * Promote the pending candidate to the live session. Called ONLY from the
+   * TAG_MSG handler, when a frame decrypts under the candidate key — that
+   * ciphertext is proof the counterparty holds the key material, which is
+   * exactly the authority required to retire the old live session
+   * (make-before-break). Advances `epoch` so in-flight responses from the
+   * retired session self-drop at the response guard, and clears the replay
+   * window (new key → old nonces are irrelevant).
    */
-  function resetHandshake(): void {
-    clearHsTimer();
+  function promoteCandidate(): void {
+    if (candidateKey === null) return; // defensive — never expected
+    clearCandidateTimer();
+    if (liveKey !== null) zero(liveKey);
+    liveKey = candidateKey;
+    liveEncrypt = createEncryptor(liveKey);
+    liveDecrypt = candidateDecrypt;
+    liveAuthData = candidateAuthData;
     epoch++;
-    if (sessionKey !== null) {
-      zero(sessionKey);
-      sessionKey = null;
-    }
-    encrypt = null;
-    decrypt = null;
-    authData = null;
     seenClear();
-    state = "waiting";
+    candidateKey = null; // ownership moved to liveKey — do NOT zero it
+    candidateDecrypt = null;
+    candidateAuthData = null;
+  }
+
+  /**
+   * Drop the pending candidate without touching the live session. Called on
+   * candidate confirmation timeout. If a live session exists it keeps serving
+   * (make-before-break); otherwise we fall back to waiting.
+   */
+  function dropCandidate(): void {
+    clearCandidateTimer();
+    if (candidateKey !== null) {
+      zero(candidateKey);
+      candidateKey = null;
+    }
+    candidateDecrypt = null;
+    candidateAuthData = null;
   }
 
   function destroy(): void {
     if (destroyed) return;
     destroyed = true;
-    clearHsTimer();
-    if (sessionKey !== null) {
-      zero(sessionKey);
-      sessionKey = null;
+    clearCandidateTimer();
+    if (liveKey !== null) {
+      zero(liveKey);
+      liveKey = null;
     }
-    encrypt = null;
-    decrypt = null;
-    authData = null;
+    if (candidateKey !== null) {
+      zero(candidateKey);
+      candidateKey = null;
+    }
+    liveEncrypt = null;
+    liveDecrypt = null;
+    liveAuthData = null;
+    candidateDecrypt = null;
+    candidateAuthData = null;
     seenClear();
     if (unsubscribe !== null) {
       unsubscribe();
@@ -388,12 +439,13 @@ export function server(
     const data = toPlainBytes(raw);
     const tag = data[0];
 
-    // D1 (deferred reset): a hello opens a handshake ATTEMPT. The live
-    // session (if any) keeps serving on its own key throughout — it is torn
-    // down and replaced ONLY when this attempt fully validates and publishes
-    // below. A garbage or bad-signature hello therefore cannot displace an
-    // established session. `attemptEpoch` bumps per hello so a newer attempt
-    // cancels this one at its guards without touching the session.
+    // Make-before-break: a hello opens a handshake ATTEMPT. The live session
+    // (if any) keeps serving on its own key throughout. A fully validated
+    // attempt is installed as a CANDIDATE (below), NOT swapped in; the live
+    // key is retired only when a frame decrypts under the candidate. A garbage
+    // or bad-signature hello therefore cannot displace an established session.
+    // `attemptEpoch` bumps per hello so a newer attempt cancels this one at
+    // its await guards without touching the session or the candidate.
     if (tag === TAG_HELLO) {
       if (data.length > MAX_HELLO_BYTES) return;
 
@@ -543,34 +595,34 @@ export function server(
             localServerAuth = signed;
           }
 
-          // FINAL publish guard. The block below is fully synchronous: it
-          // atomically swaps the live session for the newly-proven one, so
-          // the publishes cannot race against a newer attempt or a request.
+          // FINAL install guard. The block below is fully synchronous: it
+          // installs the newly-proven session as a CANDIDATE without racing a
+          // newer attempt or a request.
           if (attemptEpoch !== myAttempt || destroyed) return;
 
-          // Tear down the OLD session and publish the new one. `epoch++`
-          // makes any in-flight response from the old session self-drop at
-          // the TAG_MSG guard; `seenClear()` drops the old replay window
-          // (new key → old nonces are irrelevant and would only waste budget).
-          clearHsTimer();
-          if (sessionKey !== null) zero(sessionKey);
-          epoch++;
-          seenClear();
-          sessionKey = localSessionKey;
+          // Make-before-break: install as CANDIDATE, do NOT touch the live
+          // session. The live key (if any) keeps serving until a frame
+          // decrypts under this candidate (see promoteCandidate). A newer
+          // unconfirmed candidate replaces an older one (latest wins). The
+          // candidate is decrypt-only — its encryptor is created on promotion,
+          // never before, since we never encrypt under an unconfirmed key.
+          clearCandidateTimer();
+          if (candidateKey !== null) zero(candidateKey);
+          candidateEpoch++;
+          candidateKey = localSessionKey;
           localSessionKey = null; // ownership transferred — skip finally zero
-          encrypt = createEncryptor(sessionKey);
-          decrypt = createDecryptor(sessionKey);
-          authData = localAuthData;
-          state = "pending";
+          candidateDecrypt = createDecryptor(candidateKey);
+          candidateAuthData = localAuthData;
 
-          // Arm the confirmation timer for the new pending session. Budget
-          // covers waiting for the first valid TAG_MSG that promotes
-          // pending → ready. Keyed on the session epoch so a later publish
-          // (which clears this timer) or reset cancels it cleanly.
-          const sessionEpoch = epoch;
-          hsTimer = setTimeout(function onHsTimeout() {
-            if (epoch !== sessionEpoch || destroyed) return;
-            resetHandshake();
+          // Arm the confirmation timer for this candidate. On expiry the
+          // candidate is dropped and the live session is untouched. Keyed on
+          // `candidateEpoch` so a later install (or a validated newer
+          // candidate) cancels this timer cleanly, while a later hello that
+          // merely bumps `attemptEpoch` and then fails cannot disarm it.
+          const myCandEpoch = candidateEpoch;
+          candidateTimer = setTimeout(function onCandidateTimeout() {
+            if (candidateEpoch !== myCandEpoch || destroyed) return;
+            dropCandidate();
             if (onError !== null) {
               onError(new RPCError("HANDSHAKE", "Handshake timeout"));
             }
@@ -590,10 +642,11 @@ export function server(
           localProof = null;
 
           await channel.send(reply);
-          if (epoch !== sessionEpoch || destroyed) return;
+          if (candidateEpoch !== myCandEpoch || destroyed) return;
 
-          // Timer continues running — waiting for first valid TAG_MSG
-          // to transition pending → ready. Total budget = hsTimeout.
+          // Timer continues running — waiting for first valid TAG_MSG that
+          // decrypts under the candidate to promote it. Total budget =
+          // hsTimeout.
         } finally {
           if (rawShared !== null) zero(rawShared);
           if (localSessionKey !== null) zero(localSessionKey);
@@ -617,45 +670,62 @@ export function server(
       return;
     }
 
-    if (tag === TAG_MSG && decrypt !== null && encrypt !== null) {
+    if (
+      tag === TAG_MSG &&
+      (liveDecrypt !== null || candidateDecrypt !== null)
+    ) {
       if (data.length > maxBytes) return;
 
-      // D2: cheap replay reject BEFORE decrypt. The AEAD nonce is the
-      // NONCE_LEN bytes right after the tag. If a frame with this nonce was
-      // already accepted in the current session, it is a duplicate/replay —
-      // drop it silently. The membership record itself is only written AFTER
-      // Poly1305 verifies (below), so unforgeable frames can never pollute
-      // the window.
+      // D2: cheap replay reject BEFORE decrypt, against the LIVE replay
+      // window. The AEAD nonce is the NONCE_LEN bytes right after the tag. If
+      // a frame with this nonce was already accepted in the current session,
+      // it is a duplicate/replay — drop it silently. The membership record
+      // itself is only written AFTER Poly1305 verifies (below), so unforgeable
+      // frames can never pollute the window.
       const nKey =
         data.length >= 1 + NONCE_LEN
           ? nonceKey(data.subarray(1, 1 + NONCE_LEN))
           : null;
       if (nKey !== null && seenHas(nKey)) return;
 
-      const reqEpoch = epoch;
-
       (async function handleRequest() {
-        if (decrypt === null || encrypt === null) return;
-
-        let raw: unknown;
-        try {
-          raw = decrypt(data);
-        } catch {
+        // Trial decrypt: LIVE first (steady-state cost = one decrypt), then
+        // CANDIDATE. A frame that decrypts under the candidate is proof the
+        // counterparty holds the key material — the authority required to
+        // retire the live session (make-before-break).
+        let raw: unknown = undefined;
+        let decryptedUnder: "live" | "candidate" | null = null;
+        if (liveDecrypt !== null) {
+          try {
+            raw = liveDecrypt(data);
+            decryptedUnder = "live";
+          } catch {
+            /* fall through to candidate */
+          }
+        }
+        if (decryptedUnder === null && candidateDecrypt !== null) {
+          try {
+            raw = candidateDecrypt(data);
+            decryptedUnder = "candidate";
+          } catch {
+            /* neither key */
+          }
+        }
+        if (decryptedUnder === null) {
           return; // poly1305 failure → silently drop (nonce NOT recorded)
         }
 
-        // Poly1305 verified — record the nonce now so a later duplicate of
-        // this exact frame is rejected. Synchronous (runs before any await),
-        // so back-to-back duplicates cannot both slip through.
-        if (nKey !== null) seenAdd(nKey);
+        // Promotion advances `epoch`; capture reqEpoch AFTER it so the reply
+        // to THIS confirming frame survives the response guard below. The
+        // confirming frame is not an in-flight leftover — it is the promoter.
+        if (decryptedUnder === "candidate") promoteCandidate();
+        const reqEpoch = epoch;
 
-        // First valid decrypt confirms the session.
-        // The client proved it has the correct sessionKey (which
-        // requires the correct secret) by producing a valid ciphertext.
-        if (state === "pending") {
-          clearHsTimer();
-          state = "ready";
-        }
+        // Poly1305 verified — record the nonce in the (now-current) live
+        // window so a later duplicate of this exact frame is rejected.
+        // Synchronous (runs before any await), so back-to-back duplicates
+        // cannot both slip through.
+        if (nKey !== null) seenAdd(nKey);
 
         if (typeof raw !== "object" || raw === null) return;
         const msg = raw as Record<string, unknown>;
@@ -687,7 +757,7 @@ export function server(
           // does not race against an in-flight handler. The session is
           // bound to one handshake; if it resets, the response is dropped
           // by the epoch guard below.
-          const ctxArg = authData !== null ? { auth: authData } : {};
+          const ctxArg = liveAuthData !== null ? { auth: liveAuthData } : {};
           let ctx: Ctx;
           if (opts.context !== undefined) {
             // Return type is widened to `unknown` on the loose impl
@@ -728,12 +798,12 @@ export function server(
           }
         }
 
-        // Epoch guard: if a reset/re-handshake happened while the
-        // handler was running, this response belongs to a dead session.
+        // Epoch guard: if a promotion/re-handshake happened while the
+        // handler was running, this response belongs to a superseded session.
         // Drop it — the client already timed out and retried.
         if (epoch !== reqEpoch || destroyed) return;
 
-        const enc = encrypt;
+        const enc = liveEncrypt;
         if (enc === null) return;
         await channel.send(enc(res));
       })().catch(function onSendError(err: unknown) {

@@ -116,11 +116,11 @@ The handshake is one round-trip initiated by the client, and it is **lazy** - no
 ```mermaid
 sequenceDiagram
     Client->>Server: TAG_HELLO + { pub, nonce, epoch, auth? }
-    Note right of Server: verify auth (if configured)<br/>derive session key<br/>compute proof<br/>state → pending
+    Note right of Server: verify auth (if configured)<br/>derive session key<br/>compute proof<br/>install CANDIDATE (live untouched)
     Server->>Client: TAG_HELLO + { pub, proof, epoch, auth? }
     Note left of Client: verify auth (if configured)<br/>derive session key<br/>verify proof<br/>state → ready
     Client->>Server: TAG_MSG + encrypted RPC
-    Note right of Server: decrypt OK ⇒ state → ready
+    Note right of Server: decrypt under candidate ⇒ promote<br/>(retire old live key)
     Server->>Client: TAG_MSG + encrypted response
 ```
 
@@ -152,7 +152,9 @@ The client then sends:
 
 ### Step 2: server processes hello
 
-The server processes the hello as an **attempt**, on state local to that attempt — a fresh ephemeral pair `(s_priv, s_pub)` generated for this hello. An established session, if any, keeps serving while the attempt runs and is replaced only at step 10. A failure at any step discards the attempt's local state and leaves the established session untouched.
+The server processes the hello as an **attempt**, on state local to that attempt — a fresh ephemeral pair `(s_priv, s_pub)` generated for this hello. An established session, if any, keeps serving while the attempt runs and is **not** replaced at step 10 — the attempt is installed as a _candidate_ that is promoted only when a frame decrypts under it (step 4, make-before-break). A failure at any step discards the attempt's local state and leaves the established session untouched.
+
+> **Invariant (load-bearing).** `(s_priv, s_pub)` is generated fresh per attempt and is never held at module/connection scope. A duplicate hello therefore derives a _different_ `raw` and a _different_ candidate key than the live session, so replayed traffic can never decrypt under the candidate. Moving this pair to a shared scope would silently turn the duplicate-hello nuisance below into a full session-traffic replay. See [make-before-break](#re-handshake).
 
 1. Verify frame length and tag.
 2. Decode msgpack, sanitize, check shape. Validate `epoch` is an integer in `0..2^32-1`.
@@ -173,14 +175,14 @@ reply_transcript :=
     s_pub
 ```
 
-10. **Publish atomically**: zero the previous session key (if any), install the new `session_key`/encryptor/decryptor and the verified auth data, transition state to `pending`. This publish must be a single synchronous block guarded by the attempt's epoch, so a concurrent newer hello cannot interleave.
+10. **Install the candidate atomically**: install `session_key`/decryptor and the verified auth data into the _candidate_ slot, replacing any prior unconfirmed candidate (latest attempt wins). **Do not touch the live session** — its key keeps serving. The candidate is decrypt-only; its encryptor is created on promotion, never before, since the server never encrypts under an unconfirmed key. This install must be a single synchronous block guarded by the attempt's epoch, so a concurrent newer hello cannot interleave. Arm a confirmation timer for the candidate.
 11. Send:
 
 ```
 0x00 || msgpack({ pub: s_pub, proof: proof, epoch: epoch, auth: signed? })
 ```
 
-The server **does not** transition to `ready` yet. It does so on the first `TAG_MSG` whose Poly1305 tag verifies under the freshly-derived session key, regardless of whether the decrypted payload is a well-formed RPC request. Producing a valid AEAD frame is the implicit proof; the inner shape is checked afterwards and may be silently dropped without rolling state back.
+The live session is **not** replaced yet. Replacement happens on the first `TAG_MSG` whose Poly1305 tag verifies under the candidate key, regardless of whether the decrypted payload is a well-formed RPC request. Producing a valid AEAD frame under the candidate is the implicit proof that the counterparty holds the key material; only then is the old live key retired (step 4). The inner shape is checked afterwards and may be silently dropped without rolling state back.
 
 ### Step 3: client processes reply
 
@@ -197,17 +199,23 @@ The server **does not** transition to `ready` yet. It does so on the first `TAG_
 
 ### Step 4: first encrypted message
 
-The client encrypts and sends its first RPC request. On the server, successful AEAD verification of the first `TAG_MSG` (Poly1305 tag passes under the freshly-derived session key) is the implicit proof that the client knows the secret, and the server transitions from `pending` to `ready`. The inner RPC payload is validated separately. A junk payload that nonetheless decrypts cleanly still confirms the session; it is just dropped without producing a response.
+The client encrypts and sends its first RPC request. On the server, inbound `TAG_MSG` frames are trial-decrypted **live key first, then candidate key**. Successful AEAD verification under the candidate (Poly1305 tag passes) is the implicit proof that the client knows the secret; the server then **promotes** the candidate — retires the old live key, installs the candidate as the new live session (create its encryptor), advances the response-guard epoch, and clears the replay window. A bootstrap (no prior live session) is the same path with an empty live slot. The inner RPC payload is validated separately. A junk payload that nonetheless decrypts cleanly still confirms and promotes the session; it is just dropped without producing a response.
+
+The response-guard epoch is captured **after** promotion, so the reply to this first confirming frame is not dropped by the guard — the confirming frame is the promoter, not an in-flight leftover from the retired session.
 
 ### Re-handshake
 
 A server in **any** state that receives a `TAG_HELLO` opens a new handshake _attempt_ and processes it — this is how transparent recovery works: a client whose session died sends a fresh hello and gets a fresh session without application-layer coordination.
 
-The established session, if one exists, **must survive until the new attempt succeeds** (step 10 above). An invalid hello — malformed, oversized auth, failed `verify`, bad secret — discards only the attempt. This ordering is load-bearing: without it, a single injected garbage hello (no authentication required) tears down a live session, handing any traffic injector a trivial denial-of-service. With it, a deployment with `verify` configured cannot have its sessions displaced by an attacker who cannot produce a valid signature.
+The established session, if one exists, **must survive until a frame decrypts under the new candidate** — i.e. until the counterparty proves it holds the new key material. A validated attempt installs a candidate (step 10); the live key is retired only at promotion (step 4). An invalid hello — malformed, oversized auth, failed `verify`, bad secret — discards only the attempt and never reaches candidate install.
 
-Residual (accepted): in secret-only mode nothing in the hello itself is authenticated, so a _well-formed_ forged hello still opens an attempt that reaches step 10 and displaces the session. Rate-limit hellos at the transport layer if that matters for your deployment.
+**Underlying rule (normative).** A transition that _destroys_ authenticated state must be authenticated at least as strongly as the state it destroys. A hello proves at most the sender's chosen identity; it may _create_ a candidate. Retiring a live session is _destruction_ and must be gated on proof of key possession — a frame that decrypts under the candidate. (This is the same failure family as forged TCP resets and Wi-Fi deauth: an unauthenticated message tearing down an authenticated connection.)
 
-Each incoming hello **must** invalidate any prior in-flight attempt (bump the attempt counter/epoch before any `await`-equivalent suspension), so stale suspended attempts detect the change and abandon all writes.
+This make-before-break ordering is load-bearing and closes the displacement hole in **both** modes: neither a byte-for-byte replayed hello nor a well-formed forged hello (secret-only mode) can retire a live session, because neither can produce a frame that decrypts under the fresh-per-attempt candidate key. A duplicate/forged hello can at most create a candidate that expires unconfirmed on its timer.
+
+Residual (accepted, out of threat model): because the latest hello wins the candidate slot, a _flood_ of hellos can keep overwriting the candidate and starve a legitimate peer's reconnect before its confirming frame lands. This is a denial-of-service concern, explicitly outside saferpc's threat model; rate-limit hellos at the transport layer if it matters for your deployment. A cheap partial mitigation (drop byte-identical duplicate hellos via a small recent-transcript-hash cache before signature verification) is possible but not mandated.
+
+Each incoming hello **must** invalidate any prior in-flight attempt (bump the attempt counter/epoch before any `await`-equivalent suspension), so stale suspended attempts detect the change and abandon all writes. A separate counter guards the candidate confirmation timer, bumped only when a candidate is installed — so a later hello that bumps the attempt counter but then fails validation cannot disarm an existing candidate's timeout.
 
 ## Key derivation
 
@@ -359,20 +367,32 @@ Messages with wrong `t`, missing/empty `id`, missing/empty `p`, or any unexpecte
 
 ### Server
 
+State is described by two key slots — the **live** session (serves traffic) and
+a **candidate** (a validated-but-unconfirmed attempt). `waiting` = neither set,
+`pending` = candidate set (live may still be serving), `ready` = live set with
+no candidate.
+
 ```
 [waiting]
-   │  TAG_HELLO → attempt validates (steps 1-9) → publish
+   │  TAG_HELLO → attempt validates (steps 1-9) → install candidate
    ▼
-[pending] ──── 1st valid TAG_MSG ───────► [ready]
-   │                                        │
-   │ attempt timeout / attempt error       │  TAG_HELLO → attempt validates
-   ▼                                        ▼  → publish replaces session
-[waiting]                               [pending] (new session)
+[pending] ── 1st TAG_MSG decrypts under candidate → promote ──► [ready]
+   │                                                         │
+   │ candidate timeout / attempt error                       │  TAG_HELLO → validates
+   │ (candidate dropped; live, if any, untouched)            ▼  → install candidate
+   ▼                                              [pending] (live still serving)
+[waiting or ready]                                     │
+(ready if a live session exists)                        │ 1st TAG_MSG under candidate
+                                                        ▼  → promote (retire old live)
+                                                     [ready] (new session)
 
-A hello received in ANY state opens an attempt. The attempt runs on local
-state; the current session (pending or ready) keeps serving and is replaced
-only when the attempt publishes. A failed or timed-out attempt changes
-nothing except attempt-local state.
+Make-before-break: a hello in ANY state opens an attempt on attempt-local
+state and, if it validates, installs a CANDIDATE. The live session (if any)
+keeps serving and is retired ONLY when a frame decrypts under the candidate
+— proof the counterparty holds the key material. A failed / timed-out attempt
+or an unconfirmed candidate that expires changes nothing about the live
+session. A byte-for-byte replayed or forged hello can therefore at most create
+a candidate that expires; it can never displace the live session.
 
 destroy() ⇒ [destroyed], terminal
 ```
@@ -497,11 +517,14 @@ A new-language port that ticks every item is conformant:
 - [ ] Frames are bounded by `MAX_HELLO_BYTES` / `MAX_MSG_BYTES`.
 - [ ] Hello transcript and reply transcript are built from the exact byte sequences shown.
 - [ ] Auth is processed **before** any session key is materialized; failed auth never leaks session state.
-- [ ] Server transitions to `ready` only on first valid decrypt, not on sending the reply.
+- [ ] The server's ephemeral pair `(s_priv, s_pub)` is generated **fresh per hello attempt** and never held at module/connection scope. This is load-bearing for make-before-break: it guarantees a duplicate hello derives a different candidate key than the live session, so replayed traffic can never decrypt under the candidate and force a promotion.
+- [ ] A validated attempt is installed as a **candidate**, not swapped into the live session. The live key is retired only when a `TAG_MSG` decrypts under the candidate key (make-before-break). Inbound frames are trial-decrypted live-first, then candidate.
+- [ ] The response-guard epoch is captured **after** promotion (not at frame arrival), so the reply to the confirming frame is not dropped by the guard.
 - [ ] Epoch counter increments per handshake attempt on both sides, is echoed in the reply, is validated as a uint32 on the wire, and never wraps (exhaustion is a terminal client error).
 - [ ] The attempt counter is bumped for **every** incoming hello, including ones that arrive while a previous attempt is still suspended at an `await`. In-flight stale attempts detect themselves via the guard and abandon all writes.
-- [ ] Every `await` in the handshake path is followed by an attempt + destroyed guard before any session state is written. The session publish (key swap, state → `pending`) happens under a final guard inside a single synchronous block.
-- [ ] Hello processing runs on **attempt-local** state; an established session keeps serving during the attempt and is replaced only by a successful publish. An invalid hello (malformed, oversized, failed `verify`, bad secret) never disturbs an established session.
+- [ ] Every `await` in the handshake path is followed by an attempt + destroyed guard before any session state is written. The candidate install happens under a final guard inside a single synchronous block.
+- [ ] A separate counter guards the candidate confirmation timer, bumped only when a candidate is installed — so a later hello that bumps the attempt counter but then fails validation cannot disarm an existing candidate's timeout.
+- [ ] Hello processing runs on **attempt-local** state; an established session keeps serving during the attempt and is retired only on promotion. An invalid hello (malformed, oversized, failed `verify`, bad secret), a byte-for-byte replayed hello, or a well-formed forged hello never disturbs an established session — at most it creates a candidate that expires unconfirmed.
 - [ ] Secret bytes equal to `EMPTY_SECRET` (32 zero bytes) are rejected at runtime when `auth.secret` is configured.
 - [ ] The X25519 raw shared secret is zeroed in a try/finally so a thrown `psk()` does not leak it.
 - [ ] Ephemeral private keys captured for the duration of an `await` are owned by the in-flight attempt (copied, not aliased), so a concurrent reset that zeroes the live buffer does not corrupt the in-flight derivation.

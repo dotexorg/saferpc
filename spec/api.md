@@ -186,13 +186,15 @@ Returned `auth` data is sanitized (poison keys stripped) before reaching `contex
 ```
 waiting → pending → ready
    ↑         |        |
-   └─────────┴────────┘   (timeout / new hello / explicit destroy)
+   └─────────┴────────┘   (candidate timeout / new hello / explicit destroy)
 ```
 
-- `waiting`: accepting hellos, no session.
-- `pending`: hello processed, reply sent. Transitions to `ready` only on successful decrypt of the first `TAG_MSG`.
-- `ready`: session confirmed. Routes RPCs.
-- A new hello in any state resets the server and starts over.
+State is described by two key slots — a **live** session and a validated-but-unconfirmed **candidate** (make-before-break):
+
+- `waiting`: no live session, no candidate. Accepting hellos.
+- `pending`: a validated hello has installed a candidate; the reply is sent. **If a live session already exists it keeps serving throughout.** The candidate is promoted only on successful decrypt of the first `TAG_MSG` under the candidate key.
+- `ready`: a live session is confirmed, no candidate pending. Routes RPCs.
+- A new hello in any state opens an attempt and, if it validates, installs a candidate — it does **not** reset or displace the live session. A replayed or forged hello can at most create a candidate that expires unconfirmed.
 - `destroy()` is permanent: zeros all keys, unsubscribes from the channel, drops references.
 
 ---

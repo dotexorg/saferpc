@@ -214,6 +214,35 @@ auth: {
 
 The unsafe list shares one pattern: the attacker can reproduce the derivation, either because the input is guessable or because the secret material lives in the wrong place.
 
+### The secret is a key, not a password
+
+The `secret` **must** be a high-entropy cryptographic key (e.g. `randomBytes(32)` from a CSPRNG), not a password or passphrase. The 32-byte minimum length is a floor, not a guarantee of strength: 32 bytes of a human-chosen or dictionary-derived value still has only password-level entropy.
+
+The reason is a proof oracle inherent to the handshake. On any well-formed hello the server derives `session_key = HKDF(raw, salt=secret)` and returns `proof = HMAC(session_key, s_pub‖c_pub‖c_nonce)` — before the client has proven anything. An attacker who sends their own hello with an ephemeral pair they generated knows `raw` (X25519 is symmetric: `X25519(attacker_priv, s_pub) == X25519(s_priv, attacker_pub)`), and receives `s_pub` and `proof`. That leaves the secret as the only unknown in the proof, so the attacker can grind candidate secrets **offline**, at billions of guesses per second, with no further traffic to the server:
+
+```
+for guess in candidates:            # offline, no network
+    k = HKDF(raw, salt=guess)
+    if HMAC(k, s_pub‖c_pub‖c_nonce) == proof:  # found it
+```
+
+Against a random 32-byte key this is 2²⁵⁶ work — infeasible. Against a password-derived secret it is a fast dictionary attack. This is a property of the scheme (PSK as HKDF salt with a server-first proof), not a fixable bug; defending weak passwords would require a PAKE, which saferpc is not.
+
+```typescript
+// ✅ Real random key from a CSPRNG
+import { randomBytes } from "@noble/ciphers/utils.js";
+const key = randomBytes(32);
+auth: { secret: () => key }
+
+// ❌ Password / passphrase used directly — offline-bruteforceable via the proof
+auth: { secret: () => new TextEncoder().encode("correct horse battery staple") }
+
+// ⚠️ If you MUST start from a human password, stretch it with a slow KDF first
+//     (scrypt / argon2) — this raises the per-guess cost but does not make a
+//     weak password strong; prefer a real random key wherever possible.
+auth: { secret: async () => await scrypt(password, salt, { N: 2**17, r: 8, p: 1, dkLen: 32 }) }
+```
+
 ## Built-in signature helpers
 
 Safe RPC ships ready-made helpers for the common cases. Each one binds its proof to the handshake transcript that Safe RPC passes in.
