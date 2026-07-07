@@ -80,7 +80,8 @@ export interface ServerOptionsBase {
    * Max time (ms) to complete a handshake AFTER a client hello arrives.
    * The server waits indefinitely for a client to connect — this timeout
    * only governs the exchange once a hello is received.
-   * On timeout the server resets to waiting (does NOT destroy).
+   * On timeout the unconfirmed candidate is dropped; the live session,
+   * if any, keeps serving (make-before-break). Never destroys.
    * Default: 5000ms.
    */
   handshakeTimeout?: number;
@@ -205,22 +206,23 @@ function execute(
 }
 
 // ─── Server ───────────────────────────────────────────────
-// RESILIENT HANDSHAKE: The server survives handshake failures.
+// RESILIENT HANDSHAKE (make-before-break): The server survives handshake
+// failures AND handshake replays. State is described by two key slots:
 //
-// States:
-//   waiting — accepting hellos, no session yet
-//   pending — hello reply sent, waiting for first valid encrypted msg
-//   ready   — session established (first valid TAG_MSG decrypted)
+//   waiting — no live session, no candidate. Accepting hellos.
+//   pending — a validated hello installed a CANDIDATE; reply sent. If a
+//             live session exists it keeps serving throughout.
+//   ready   — live session confirmed, no candidate pending.
 //
 // Transitions:
-//   waiting → pending:  hello processed, reply sent
-//   pending → ready:    first valid TAG_MSG decrypted (session confirmed)
-//   pending → waiting:  timeout OR new hello arrives (client retry)
-//   ready   → waiting:  new hello arrives (client re-handshaking)
+//   hello validates        → install candidate (live, if any, untouched)
+//   TAG_MSG decrypts under candidate → promote (retire old live key)
+//   candidate timeout / attempt error → drop candidate only; live intact
 //
-// On handshake failure or timeout, the server resets with fresh
-// ephemeral keys and waits for the next hello. An epoch counter
-// guards against stale async operations from previous attempts.
+// A failed, replayed, or forged hello can at most create a candidate that
+// expires unconfirmed — it can never displace the live session. Epoch
+// counters guard against stale async operations from previous attempts
+// (see the three-counter comment inside server()).
 
 export function server<T extends Router>(
   router: T,
