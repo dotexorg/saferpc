@@ -92,6 +92,11 @@
       "types": "./esm/server.d.ts",
       "import": "./esm/server.js",
       "require": "./cjs/server.js"
+    },
+    "./channels": {
+      "types": "./esm/channels/index.d.ts",
+      "import": "./esm/channels/index.js",
+      "require": "./cjs/channels/index.js"
     }
   },
   "sideEffects": false,

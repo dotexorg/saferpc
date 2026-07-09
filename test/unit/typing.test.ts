@@ -16,6 +16,7 @@ import {
   client,
   server,
   RPCError,
+  type CallOptions,
   type Client,
   type Router,
   type Procedure,
@@ -162,26 +163,35 @@ describe("Client<Router> — end-to-end inference", () => {
   it("maps each procedure to a typed call", () => {
     type Api = Client<AppRouter>;
     expectTypeOf<Api["greet"]>().toEqualTypeOf<
-      (input: { name: string }) => Promise<{ message: string }>
+      (
+        input: { name: string },
+        opts?: CallOptions,
+      ) => Promise<{ message: string }>
     >();
     expectTypeOf<Api["parseId"]>().toEqualTypeOf<
-      (input: { raw: string }) => Promise<{ id: number }>
+      (input: { raw: string }, opts?: CallOptions) => Promise<{ id: number }>
     >();
     // no `.input()` schema at all → the argument is optional
     expectTypeOf<Api["me"]>().toEqualTypeOf<
-      (input?: unknown) => Promise<{ id: string; name: string }>
+      (
+        input?: unknown,
+        opts?: CallOptions,
+      ) => Promise<{ id: string; name: string }>
     >();
     // `.input(z.string().optional())` → `undefined` is a valid input, so
     // the argument is still optional
     expectTypeOf<Api["ping"]>().toEqualTypeOf<
-      (input?: string | undefined) => Promise<{ pong: string }>
+      (
+        input?: string | undefined,
+        opts?: CallOptions,
+      ) => Promise<{ pong: string }>
     >();
   });
 
-  it("a loose Router stays callable as (input?: unknown) => Promise<unknown>", () => {
+  it("a loose Router stays callable as (input?, opts?) => Promise<unknown>", () => {
     type Loose = Client<Router>;
     expectTypeOf<Loose[string]>().toEqualTypeOf<
-      (input?: unknown) => Promise<unknown>
+      (input?: unknown, opts?: CallOptions) => Promise<unknown>
     >();
   });
 

@@ -212,33 +212,57 @@ function client<T extends Router>(
 };
 ```
 
-Returns synchronously. The handshake stays lazy: it starts on the first `api` call. `abortPending(err?)` lets a transport adapter reject all in-flight calls (and any in-progress handshake) with a retryable code and return the client to `idle` without destroying it — see [Failure handling](#failure-handling-no-auto-retry).
+Returns synchronously. The handshake stays lazy: it starts on the first `api` call. `abortPending(err?)` lets the application reject all in-flight calls (and any in-progress handshake) at once when it knows further waiting is pointless — the session itself survives; see [Failure handling](#failure-handling-no-auto-retry).
 
 ### `ClientOptions`
 
 | Field              | Type          | Default     | Required |
 | ------------------ | ------------- | ----------- | -------- |
 | `auth`             | `AuthOptions` | —           | ✅       |
-| `timeout`          | `number` (ms) | `10_000`    | —        |
+| `timeout`          | `number` (ms) | `30_000`    | —        |
 | `maxPending`       | `number`      | `256`       | —        |
 | `handshakeTimeout` | `number` (ms) | `5000`      | —        |
 | `maxMessageBytes`  | `number`      | `1_048_576` | —        |
 
 `maxPending` caps concurrent in-flight calls. Past the cap, calls reject with `RPCError("CLIENT", "Too many pending requests")`.
 
-`timeout` is per call. On timeout the client throws `RPCError("TIMEOUT", "Timed out: <procedure>")` and resets the session (no auto-retry — the error surfaces and the caller decides whether to retry; the next call re-handshakes).
+`timeout` applies to every call. On timeout the client throws `RPCError("TIMEOUT", "Timed out: <procedure>")` and resets the session (no auto-retry — the error surfaces and the caller decides whether to retry; the next call re-handshakes). Set it generously — it is the safety net, not a UX budget; shorten a single call with [`AbortSignal.timeout`](#calloptions--per-call-abort) instead.
 
 ### `Client<T>`
 
 ```typescript
 type Client<T extends Router> = {
   [K in keyof T & string]: T[K] extends Procedure<infer TInput, infer TOutput>
-    ? (input: TInput) => Promise<TOutput>
-    : (input: unknown) => Promise<unknown>;
+    ? (input: TInput, opts?: CallOptions) => Promise<TOutput>
+    : (input: unknown, opts?: CallOptions) => Promise<unknown>;
 };
 ```
 
-Each procedure maps to a call whose argument and result are inferred from that procedure. Pass `typeof appRouter` as the type argument — `client<typeof appRouter>(...)` — to get full end-to-end inference. A loose `Router` collapses to `(input: unknown) => Promise<unknown>`, so untyped usage keeps working.
+Each procedure maps to a call whose argument and result are inferred from that procedure. Pass `typeof appRouter` as the type argument — `client<typeof appRouter>(...)` — to get full end-to-end inference. A loose `Router` collapses to `(input: unknown, opts?: CallOptions) => Promise<unknown>`, so untyped usage keeps working.
+
+### `CallOptions` — per-call abort
+
+```typescript
+interface CallOptions {
+  signal?: AbortSignal;
+}
+
+const ac = new AbortController();
+const p = api.getProfile({ id: "u_1" }, { signal: ac.signal });
+ac.abort(); // p rejects with RPCError("ABORTED"), signal.reason on .cause
+
+// a shorter budget for ONE call — the platform's timeout-signal:
+await api.getPrice(input, { signal: AbortSignal.timeout(500) });
+```
+
+Fetch-style. Aborting rejects **that call** with `RPCError("ABORTED")`:
+
+- An already-aborted signal rejects immediately — nothing is sent and no handshake is triggered.
+- Aborting while the call waits on a shared handshake rejects the call only; the handshake keeps running for other callers and for the next call.
+- Abort is client-local. Like a `TIMEOUT`, the outcome on the server is **UNKNOWN** — the request may still execute there. Abort does not cancel server-side execution; never blind-resend a non-idempotent call after aborting it.
+- The session is never touched: `ABORTED` does not trigger the reset path, and a reply arriving after the abort is silently dropped.
+
+There is deliberately **no per-call `timeout` field**: the two-lever model is a *global* timeout (the client-level `timeout` option — the safety net that heals a dead session) plus a *local* abort (`AbortSignal.timeout(ms)` for a shorter single-call budget — gives `ABORTED`, session untouched). A signal can only shrink a call's budget, not extend it past the global timer; procedures slower than the global timeout mean the global value is too small — raise `ClientOptions.timeout` (this is also why the default is a generous 30 s), don't look for a per-call escape hatch.
 
 ### Client lifecycle
 
@@ -257,9 +281,11 @@ idle → handshaking → ready
 
 ## Failure handling (no auto-retry)
 
-As of 0.7.0 a call that fails on a `ready` session with a local `TIMEOUT` or `CHANNEL` send error resets the session (zeros the key, returns to `idle`) but is **not** resent — the error surfaces so the caller, the only party that knows whether the procedure is idempotent, decides. Resending after a `TIMEOUT` (outcome unknown) would silently double-execute non-idempotent handlers. `RemoteRPCError` (server answered) and local guardrail errors (`CLIENT`) never reset the session. The reset alone keeps a desynced peer from wedging future calls: the next call re-handshakes lazily. Concurrent failures share one re-handshake via an epoch counter. Full state-machine and wire-level semantics in [Protocol § Failure handling](protocol.md#failure-handling-no-auto-retry).
+As of 0.7.0 a call that fails on a `ready` session with a local `TIMEOUT` or `CHANNEL` send error resets the session (zeros the key, returns to `idle`) but is **not** resent — the error surfaces so the caller, the only party that knows whether the procedure is idempotent, decides. Resending after a `TIMEOUT` (outcome unknown) would silently double-execute non-idempotent handlers. `RemoteRPCError` (server answered) and local guardrail errors (`CLIENT`, `ABORTED`) never reset the session. The reset alone keeps a desynced peer from wedging future calls: the next call re-handshakes lazily. Concurrent failures share one re-handshake via an epoch counter. Full state-machine and wire-level semantics in [Protocol § Failure handling](protocol.md#failure-handling-no-auto-retry).
 
-`abortPending(err?)` is the adapter-driven counterpart: on a transport `onclose` event it rejects every in-flight call and any hello-waiter immediately with `err ?? RPCError("CHANNEL", "Channel down")`, fails an in-progress handshake, zeros the keys, and returns the client to `idle` (not `closed`) so it stays usable.
+As of 0.7.0 **transport death is not a session event**. The session is bound to key material, not to a transport instance; when a socket dies, the client does nothing — keys are kept, pending calls keep waiting under their own timers. A call's outcome is decided by exactly two events: a reply that decrypts, or the call's own timeout. Channel liveness (reconnecting, queueing frames that never left) is the adapter's job — see [Integrations § adapter lifecycle contract](integrations.md) and the shipped `@dotex/saferpc/channels`. If the server lost its session with the socket, the first call after recovery times out and the reset above heals lazily.
+
+`abortPending(err?)` is the application-driven "stop waiting": it rejects every in-flight call and any hello-waiter immediately with `err ?? RPCError("ABORTED", "Pending calls aborted")` and fails an in-progress handshake. A `ready` session's keys and state are **untouched** — the next call reuses the session, no re-handshake. Use it when the app knows waiting is pointless (user logged out, tab hiding); use per-call `signal` for single-call aborts.
 
 ## Replay within a session
 
@@ -282,7 +308,7 @@ The only transport contract. `receive` should return an unsubscribe function; re
 - Deliver each call to `cb` once, in any order
 - Allow `send` and `receive` to run concurrently
 
-Dropping, duplicating, or reordering messages is allowed — Safe RPC will time out and surface a typed error (no auto-retry; the caller decides whether to resend). Ready-made adapters live in [Integrations](integrations.md).
+Dropping, duplicating, or reordering messages is allowed — Safe RPC will time out and surface a typed error (no auto-retry; the caller decides whether to resend). For transports that can die (sockets), the adapter owns liveness: reopen immediately, hold open, queue frames that provably never left while down — see [Integrations § adapter lifecycle](integrations.md#adapter-lifecycle-reopen-immediately-queue-what-never-left). Ready-made adapters live in [Integrations](integrations.md) and ship as code in `@dotex/saferpc/channels`.
 
 > Within a single session the protocol assumes the `TAG_HELLO` reply arrives before any `TAG_MSG` sent under the resulting session key. Transports that can reorder _across_ the hello/reply boundary (multi-path links, fan-out buses) will hang the handshake until the timeout fires. `TAG_MSG`-to-`TAG_MSG` reordering stays safe: every encrypted frame is independently authenticated and the protocol imposes no ordering on application messages.
 
@@ -310,7 +336,8 @@ class RemoteRPCError extends RPCError {}
 | `TIMEOUT`           | RPC call exceeded `timeout` ms                                                                                        |
 | `SESSION`           | `destroy()` called or session closed                                                                                  |
 | `CLIENT`            | Client-side guardrail tripped (e.g., `maxPending` exceeded)                                                           |
-| `CHANNEL`           | `channel.send` failed (request provably never left); also the default `abortPending` code. Original error on `.cause` |
+| `CHANNEL`           | `channel.send` failed (request provably never left). Original error on `.cause`                                       |
+| `ABORTED`           | Per-call `signal` fired, or `abortPending()`; outcome on the server UNKNOWN (like `TIMEOUT`). `signal.reason` on `.cause` |
 | `HANDSHAKE`         | Handshake failed or timed out, auth payload malformed                                                                 |
 | `INPUT_VALIDATION`  | `.input(schema)` rejected the input                                                                                   |
 | `OUTPUT_VALIDATION` | `.output(schema)` rejected the handler output                                                                         |
@@ -318,7 +345,7 @@ class RemoteRPCError extends RPCError {}
 | `INTERNAL`          | Defensive: should not be reachable                                                                                    |
 | `MIDDLEWARE`        | Middleware misuse (`next()` called twice, bad `extra` arg)                                                            |
 
-`INPUT_VALIDATION`, `OUTPUT_VALIDATION`, `MIDDLEWARE`, and `NOT_FOUND` are raised **server-side**. The client never validates locally, so these always arrive wrapped as `RemoteRPCError` (the remote branch of the pattern below), never as a bare local `RPCError`. Only `TIMEOUT`, `SESSION`, `CLIENT`, and `HANDSHAKE` are genuinely client-local.
+`INPUT_VALIDATION`, `OUTPUT_VALIDATION`, `MIDDLEWARE`, and `NOT_FOUND` are raised **server-side**. The client never validates locally, so these always arrive wrapped as `RemoteRPCError` (the remote branch of the pattern below), never as a bare local `RPCError`. Only `TIMEOUT`, `SESSION`, `CLIENT`, `ABORTED`, and `HANDSHAKE` are genuinely client-local.
 
 Handlers may throw `RPCError(...)` with any code; those codes surface as `RemoteRPCError.code` on the client.
 

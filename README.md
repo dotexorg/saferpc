@@ -65,7 +65,7 @@ const { api, destroy: stopClient } = client<AppRouter>(clientChannel, { auth });
 const { message } = await api.greet({ name: "World" }); // input & output typed
 ```
 
-`client()` and `server()` are synchronous. No top-level `await`. The handshake runs lazily on the first procedure call. If the session drops, the failed call surfaces a typed error (`TIMEOUT` / `CHANNEL`) and the next call re-handshakes — the client never silently resends (that would double-execute non-idempotent handlers). A transport adapter can call `abortPending()` to fail in-flight calls instantly on channel death and keep the client usable.
+`client()` and `server()` are synchronous. No top-level `await`. The handshake runs lazily on the first procedure call. If the session drops, the failed call surfaces a typed error (`TIMEOUT` / `CHANNEL`) and the next call re-handshakes — the client never silently resends (that would double-execute non-idempotent handlers). Transport death alone doesn't touch the session: a reconnecting adapter (see `@dotex/saferpc/channels`) lets in-flight calls complete across a socket blip. Per-call `AbortSignal` (`api.thing(input, { signal })`) and `abortPending()` cancel waiting without tearing anything down.
 
 Because `rpc` carries `Context`, procedures can be authored in any file with a fully-typed `ctx`, and `server()` requires a `context()` that returns the type your procedures expect.
 

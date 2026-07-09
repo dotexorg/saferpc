@@ -8,7 +8,8 @@
     "./auth/client": "./src/auth/client.ts",
     "./auth/server": "./src/auth/server.ts",
     "./client": "./src/client.ts",
-    "./server": "./src/server.ts"
+    "./server": "./src/server.ts",
+    "./channels": "./src/channels/index.ts"
   },
   "imports": {
     "@msgpack/msgpack": "npm:@msgpack/msgpack@^3.1.3",

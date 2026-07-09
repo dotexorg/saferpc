@@ -3,6 +3,9 @@
  *   - createChannelPair        — in-memory two-way pair (synchronous)
  *   - createAsyncChannelPair   — same, but send() resolves on next tick
  *   - createMitmChannelPair    — middlebox you can stop/tamper/inject through
+ *   - createFaultChannelPair   — pair whose link can go down/up; while down
+ *                                both endpoints queue their sends (adapter
+ *                                lifecycle contract) and flush in order on up
  *   - portChannel              — wrap a worker_threads MessagePort
  *   - wsChannel                — wrap a `ws` WebSocket
  */
@@ -167,6 +170,84 @@ export function createMitmChannelPair(): {
   };
 
   return { a, b, mitm };
+}
+
+export interface FaultLink {
+  goDown: () => void;
+  goUp: () => void;
+  isUp: () => boolean;
+}
+
+/**
+ * In-memory pair whose link can be taken down and brought back. Models a
+ * transport adapter that follows the lifecycle contract (common.ts
+ * `Channel` jsdoc): while the link is down, `send` never throws — frames
+ * queue at the sender (they provably never left) and flush in order on
+ * `goUp()`. Frames delivered while up are synchronous, like
+ * `createChannelPair`.
+ */
+export function createFaultChannelPair(): {
+  a: Channel;
+  b: Channel;
+  link: FaultLink;
+} {
+  let aCb: ((data: Uint8Array) => void) | null = null;
+  let bCb: ((data: Uint8Array) => void) | null = null;
+  let up = true;
+  const fromA: Uint8Array[] = [];
+  const fromB: Uint8Array[] = [];
+
+  const a: Channel = {
+    send(data) {
+      if (!up) {
+        fromA.push(data.slice());
+        return;
+      }
+      if (bCb) bCb(data);
+    },
+    receive(cb) {
+      aCb = cb;
+      return () => {
+        if (aCb === cb) aCb = null;
+      };
+    },
+  };
+  const b: Channel = {
+    send(data) {
+      if (!up) {
+        fromB.push(data.slice());
+        return;
+      }
+      if (aCb) aCb(data);
+    },
+    receive(cb) {
+      bCb = cb;
+      return () => {
+        if (bCb === cb) bCb = null;
+      };
+    },
+  };
+
+  const link: FaultLink = {
+    goDown() {
+      up = false;
+    },
+    goUp() {
+      if (up) return;
+      up = true;
+      while (fromA.length > 0) {
+        const frame = fromA.shift() as Uint8Array;
+        if (bCb) bCb(frame);
+      }
+      while (fromB.length > 0) {
+        const frame = fromB.shift() as Uint8Array;
+        if (aCb) aCb(frame);
+      }
+    },
+    isUp: () => up,
+  };
+
+  return { a, b, link };
 }
 
 /** Wrap a worker_threads MessagePort. */

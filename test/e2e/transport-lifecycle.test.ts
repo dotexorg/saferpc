@@ -135,10 +135,10 @@ describe("transport lifecycle / retry semantics (F1 Option A)", () => {
   });
 });
 
-describe("transport lifecycle / abortPending (F3)", () => {
-  it("rejects in-flight calls with CHANNEL and keeps the client usable", async () => {
+describe("transport lifecycle / abortPending (F3, 0.7.0 semantics)", () => {
+  it("rejects in-flight calls with ABORTED and the session survives", async () => {
     const psk = randomBytes(32);
-    const { a, b } = createChannelPair();
+    const { a, b, mitm } = createMitmChannelPair();
     let execCount = 0;
     const router: Router = {
       slow: chain().handler(async () => {
@@ -156,10 +156,16 @@ describe("transport lifecycle / abortPending (F3)", () => {
       // Let the handshake + request go out.
       await new Promise((r) => setTimeout(r, 60));
       abortPending();
-      await expect(p1).rejects.toMatchObject({ code: "CHANNEL" });
+      await expect(p1).rejects.toMatchObject({ code: "ABORTED" });
 
-      // Client object is still usable — the next call lazily re-handshakes.
+      // The session SURVIVED: the next call succeeds without a second
+      // handshake (exactly one hello on the wire).
       expect(await api.slow({})).toBe("done");
+      const helloCount = mitm.state.captures.filter(
+        (c) => c.dir === "BtoA" && c.data[0] === 0x00,
+      ).length;
+      expect(helloCount).toBe(1);
+      expect(execCount).toBe(2);
     } finally {
       destroy();
       srv.destroy();

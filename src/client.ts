@@ -7,6 +7,14 @@
  * caller, who alone knows whether the procedure is idempotent. The reset
  * only ensures the NEXT call lazily re-handshakes. Concurrent calls
  * coordinate via epoch to avoid redundant resets.
+ *
+ * Transport death is NOT a session event: the session is bound to key
+ * material, not to a transport instance. Channel liveness (reconnect,
+ * queueing frames that never left) is the adapter's job — see the Channel
+ * jsdoc in common.ts and the shipped adapters in channels/. A call's
+ * outcome is decided by exactly two events: a reply that decrypts, or the
+ * call's own timeout. Per-call AbortSignal and abortPending() cancel
+ * waiting without touching the session.
  */
 
 import { randomBytes } from "@noble/ciphers/utils.js";
@@ -48,7 +56,7 @@ import {
 
 const PROOF_LEN = 32;
 const MAX_PENDING = 256;
-const DEFAULT_TIMEOUT = 10_000;
+const DEFAULT_TIMEOUT = 30_000;
 const MAX_KNOWN_PROCEDURES = 1024;
 
 // ─── Client types ─────────────────────────────────────────
@@ -66,6 +74,21 @@ export class RemoteRPCError extends RPCError {
 }
 
 /**
+ * Per-call options, fetch-style. Passed as the optional second argument of
+ * every generated method.
+ */
+export interface CallOptions {
+  /**
+   * Abort THIS call. Rejects the call with `RPCError("ABORTED")` (the
+   * signal's reason on `.cause`). Client-local: like a TIMEOUT, the outcome
+   * on the server is UNKNOWN — the request may still execute there. The
+   * session is never touched; a shared in-progress handshake continues for
+   * other callers.
+   */
+  signal?: AbortSignal;
+}
+
+/**
  * A procedure's call signature. The input argument is optional when it
  * isn't actually required to call the procedure — no `.input()` schema was
  * set (`TInput` is `unknown`) or the schema itself accepts `undefined`
@@ -73,10 +96,10 @@ export class RemoteRPCError extends RPCError {
  * Otherwise the argument is mandatory.
  */
 type ClientMethod<TInput, TOutput> = unknown extends TInput
-  ? (input?: TInput) => Promise<TOutput>
+  ? (input?: TInput, opts?: CallOptions) => Promise<TOutput>
   : undefined extends TInput
-    ? (input?: TInput) => Promise<TOutput>
-    : (input: TInput) => Promise<TOutput>;
+    ? (input?: TInput, opts?: CallOptions) => Promise<TOutput>
+    : (input: TInput, opts?: CallOptions) => Promise<TOutput>;
 
 /**
  * The caller-facing API for a router, inferred end-to-end. Each procedure
@@ -93,7 +116,7 @@ export type Client<T extends Router> = {
     unknown
   >
     ? ClientMethod<TInput, TOutput>
-    : (input?: unknown) => Promise<unknown>;
+    : (input?: unknown, opts?: CallOptions) => Promise<unknown>;
 };
 
 export interface ClientOptions {
@@ -102,7 +125,13 @@ export interface ClientOptions {
    * auth (`sign`/`verify`) MUST be configured.
    */
   auth: AuthOptions;
-  /** Per-RPC-call timeout. Default: 10000ms. */
+  /**
+   * Per-RPC-call timeout, client-wide. Default: 30000ms. Set it generously
+   * — it is the safety net that heals a dead session (a TIMEOUT resets and
+   * the next call re-handshakes). For a SHORTER budget on a single call,
+   * pass `{ signal: AbortSignal.timeout(ms) }` — that rejects with ABORTED
+   * and does not touch the session.
+   */
   timeout?: number;
   /** Max concurrent pending RPC calls. Default: 256. */
   maxPending?: number;
@@ -544,12 +573,58 @@ export function client<T extends Router>(
     }
   });
 
+  // ── Per-call abort ───────────────────────────────────────
+
+  function abortError(prop: string, reason: unknown): RPCError {
+    return new RPCError("ABORTED", "Call aborted: " + prop, undefined, {
+      cause: reason,
+    });
+  }
+
+  /**
+   * Await `p`, but reject early with ABORTED if the signal fires. The
+   * underlying promise is left running — a shared handshake must complete
+   * for its other awaiters (it already carries a noop catch, so a later
+   * rejection cannot surface as unhandled).
+   */
+  function raceAbort<T>(
+    p: Promise<T>,
+    signal: AbortSignal,
+    prop: string,
+  ): Promise<T> {
+    return new Promise<T>(function raceExec(resolve, reject) {
+      function onAbort(): void {
+        reject(abortError(prop, signal.reason));
+      }
+      signal.addEventListener("abort", onAbort, { once: true });
+      p.then(
+        function onOk(v: T) {
+          signal.removeEventListener("abort", onAbort);
+          resolve(v);
+        },
+        function onErr(e: unknown) {
+          signal.removeEventListener("abort", onAbort);
+          reject(e);
+        },
+      );
+    });
+  }
+
   // ── Send a single RPC request, returns promise for the response ──
 
-  function sendRequest(prop: string, input: unknown): Promise<unknown> {
+  function sendRequest(
+    prop: string,
+    input: unknown,
+    signal?: AbortSignal,
+  ): Promise<unknown> {
     const enc = encrypt;
     if (state === "closed" || enc === null) {
       return Promise.reject(new RPCError("SESSION", "Session destroyed"));
+    }
+    if (signal !== undefined && signal.aborted) {
+      // Covers the microtask gap between the handshake race resolving and
+      // this call — a listener added to an already-aborted signal never fires.
+      return Promise.reject(abortError(prop, signal.reason));
     }
     if (pending.size >= maxPending) {
       return Promise.reject(
@@ -575,12 +650,49 @@ export function client<T extends Router>(
     const encrypted = enc(req);
 
     return new Promise(function rpcExec(res, rej) {
+      // Listener hygiene: every settle path (resolve, reject, timeout,
+      // abort, send error) detaches the abort listener, or long-lived
+      // signals reused across calls would accumulate closures.
+      let onAbort: (() => void) | null = null;
+      function settle(): void {
+        if (onAbort !== null && signal !== undefined) {
+          signal.removeEventListener("abort", onAbort);
+          onAbort = null;
+        }
+      }
+
       const timer = setTimeout(function onRpcTimeout() {
         pending.delete(id);
+        settle();
         rej(new RPCError("TIMEOUT", "Timed out: " + prop));
       }, timeout);
 
-      pending.set(id, { resolve: res, reject: rej, timer });
+      pending.set(id, {
+        resolve: function resolveSettled(v: unknown) {
+          settle();
+          res(v);
+        },
+        reject: function rejectSettled(e: unknown) {
+          settle();
+          rej(e);
+        },
+        timer,
+      });
+
+      if (signal !== undefined) {
+        onAbort = function onCallAbort() {
+          onAbort = null; // {once:true} already removed the listener
+          const entry = pending.get(id);
+          if (entry === undefined) return;
+          pending.delete(id);
+          clearTimeout(entry.timer);
+          // The request may have executed on the server — same UNKNOWN
+          // outcome as a timeout. A late reply finds no pending entry and
+          // is silently dropped. The session is not touched.
+          rej(abortError(prop, signal.reason));
+        };
+        signal.addEventListener("abort", onAbort, { once: true });
+      }
 
       // Give the send path a typed failure code. A raw adapter error (bare
       // Error / DOMException) would slip past the caller's documented
@@ -592,6 +704,7 @@ export function client<T extends Router>(
       function onSendError(err: unknown): void {
         pending.delete(id);
         clearTimeout(timer);
+        settle();
         rej(
           err instanceof RPCError
             ? err
@@ -622,12 +735,27 @@ export function client<T extends Router>(
       if (typeof prop !== "string") return undefined;
       if (prop === "then") return undefined;
 
-      return async function call(input: unknown): Promise<unknown> {
+      return async function call(
+        input: unknown,
+        callOpts?: CallOptions,
+      ): Promise<unknown> {
         if (state === "closed") {
           throw new RPCError("SESSION", "Session destroyed");
         }
 
-        await ensureHandshake();
+        const signal = callOpts !== undefined ? callOpts.signal : undefined;
+        if (signal !== undefined && signal.aborted) {
+          // Already aborted: nothing is sent, no handshake is triggered.
+          throw abortError(prop, signal.reason);
+        }
+
+        if (signal !== undefined) {
+          // Abort rejects THIS call only; the handshake itself is shared
+          // state and keeps running for other callers / the next call.
+          await raceAbort(ensureHandshake(), signal, prop);
+        } else {
+          await ensureHandshake();
+        }
 
         if (knownProcedures.size < MAX_KNOWN_PROCEDURES) {
           knownProcedures.add(prop);
@@ -637,7 +765,7 @@ export function client<T extends Router>(
         const sentEpoch = epoch;
 
         try {
-          return await sendRequest(prop, input);
+          return await sendRequest(prop, input, signal);
         } catch (err: unknown) {
           // No auto-retry. A TIMEOUT leaves the outcome UNKNOWN (the request
           // may have executed — auto-resending it is a silent double-execution
@@ -698,26 +826,26 @@ export function client<T extends Router>(
   }
 
   // ── abortPending ───────────────────────────────────────────
-  // Adapter-driven teardown: called from a transport `onclose` event when
-  // no `send` is in progress, so the adapter can hand channel-death to the
-  // client. Rejects every in-flight call (and any hello-waiter) immediately
-  // with a retryable code instead of letting them stack up to their
-  // timeouts, then returns the client to `idle` (NOT `closed`) so the next
-  // call lazily re-handshakes over the revived transport. The caller-visible
-  // client object never changes identity.
+  // Application-driven "stop waiting": the app knows further waiting is
+  // pointless (user logged out, tab hiding) and rejects every in-flight
+  // call (and any hello-waiter) immediately instead of letting them stack
+  // up to their timeouts. The SESSION SURVIVES: a live session's keys and
+  // `ready` state are untouched — transport death is not a session event
+  // (channel liveness is the adapter's job; a lost server session heals
+  // lazily via timeout → reset). Only an in-progress handshake attempt is
+  // failed, which zeros that attempt's ephemerals — attempt state, not a
+  // live session.
 
   function abortPending(err?: RPCError): void {
     if (state === "closed") return;
-    const e = err ?? new RPCError("CHANNEL", "Channel down");
+    const e = err ?? new RPCError("ABORTED", "Pending calls aborted");
     // Reject all pending RPC calls (clears their timers).
     rejectPending(e);
     if (state === "handshaking") {
       // failHandshake rejects the shared handshake promise (so hello-waiters
-      // don't hang until handshakeTimeout), zeros keys, and goes idle.
+      // don't hang until handshakeTimeout), zeros the attempt's ephemerals,
+      // and goes idle. A `ready` session is left fully intact.
       failHandshake(e);
-    } else {
-      zeroKeys();
-      state = "idle";
     }
   }
 

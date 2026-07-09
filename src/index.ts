@@ -65,6 +65,7 @@ export {
   RemoteRPCError,
   type Client,
   type ClientOptions,
+  type CallOptions,
 } from "./client.ts";
 export {
   server,

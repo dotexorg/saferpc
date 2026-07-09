@@ -468,6 +468,18 @@ export type RouterContext<T extends Router> = UnionToIntersection<
   }[keyof T]
 >;
 
+/**
+ * The transport contract: move `Uint8Array` frames both ways.
+ *
+ * Adapter lifecycle contract (for transports that can die, e.g. sockets):
+ * reopen the transport immediately when it closes and hold it open as long
+ * as possible; while it is down, `send` must not throw — queue frames that
+ * provably never left (flush them in order on reconnect) and drop transport
+ * errors inside the adapter. Never resend a frame that was written to a
+ * live transport — its outcome is unknown. A call's fate is then decided by
+ * exactly two events: a reply that decrypts, or the call's own timeout.
+ * Shipped reference implementation: `@dotex/saferpc/channels` (`wsChannel`).
+ */
 export interface Channel {
   send(data: Uint8Array): void | Promise<void>;
   receive(cb: (data: Uint8Array) => void): (() => void) | void;
