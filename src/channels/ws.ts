@@ -6,15 +6,15 @@
  * - `wsChannel(source)` — reconnecting client adapter. OWNS the socket
  *   lifecycle: when the socket closes it immediately creates a new one and
  *   keeps retrying (exponential backoff, forever) until `close()`. While the
- *   transport is down, `send` never throws — frames that provably never left
- *   are queued and flushed in order on reconnect, transport errors are
- *   swallowed (surfaced only via the `onDown` observability hook). A frame
- *   written to a live socket is spent — it is NEVER resent, so nothing here
- *   violates the client's no-auto-retry semantics.
+ *   transport is down, `send` throws synchronously — the core outbound queue
+ *   owns retry; the adapter's job is availability, not delivery bookkeeping.
+ *   `onDown`/`onUp` hooks report transitions for observability only.
  *
  * - `socketChannel(ws)` — plain single-socket adapter, no lifecycle
  *   ownership. This is the server-side wrapper (a server cannot reconnect a
  *   client's socket) and the choice when the caller manages the socket.
+ *   `send` checks `readyState` and throws when not OPEN (browser CLOSED
+ *   silently drops — that silent drop is the trap this check closes).
  */
 
 import type { Channel } from "../common.ts";
@@ -36,13 +36,6 @@ export interface WebSocketLike {
 }
 
 export interface WsChannelOptions {
-  /**
-   * Max frames buffered while the socket is down. Default 256 (matches the
-   * client's default `maxPending`). On overflow the OLDEST frame is dropped
-   * silently — the affected call times out and the session heals lazily;
-   * keeping the newest frames means a fresh hello beats a stale request.
-   */
-  maxQueue?: number;
   /**
    * Reconnect backoff. The first retry is immediate; subsequent retries are
    * exponential from `backoffMin` (default 250 ms) to `backoffMax`
@@ -78,10 +71,8 @@ export function wsChannel(
   source: string | (() => WebSocketLike),
   opts: WsChannelOptions = {},
 ): Channel & { close: () => void } {
-  const maxQueue = opts.maxQueue !== undefined ? opts.maxQueue : 256;
   const backoffMin = opts.backoffMin !== undefined ? opts.backoffMin : 250;
   const backoffMax = opts.backoffMax !== undefined ? opts.backoffMax : 5000;
-  if (maxQueue < 1) throw new TypeError("wsChannel: maxQueue must be ≥ 1");
 
   const factory: () => WebSocketLike =
     typeof source === "function"
@@ -99,10 +90,9 @@ export function wsChannel(
         };
 
   const callbacks = new Set<(data: Uint8Array) => void>();
-  const queue: Uint8Array[] = [];
   let sock: WebSocketLike | null = null;
   let closed = false;
-  /** True between a completed flush (socket usable) and the next down. */
+  /** True after onOpen (socket usable) until the next down event. */
   let up = false;
   /** Consecutive failed attempts since the socket was last open. */
   let attempts = 0;
@@ -157,20 +147,6 @@ export function wsChannel(
     function onOpen(): void {
       if (closed || s !== sock) return;
       attempts = 0;
-      // Flush frames that provably never left, in order. A throw here means
-      // the socket died mid-flush; the frame is spent (unknown outcome — do
-      // not requeue), the remaining queue survives for the next reconnect,
-      // and the close event will schedule it. In that case the channel never
-      // went usably up — do NOT fire onUp (and onClose, seeing up === false,
-      // will not fire onDown), so consumers see no spurious up/down pair.
-      while (queue.length > 0) {
-        const frame = queue.shift() as Uint8Array;
-        try {
-          s.send(frame);
-        } catch {
-          return;
-        }
-      }
       up = true;
       if (opts.onUp !== undefined) {
         try {
@@ -214,18 +190,10 @@ export function wsChannel(
         throw new Error("wsChannel: channel closed");
       }
       const s = sock;
-      // `up` (set after flush) gates ordering: a socket can report OPEN
-      // before our open handler flushed the queue — sending directly then
-      // would reorder frames past the queued ones. `readyState` gates the
-      // browser trap: send() on a CLOSED socket silently drops.
-      if (s !== null && up && s.readyState === WS_OPEN) {
-        s.send(data); // a sync throw here is a real send failure — propagate
-        return;
+      if (s === null || !up || s.readyState !== WS_OPEN) {
+        throw new Error("wsChannel: no open socket");
       }
-      // Transport down: never throw. Queue the frame (it provably never
-      // left); drop the oldest on overflow.
-      if (queue.length >= maxQueue) queue.shift();
-      queue.push(data);
+      s.send(data); // a sync throw here is a real send failure — propagate
     },
     receive(cb: (data: Uint8Array) => void): () => void {
       callbacks.add(cb);
@@ -240,7 +208,6 @@ export function wsChannel(
         clearTimeout(retryTimer);
         retryTimer = null;
       }
-      queue.length = 0;
       callbacks.clear();
       const s = sock;
       sock = null;
@@ -257,11 +224,14 @@ export function wsChannel(
 }
 
 /**
- * Plain single-socket channel. No reconnect, no queue — the caller owns the
- * socket lifecycle. Use on the server side
+ * Plain single-socket channel. No reconnect — the caller owns the socket
+ * lifecycle. Use on the server side
  * (`wss.on("connection", sock => server(router, socketChannel(sock), ...))`,
  * with `sock.on("close", destroy)`) or anywhere the socket is managed
  * externally.
+ *
+ * `send` checks `readyState` and throws when not OPEN (browser CLOSED silently
+ * drops — that silent drop is the trap this check closes).
  */
 export function socketChannel(ws: WebSocketLike): Channel {
   try {
@@ -271,6 +241,9 @@ export function socketChannel(ws: WebSocketLike): Channel {
   }
   return {
     send(data: Uint8Array): void {
+      if (ws.readyState !== WS_OPEN) {
+        throw new Error("socketChannel: socket not open");
+      }
       ws.send(data);
     },
     receive(cb: (data: Uint8Array) => void): () => void {

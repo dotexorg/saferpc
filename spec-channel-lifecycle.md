@@ -1,100 +1,90 @@
-# Spec: channel lifecycle — session survives transport death (saferpc client + channels module)
+# Spec: channel lifecycle v2 — session survives transport death, core owns the send queue
 
-Status: ready to implement. Target: `src/client.ts`, new `src/channels/`,
-`package.json` exports, four spec docs, two test files. Ships within the
-unreleased 0.7.0 (no published version ever carried the old `abortPending`
-semantics, so no consumer-facing break).
+Status: ready to implement. Supersedes v1 (2026-07-09) after CTO review of
+PR #2 (2026-07-10). Target: `src/client.ts`, `src/common.ts`,
+`src/channels/`, spec docs, tests. Ships within the unreleased 0.7.0.
 
-Decisions locked with CTO 2026-07-09:
+Decisions locked with CTO 2026-07-10:
 
-1. **Reconnect policy: lazy on the client core.** The client does not react to
-   channel recovery at all. Pending calls keep waiting for their reply under
-   their own timers; if the server kept the session the replies arrive over the
-   revived socket, if not the call times out and the existing
-   `timeout → reset → lazy re-handshake` path heals. No eager re-handshake on
-   reconnect — while `handshaking` the client drops TAG_MSG, which would kill
-   the very pending calls the kept session exists to serve.
-2. **`abortPending` stays, in simple form** (rejects pending, no longer zeros
-   the session), **plus** a per-call `AbortSignal`, fetch-style, as an optional
-   argument on every generated method.
-3. **The `Channel` interface does not change.** `{ send, receive }` as today.
-   The lifecycle policy is an *adapter contract*, stated in docs and shipped as
-   code in a new channels module: reopen your transport immediately when it
-   closes, hold it open as long as possible; while down, `send` must not throw —
-   queue frames that provably never left and drop any transport error inside
-   the adapter.
+1. **`abortPending` is removed entirely** (v1 kept it in simple form). The
+   per-call `AbortSignal` covers the use case: an app that wants "reject all
+   in-flight calls" holds one `AbortController` and passes its signal to every
+   call — `ctl.abort()` is `abortPending()` with none of the API surface. The
+   method was historically the transport hook (`ws.onclose → abortPending`),
+   which is exactly the antipattern this work kills; removing it removes the
+   footgun physically.
+2. **New error class `RPCAbortedError extends RPCError`** — the caller must
+   know deterministically whether the request reached the wire.
+   `RPCAbortedError` = "the request was handed to a live transport; outcome
+   UNKNOWN — it may have executed, check before retrying". Plain `RPCError`
+   (local) = "the request provably never left this process; retry freely".
+   `RemoteRPCError` (unchanged) = "the handler ran and returned an error".
+   Details and the DX rationale in §5.
+3. **Channels own no queue — queueing inside a transport adapter is an
+   antipattern.** The `Channel` contract flips: `send` MUST throw (or reject,
+   for async adapters) when it cannot hand the frame to a live transport
+   right now. The client core owns the outbound queue and retries unsent
+   frames until a new **`sendTimeout`** (default 10 000 ms) expires. The
+   channel's only jobs: move frames, and try to stay available
+   (auto-reconnect stays in `wsChannel`).
+4. **Unchanged from v1:** lazy reconnect policy (the client core does not
+   react to channel recovery; pending calls wait under their own timers, a
+   lost server session heals via `timeout → reset → lazy re-handshake`);
+   the `Channel` interface shape `{ send, receive }`; the two-lever timeout
+   model (global `timeout` 30 s + per-call `AbortSignal.timeout(ms)`); no
+   auto-retry of frames that reached the wire (F1).
 
-This document is self-contained.
+This document is self-contained; v1 content still valid is restated.
 
 ---
 
 ## 1. The problem in one paragraph
 
-Today channel death is handled by tearing the session down. The documented WS
-wiring is `ws.onclose → abortPending()`, and `abortPending` rejects every
-in-flight call **and zeros the session keys** (`src/client.ts`, `abortPending`
-→ `zeroKeys(); state = "idle"`). That is wrong twice. First, it burns a session
-that may still be perfectly valid on the server (the Enclave SessionDO case:
-the DO and its session outlive any single socket) — a transient socket blip
-costs a full re-handshake and rejects calls that could have completed. Second,
-it makes the adapter responsible for calling into the client at the right
-moment, which is exactly the API awkwardness the CTO flagged ("abortPending
-неприятно юзать"). Meanwhile a `send` into a dead channel is adapter roulette:
-browser `WebSocket.send()` on CLOSED silently drops (review F4), so the call
-burns its whole timeout for a frame that never left, even if the socket comes
-back 50 ms later. The fix: the channel owns its own liveness (reconnect
-eagerly, queue never-left frames, swallow errors while down), and the client
-core stops treating transport death as session death.
+Two gaps remain after the v1 implementation (543d4f9). First, a caller
+catching an error today cannot tell whether the request reached the server:
+`TIMEOUT` is documented as unknown-outcome, `CHANNEL` as never-left, but the
+send/queue split lived inside the adapter — a frame sitting in `wsChannel`'s
+private queue when the call timed out was reported `TIMEOUT` (unknown) even
+though it provably never left. The retry decision — the single most important
+thing an RPC error must support — required reading docs and trusting adapter
+internals. Second, the adapter-owned queue duplicates state the core already
+has (the pending map bounds it, the call timers race it) and puts the
+"never-left" bookkeeping in the one place the core cannot see. Moving the
+queue into the core makes the sent/unsent boundary a fact the core *knows*
+rather than infers, and shrinks the adapter contract to one line: send or
+throw.
 
 ## 2. The property we want
 
-> A Safe RPC session is bound to key material, not to a transport instance. The
-> death of a socket must not, by itself, destroy the session or reject calls.
-> A call's outcome is decided by exactly two events: a reply that decrypts, or
-> the call's own timeout.
+> A Safe RPC session is bound to key material, not to a transport instance.
+> A call's outcome is decided by exactly two events: a reply that decrypts,
+> or a terminal local event (timeout, abort, destroy). Every rejection states
+> on which side of the wire the request died: `RPCAbortedError` = it left,
+> outcome unknown; plain local `RPCError` = it never left, retry freely.
 
-Corollary for the send path: a frame that **provably never left** the client
-(submitted while the transport was down) may be flushed after reconnect — this
-is the `CHANNEL`-class "never left, safe to retry" case from the 0.7.0
-taxonomy, executed inside the adapter. A frame that was written to a live
-socket that then died has UNKNOWN outcome and is **never** resent by anyone.
-This keeps the no-auto-retry invariant (F1) intact: nothing above the adapter
-retries, and the adapter only ever "retries" frames that never hit the wire.
+The **sent boundary** is defined as: `channel.send(frame)` returned without
+throwing (sync adapters) or its promise resolved (async adapters). Before
+that point the core holds the only copy of the frame and can discard it with
+certainty; after that point the frame's fate is unknowable and it is never
+resent by any layer.
 
-Payoff condition, stated honestly: keeping the session across a reconnect pays
-off only when the server-side session outlives the socket (long-lived server
-binding, e.g. Enclave's SessionDO, or any wiring where `server()` is not
-per-connection). With the common `wss.on("connection", ws => server(...))`
-wiring the kept client session is dead weight after a reconnect — the first
-call times out, resets, and heals. That is the same cost as today's behavior,
-minus the instant rejection. The design is strictly better or equal in every
-wiring.
+## 3. Design part I — the channel contract (revised) and `src/channels/`
 
-## 3. Design part I — channels module (`src/channels/`)
+### 3.1 Contract (goes into `common.ts` `Channel` jsdoc + integrations.md)
 
-New source directory, exported as a subpath so the core stays dependency-free
-and tree-shakeable:
+- `send(frame)` MUST throw synchronously (or reject, if it returns a
+  promise) when it cannot hand the frame to a live transport **now**. No
+  internal queues, no buffering, no retry — a channel that accepts a frame it
+  cannot deliver lies to the core about the sent boundary.
+- A channel SHOULD try to stay available: reopen its transport eagerly when
+  it dies, hold it open as long as possible. Availability is the channel's
+  job; delivery bookkeeping is the core's.
+- `receive(cb)` unchanged: register a frame callback, return unsubscribe.
 
-```jsonc
-// package.json exports (add)
-"./channels": {
-  "types": "./esm/channels/index.d.ts",
-  "import": "./esm/channels/index.js",
-  "require": "./cjs/channels/index.js"
-}
-```
-
-Files: `src/channels/index.ts` (re-exports), `src/channels/ws.ts`. The adapters
-currently living as copy-paste snippets in `spec/integrations.md` migrate here
-over time; WebSocket ships first because it is the one with the lifecycle trap.
-
-### 3.1 `wsChannel(source, opts?)` — reconnecting client adapter
+### 3.2 `wsChannel(source, opts?)` — reconnecting client adapter (revised)
 
 ```ts
 export interface WsChannelOptions {
-  /** Max frames buffered while the socket is down. Default 256
-   *  (matches the client's default maxPending). Overflow: drop-oldest. */
-  maxQueue?: number;
   /** Reconnect backoff. First retry is immediate; then exponential
    *  from `backoffMin` (default 250) to `backoffMax` (default 5000) ms,
    *  full jitter. Retries forever until close(). */
@@ -111,243 +101,284 @@ export function wsChannel(
 ): Channel & { close: () => void };
 ```
 
-- `source` as a string uses `globalThis.WebSocket` (browser, Node ≥ 22); a
-  factory covers the `ws` package and custom construction. The adapter sets
-  `binaryType = "arraybuffer"` on every socket it creates.
-- **Owns the socket lifecycle.** On `close` or `error` of the current socket:
-  notify `onDown`, immediately create a new socket via the factory, and keep
-  doing so with backoff until it opens or `close()` is called. Eager, not lazy —
-  the channel does not wait for the next `send` to notice death ("сразу
-  поднимать и держать открытым как можно дольше").
-- **`send` never throws while down.** If `readyState !== OPEN` (covers the F4
-  browser silent-drop trap: CONNECTING throws, CLOSED drops — we do neither),
-  the frame goes into the queue. On `open`, the queue flushes in order, then
-  `onUp` fires. Queue overflow drops the **oldest** frame silently — the
-  affected call times out and heals; dropping oldest keeps the most recent
-  frames (a fresh hello beats a stale encrypted request). Only frames that were
-  queued (never left) are ever flushed; a frame passed to `ws.send` on an OPEN
-  socket is spent regardless of what happens to that socket afterwards.
-- **Errors while down are dropped inside the adapter** (per CTO: "когда канал
-  закрыт любую ошибку дропать на канал"), surfaced only via `onDown` for
-  logging. A synchronous `ws.send` throw on an OPEN socket still propagates —
-  that is a real send failure, the client wraps it as `CHANNEL` and the
-  existing reset path applies.
-- `receive(cb)` registers into a callback set that survives socket
-  replacement; the adapter re-attaches its single message handler to each new
-  socket. The returned unsubscribe removes only `cb`.
-- `close()`: stop the reconnect loop, close the current socket, drop the
-  queue. After `close()`, `send` throws synchronously (client wraps as
-  `CHANNEL`). This is the hook for app shutdown, wired next to `destroy()`.
+Diff against the v1 implementation:
 
-### 3.2 `socketChannel(ws)` — plain single-socket adapter
+- **The queue is deleted** (`maxQueue` option gone, drop-oldest policy gone,
+  flush-on-open gone). `send` while `readyState !== OPEN` — or after
+  `close()` — **throws synchronously**. This also covers the F4 browser trap
+  (CLOSED silently drops, CONNECTING throws): the adapter checks readyState
+  itself and throws one typed error for every not-OPEN state.
+- Everything else stays: owns the socket lifecycle, eager reconnect with
+  backoff until `close()`, `binaryType = "arraybuffer"`, `receive` callbacks
+  survive socket replacement, `onDown`/`onUp` observability, `close()` stops
+  the loop and closes the socket.
 
-The old `wsChannel(ws)` from integrations.md, renamed. No lifecycle ownership:
-one socket, no reconnect, no queue. This is what the **server** side uses in
-`wss.on("connection", ...)` — a server cannot reconnect a client's socket, so
-its channel is one-shot by nature and `ws.on("close", destroy)` stays correct.
-No server-core changes anywhere in this spec.
+### 3.3 `socketChannel(ws)` — plain single-socket adapter (revised)
 
-### 3.3 Interaction with the handshake
+One socket, no reconnect (server side / caller-managed sockets). Change:
+`send` must check `readyState` and throw when not OPEN instead of delegating
+to `ws.send`'s platform-dependent behavior. `ws.on("close", ...)` server
+wiring stays as is — the server core is untouched.
 
-A hello sent while the socket is down is queued like any frame. If the socket
-opens within `handshakeTimeout` (default 5000 ms) the handshake proceeds
-normally. If not, the client's hs timer fails the attempt (state → `idle`) and
-the stale hello may still flush later — that is safe end to end: the server
-processes it as a normal hello, and under make-before-break
-(`spec-make-before-break.md`) it installs a *candidate* that expires without
-touching any live session; the server's reply finds the client not in
-`handshaking` and is dropped by the existing gate (`client.ts`,
-`tag === TAG_HELLO && state === "handshaking"`). No new residual. (Queued-frame
-TTL considered and rejected — adds a clock to the adapter for a case both state
-machines already absorb.)
+### 3.4 Handshake frames
 
-## 4. Design part II — `abortPending` keeps the session
+The hello goes through the same core outbound queue (§4). If the channel is
+down, the hello is retried like any frame; the attempt is bounded by
+`handshakeTimeout` (5 s), which fires first and **removes the queued hello**.
+This deletes v1's accepted residual (a stale hello flushing after handshake
+timeout) — the core owns the queue, so it can revoke frames; an adapter
+queue couldn't.
 
-New semantics (`src/client.ts`):
+## 4. Design part II — core outbound queue + `sendTimeout`
+
+New `ClientOptions` field:
 
 ```ts
-function abortPending(err?: RPCError): void {
-  if (state === "closed") return;
-  const e = err ?? new RPCError("ABORTED", "Pending calls aborted");
-  rejectPending(e);                 // reject all in-flight calls, clear timers
-  if (state === "handshaking") {
-    failHandshake(e);               // hello-waiters reject; attempt ephemerals
-                                    // zeroed; state → idle. Unchanged.
+/** How long a frame may wait for a live channel before the call fails
+ *  with a definite "never sent" error. Default 10_000 ms. */
+sendTimeout?: number;
+```
+
+Send path in `sendRequest` (and the hello path in `ensureHandshake`):
+
+1. Try `channel.send(encrypted)` immediately. Success (no throw / resolved
+   promise) → the call is **sent**: it waits for reply-or-timeout exactly as
+   today.
+2. On sync throw or async rejection → the frame enters the **outbound
+   queue** with its call context. The call's global timer keeps running.
+3. A retry tick (fixed 250 ms interval, running only while the queue is
+   non-empty) attempts queued frames **in order**; first throw stops the
+   tick's pass (head-of-line: if the channel is down for one frame it is
+   down for all). A frame that sends transitions its call to *sent*.
+4. Terminal events on a **still-queued** frame remove it from the queue and
+   reject the call with a **plain** `RPCError` — the frame provably never
+   left:
+   - `sendTimeout` expiry (per-frame, counted from enqueue) → code
+     `CHANNEL`, message "not sent within sendTimeout".
+   - global `timeout` fires first (only possible when `timeout` is
+     configured below `sendTimeout`) → code `TIMEOUT`, plain class.
+   - per-call signal abort → code `ABORTED`, plain class.
+   - `destroy()` → code `SESSION`, plain class.
+   - session reset (epoch bump, §6) → code `CHANNEL`, plain class — the
+     frame is encrypted under zeroed keys and can never succeed.
+5. Terminal events on a **sent** call reject with `RPCAbortedError` (§5).
+
+Bounding: the queue needs no own limit — `maxPending` (256) already bounds
+in-flight calls, and at most one hello can be queued per handshake attempt.
+
+Defaults sanity: `sendTimeout` (10 s) < `timeout` (30 s), so with default
+config an unsent frame always fails via the definite `CHANNEL` path before
+the global timer can fire.
+
+The queue holds encrypted frames (encryption happens at call time, as
+today); the epoch captured at call time (`sentEpoch`) identifies frames
+staled by a reset.
+
+## 5. Design part III — error taxonomy: `RPCAbortedError`
+
+### 5.1 Shape
+
+```ts
+// common.ts
+export class RPCAbortedError extends RPCError {}
+```
+
+No new fields. The class carries the one bit that decides retry safety; the
+existing `code` string keeps naming the trigger. Constructor signature
+identical to `RPCError` (code, message, data?, options?).
+
+### 5.2 The full local-error table
+
+| class | code | trigger | wire status |
+|---|---|---|---|
+| `RPCAbortedError` | `TIMEOUT` | global timeout, frame was sent | UNKNOWN — check, then retry |
+| `RPCAbortedError` | `ABORTED` | signal fired, frame was sent | UNKNOWN — check, then retry |
+| `RPCAbortedError` | `SESSION` | `destroy()`, frame was sent | UNKNOWN — check, then retry |
+| `RPCError` | `CHANNEL` | sendTimeout expired / channel closed / reset staled a queued frame | never left — retry freely |
+| `RPCError` | `TIMEOUT` | global timeout, frame still queued | never left — retry freely |
+| `RPCError` | `ABORTED` | signal fired before send (incl. during handshake wait, pre-aborted signal) | never left — retry freely |
+| `RPCError` | `SESSION` | `destroy()` before send / call on closed client | never left |
+| `RPCError` | `CLIENT` / `HANDSHAKE` | guardrails / handshake failure | never left |
+| `RemoteRPCError` | server-defined | handler ran and threw | executed |
+
+Invariant, stated once in api.md and enforced by tests: **class = which side
+of the wire the request died on; code = what killed it.** The same code can
+appear in both classes (`TIMEOUT`, `ABORTED`, `SESSION`) — that is by
+design, the trigger and the retry-safety are orthogonal axes.
+
+Caller-facing catch block, the whole point of the feature:
+
+```ts
+try {
+  await api.transfer(input, { signal });
+} catch (e) {
+  if (e instanceof RemoteRPCError) {
+    // executed, server said no
+  } else if (e instanceof RPCAbortedError) {
+    // may have executed — reconcile state before retrying
+  } else {
+    // never reached the server — safe to resend as-is
   }
-  // state === "ready": session keys, encrypt/decrypt, state — ALL untouched.
 }
 ```
 
-Diff against 0.7.0: the `else { zeroKeys(); state = "idle"; }` branch is
-deleted, and the default error code changes `CHANNEL → ABORTED` (the method's
-role changed from "adapter reports transport death" to "application declares
-waiting pointless" — e.g. user logged out, tab hiding). Failing an in-progress
-handshake still zeros that attempt's ephemerals via `failHandshake` — those are
-attempt state, not a live session.
+### 5.3 DX rationale (variants considered, per review ask)
 
-The adapter-driven use disappears from the docs: a `wsChannel` user wires
-nothing on `onclose`. The method remains for the app itself.
+- **Code-only (`code === "ABORTED"`), no subclass** — rejected: no
+  `instanceof` narrowing, and it conflates trigger with retry-safety
+  (timeout-after-send and timeout-before-send would need distinct invented
+  codes; stringly-typed checks spread through consumer code).
+- **Boolean field on `RPCError` (`err.sent`)** — rejected: carries the bit
+  but is invisible at the catch site, not discoverable from types, easy to
+  ignore; a flag does not force the three-way decision the way the class
+  hierarchy does.
+- **Subclass with a dedicated `reason` field and a single fixed code** —
+  rejected: `reason` duplicates the existing `code` machinery; two parallel
+  trigger vocabularies is worse than one.
+- **Chosen: bare subclass, codes preserved across the boundary.** One
+  `instanceof` = the retry decision with type narrowing; `code`/`message`/
+  `cause` = diagnostics, unchanged semantics; zero new fields; symmetric
+  codes make logs readable ("ABORTED before send" vs "ABORTED after send" is
+  the class name in the stack trace).
 
-## 5. Design part III — per-call `AbortSignal`
+`RemoteRPCError extends RPCError` already exists; `RPCAbortedError` is a
+parallel branch. `instanceof RPCError` still catches everything — existing
+consumer code keeps working.
 
-Fetch-style optional argument on every generated method:
+## 6. Auto-reset predicate (revised)
 
-```ts
-export interface CallOptions {
-  signal?: AbortSignal;
-}
+Today: reset on `code === "TIMEOUT" || code === "CHANNEL"` while `ready`.
+New predicate: **reset only on `RPCAbortedError` with code `TIMEOUT`** —
+"the request went out and the server never answered" is the one signal that
+the session may be desynced (server restarted, session dropped: the reply
+can't come). Everything else must NOT reset:
 
-// ClientMethod gains a second optional parameter in all three branches:
-type ClientMethod<TInput, TOutput> = unknown extends TInput
-  ? (input?: TInput, opts?: CallOptions) => Promise<TOutput>
-  : undefined extends TInput
-    ? (input?: TInput, opts?: CallOptions) => Promise<TOutput>
-    : (input: TInput, opts?: CallOptions) => Promise<TOutput>;
-```
+- plain `CHANNEL` (never left) — the transport was down; that is not a
+  session event, the keys are fine. Note this loses nothing: the old
+  CHANNEL-reset could only heal if a re-handshake could send, and if send
+  throws for 10 s the hello can't leave either; the first *sent* call that
+  times out still resets. The wedge case in the current comment (restarted
+  server silently dropping TAG_MSG over a sync transport) sends fine and
+  fails by reply-timeout → still resets.
+- `ABORTED` (either class) — caller-local decision, existing rule.
+- `SESSION`/`CLIENT`/`HANDSHAKE`/`RemoteRPCError` — existing rule.
 
-Semantics (all rejections use
-`new RPCError("ABORTED", "Call aborted: " + prop, undefined, { cause: signal.reason })`):
+`reset()` itself gains one duty: reject **queued unsent** frames plain
+`CHANNEL` (§4.4) — they are ciphertext under zeroed keys. Sent-pending calls
+stay untouched, exactly as today (their replies can't decrypt post-reset;
+they fail by reply-timeout → `RPCAbortedError("TIMEOUT")`, which is the
+correct classification — they did leave).
 
-- **Already aborted** at call time → reject immediately; nothing is sent, no
-  handshake is triggered.
-- **Abort while awaiting the shared handshake** → reject *this call*; the
-  handshake itself continues (it is shared with other callers and with the next
-  call). Implementation: race the `ensureHandshake()` promise against an
-  abort promise; on abort, detach and reject.
-- **Abort while pending** → delete the pending entry, `clearTimeout`, reject.
-  A reply arriving later finds no entry and is silently dropped (existing
-  behavior for unknown ids).
-- **Session is never touched.** `ABORTED` must not trigger the auto-reset — the
-  proxy's reset predicate already whitelists only `TIMEOUT`/`CHANNEL`, so no
-  change needed there, but add the regression test (§9).
-- **Outcome is UNKNOWN**, same as `TIMEOUT`: abort is client-local; the request
-  may have executed on the server. Document next to the timeout caveat in
-  api.md — abort does not cancel server-side execution.
-- Listener hygiene: `signal.addEventListener("abort", h, { once: true })` and
-  remove it on every settle path (resolve, reject, timeout), or the pending map
-  leaks closures on long-lived signals reused across calls.
+`destroy()` splits the pending map by the sent flag: sent →
+`RPCAbortedError("SESSION", ...)`, queued → plain `RPCError("SESSION", ...)`.
+Hello-waiters were never sent as calls → plain.
 
-Taxonomy addition: `ABORTED` = client-local, "caller gave up on purpose";
-retry-safety identical to `TIMEOUT` (unknown outcome). It joins `TIMEOUT`,
-`SESSION`, `CLIENT`, `HANDSHAKE` as a genuinely client-local code.
+## 7. What deliberately does NOT change
 
-## 6. What deliberately does NOT change
-
-- **`Channel` interface** — `{ send, receive }`, untouched. The lifecycle
-  contract is prose in `common.ts` jsdoc + integrations.md, and code in
-  `src/channels/`.
-- **Server core** — nothing. It gains `socketChannel` for convenience only.
-- **Auto-reset on `TIMEOUT`/`CHANNEL` while ready** — stays exactly as in
-  0.7.0. It is the heal path for the server-lost-session case and for dumb
-  adapters; with a reconnecting adapter `CHANNEL` simply fires rarely.
-- **No auto-retry (F1)** — stays. The only "retry" anywhere is the adapter
-  flushing frames that provably never left.
+- **`Channel` interface shape** — `{ send, receive }`. Only the prose
+  contract flips (§3.1). Async `send` stays supported (the core already
+  handles a returned promise).
+- **Server core** — nothing.
+- **No auto-retry of anything past the sent boundary (F1)** — the core
+  retries only frames it still exclusively owns; a frame written to a live
+  transport is spent.
+- **Per-call `AbortSignal` semantics** (v1 §5) — all of it: reject-not-
+  cancel-handshake, listener hygiene, no reset on abort. Only the rejection
+  class now depends on the sent flag.
 - **Handshake/crypto/wire format** — untouched.
+- **Two-lever timeout model** — global `timeout` + `AbortSignal.timeout()`.
+  `sendTimeout` is not a third caller lever; it is the definite/unknown
+  boundary inside the machine.
 
-## 7. Spec/doc changes
+## 8. Spec/doc changes
 
-- **integrations.md**
-  - Top contract section: add the adapter lifecycle contract (reopen
-    immediately on close, hold open as long as possible; while down `send`
-    must not throw — queue never-left frames, drop transport errors inside the
-    adapter; never resend a frame written to a live socket).
-  - §WebSocket: replace the inline adapter + `onclose → abortPending` guidance
-    with `import { wsChannel, socketChannel } from "@dotex/saferpc/channels"`;
-    keep one inline snippet as "what the adapter does for you".
-  - Fix any remaining "Safe RPC will time out and retry" phrasing (F2.3
-    leftover check).
-- **api.md**
-  - `abortPending`: new semantics (§4) — rejects pending, session survives,
-    default code `ABORTED`.
-  - `CallOptions` + `signal` on every method; UNKNOWN-outcome caveat shared
-    with `TIMEOUT`.
-  - Error table: add `ABORTED`; update the `CHANNEL` row (no longer "also the
-    default abortPending code").
-  - Note under lifecycle: channel death no longer resets the session; what
-    decides a call is reply-or-timeout.
-- **protocol.md** §Failure handling: transport death is not a session event;
-  describe the two-event outcome rule (§2) and the never-left flush exception.
-- **assessment.md**: note the new residual — a stale queued hello flushing
-  after handshake timeout — and why it is absorbed (§3.3); note drop-oldest
-  overflow as an availability (not integrity) trade.
-- **common.ts** `Channel` jsdoc: state the adapter contract in two sentences.
+- **api.md**: delete `abortPending` (§ returns, § failure handling); add
+  `RPCAbortedError` + the §5.2 table + the catch-block idiom; add
+  `sendTimeout` to `ClientOptions`; error-code table gets a "class" column;
+  migration note "abortPending → shared AbortController".
+- **protocol.md**: delete the `### abortPending` section (it still describes
+  pre-0.7.0 zero-keys semantics — stale either way); §Failure handling:
+  state the sent-boundary rule (§2), the queue-in-core design, the revised
+  reset predicate; update the checklist line that still says abortPending
+  returns the client to `idle`.
+- **integrations.md**: adapter contract section replaced by §3.1 (send or
+  throw, no queues, stay available); `wsChannel`/`socketChannel` docs lose
+  the queue paragraphs.
+- **assessment.md**: remove the stale-hello residual (fixed by §3.4) and the
+  drop-oldest availability trade (queue no longer exists); add: head-of-line
+  blocking on the core retry tick is bounded by `sendTimeout`.
+- **common.ts**: `Channel` jsdoc = §3.1 contract in three sentences;
+  `RPCAbortedError` jsdoc = the invariant sentence from §5.2.
 
-## 8. Migration / breaking notes (vs pre-release 0.7.0 tree)
+## 9. Migration / breaking notes (vs 543d4f9, all pre-release)
 
-- `abortPending` no longer returns the client to `idle` from `ready` and no
-  longer zeros keys; default error code `CHANNEL → ABORTED`. Anyone who used it
-  as "reset the session" should call nothing (channel death heals lazily) or
-  `destroy()` (terminal).
-- `test/e2e/transport-lifecycle.test.ts` (F3 block) asserts the old semantics
-  — "rejects in-flight calls with CHANNEL and keeps the client usable" must be
-  updated: default code becomes `ABORTED`, and add the assertion that the next
-  call does **not** re-handshake (count TAG_HELLO frames — the session
-  survived). The F1 retry-semantics block stays green untouched.
+- `abortPending` removed from the client return type. Replacement: shared
+  `AbortController` passed per call.
+- `wsChannel` `maxQueue` option removed; `send` now throws while down.
+- New `ClientOptions.sendTimeout` (default 10 000 ms).
+- `CHANNEL` no longer triggers auto-reset; reply-timeout now surfaces as
+  `RPCAbortedError` (still `code === "TIMEOUT"`, so code-based consumer
+  checks keep working).
+- Tests asserting `abortPending` (transport-lifecycle F3 block,
+  channel-lifecycle §4 case, session-continuity usage) are rewritten against
+  the shared-controller idiom or dropped.
 
-## 9. Tests
+## 10. Tests
 
-`test/e2e/channel-lifecycle.test.ts` — in-memory channel with down/up fault
-injection (extend `test/helpers/channels.ts` with a `faultChannel` that can
-`goDown()`/`goUp()` and implements the §3 contract):
+`test/e2e/channel-lifecycle.test.ts` (rework; `faultChannel` helper now
+implements the §3.1 contract — `send` throws while down):
 
 1. **Call issued while channel is down completes after recovery, no
-   re-handshake.** Establish session, `goDown()`, issue call (frame queues),
-   `goUp()` within the call timeout. Assert: call resolves; total TAG_HELLO
-   count == 1.
-2. **Channel death with server session intact: pending call survives.** Issue
-   call, `goDown()` *after* send, deliver the reply after `goUp()`. Assert
-   resolution. (Reply-or-timeout rule, reply branch.)
-3. **Channel death with server session lost: lazy heal.** `goDown()`, replace
-   server with a fresh instance, `goUp()`. First call times out (`TIMEOUT`),
-   second call re-handshakes and succeeds; TAG_HELLO count == 2 total.
-4. **abortPending keeps the session.** Establish, issue two calls,
-   `abortPending()`. Both reject with `ABORTED`; a third call succeeds with
-   TAG_HELLO count still == 1.
-5. **AbortSignal**: (a) pre-aborted signal rejects immediately, nothing sent,
-   no handshake triggered on an idle client; (b) abort mid-flight rejects with
-   `ABORTED` + `cause`, the late reply is silently dropped, a subsequent call
-   succeeds without re-handshake (no reset on ABORTED — the regression for
-   §5's reset-predicate claim); (c) abort of one call during a shared handshake
-   rejects that call while a concurrent unaborted call completes the handshake
-   and resolves; (d) listener is removed after settle (assert via a stub
-   signal counting listeners, or `getEventListeners` under Node).
+   re-handshake.** Establish, `goDown()`, call (frame queues in core),
+   `goUp()` within `sendTimeout`. Resolves; TAG_HELLO count == 1.
+2. **Pending call survives a gap after send.** Send, `goDown()`, `goUp()`,
+   deliver reply. Resolves. (Reply-or-timeout, reply branch.)
+3. **Lazy heal on lost server session.** First call fails
+   `RPCAbortedError("TIMEOUT")`; second call re-handshakes and succeeds;
+   TAG_HELLO == 2.
+4. **sendTimeout: definite failure.** `goDown()`, call, stay down past
+   `sendTimeout` → plain `RPCError("CHANNEL")`, NOT RPCAbortedError; session
+   not reset (next call after `goUp()` succeeds, TAG_HELLO still 1).
+5. **Class split on abort.** (a) abort while frame queued → plain
+   `ABORTED`; (b) abort after send → `RPCAbortedError("ABORTED")` + cause;
+   late reply dropped; no reset either way.
+6. **Class split on destroy.** One call sent, one queued (channel down);
+   `destroy()` → sent rejects `RPCAbortedError("SESSION")`, queued rejects
+   plain `RPCError("SESSION")`.
+7. **Reset predicate regression.** Reply-timeout (sent) → next call
+   re-handshakes (reset happened). Plain CHANNEL (never sent) → next call
+   does NOT re-handshake.
+8. **Stale hello is revoked.** Channel down, first call queues a hello,
+   `handshakeTimeout` fires → attempt fails; `goUp()` → queue does not flush
+   the dead hello (assert no TAG_HELLO frame from the failed attempt reaches
+   the server); next call sends a fresh hello.
+9. **Shared-controller idiom replaces abortPending.** Two calls with one
+   controller's signal; `ctl.abort()` rejects both (`ABORTED`, class per
+   sent status); a third call succeeds without re-handshake.
 
-`test/e2e/ws-channel.test.ts` — real `ws` server:
+`test/e2e/ws-channel.test.ts` (rework):
 
-6. **Reconnect + flush.** Kill the client socket server-side; adapter
-   reconnects; a call issued during the gap resolves after reconnect (server
-   session survives because the same `server()` is re-bound — use a helper
-   that re-attaches the server to the new connection, mirroring the SessionDO
-   wiring). Assert `onDown`/`onUp` fired once each.
-7. **Queue overflow drops oldest.** `maxQueue: 2`, three sends while down;
-   after reconnect the receiving side saw the last two frames.
-8. **close() is terminal.** After `close()`, `send` throws; client surfaces
-   `CHANNEL`.
+10. **Contract: send throws while down and after close().** Kill socket
+    server-side; `send` throws until reconnect completes; after `close()`
+    throws forever.
+11. **Reconnect + core retry end-to-end.** Kill socket; call during the gap
+    resolves after the adapter reconnects (core tick re-sends); `onDown`/
+    `onUp` fired once each; TAG_HELLO == 1.
 
-Keep neutral naming/comments (no attack vocabulary), as with
-`session-continuity.test.ts`.
+Keep neutral naming/comments, as with `session-continuity.test.ts`.
 
-## 10. Open questions for the implementer
+## 11. Open questions for the implementer
 
-1. **Per-call `timeout` in the same `CallOptions` bag.** ~~Review F1.3 already
-   recommended a per-call timeout override as the mitigation for slow handlers
-   cascading resets; the options bag now exists, so the marginal cost is ~10
-   lines. Recommended: include.~~ **Resolved 2026-07-10: REJECTED by CTO.**
-   The two-lever model covers all cases: a *global* timeout
-   (`ClientOptions.timeout`, already configurable — the safety net that heals
-   a dead session; default raised 10 s → 30 s as part of this decision) plus
-   a *local* abort (`AbortSignal.timeout(ms)` via the existing `signal` —
-   shorter single-call budget, `ABORTED`, no reset). A per-call field could
-   only add "extend past the global timer", and the answer to that case is
-   "raise the global".
-2. Queue overflow policy is specced as drop-oldest (§3.1); if the CTO prefers
-   loud failure, the alternative is rejecting the *new* send with `CHANNEL`
-   ("never left" stays true). Drop-oldest is the current spec choice.
-3. `wsChannel` factory typing across browser `WebSocket` and the `ws` package:
-   type `source` against a minimal structural interface (readyState, send,
-   close, addEventListener, binaryType) rather than the DOM type, so `ws`
-   users don't need casts.
-4. Does anything else in the codebase or Enclave call `abortPending` expecting
-   the old zero-keys behavior? Grep consumers before release; the Enclave
-   WS-reconnect branch is the known caller and is the direct beneficiary —
-   coordinate the adapter swap there.
+1. Retry tick granularity: fixed 250 ms is specced (not configurable — avoid
+   knob creep; `sendTimeout` is the caller-visible contract). Revisit only
+   if a sync-transport test shows the 250 ms floor hurting.
+2. `RPCAbortedError` export surface: export from the package root alongside
+   `RPCError`/`RemoteRPCError` (it is part of the public catch idiom).
+3. Grep Enclave for `abortPending` consumers before merging the removal —
+   the WS-reconnect branch there was the known caller; it migrates to
+   `wsChannel` + shared controller.
+4. Async-send adapters: a rejection arriving *after* the sent boundary was
+   already counted (promise resolved) is impossible by contract; a rejection
+   is always pre-boundary and re-enqueues the frame at the head of the
+   queue. State this in the `Channel` jsdoc so adapter authors reject
+   rather than resolve-then-error.

@@ -179,12 +179,12 @@ export interface FaultLink {
 }
 
 /**
- * In-memory pair whose link can be taken down and brought back. Models a
- * transport adapter that follows the lifecycle contract (common.ts
- * `Channel` jsdoc): while the link is down, `send` never throws — frames
- * queue at the sender (they provably never left) and flush in order on
- * `goUp()`. Frames delivered while up are synchronous, like
- * `createChannelPair`.
+ * In-memory pair whose link can be taken down and brought back. Implements
+ * the v2 Channel contract (common.ts `Channel` jsdoc): while the link is
+ * down, `send` THROWS synchronously — no internal queuing, no buffering.
+ * The core outbound queue is the sole owner of undelivered frames. On
+ * `goUp()` the channel becomes available again; the core retry tick will
+ * re-send any queued frames within its next tick (≤ 250 ms).
  */
 export function createFaultChannelPair(): {
   a: Channel;
@@ -194,15 +194,10 @@ export function createFaultChannelPair(): {
   let aCb: ((data: Uint8Array) => void) | null = null;
   let bCb: ((data: Uint8Array) => void) | null = null;
   let up = true;
-  const fromA: Uint8Array[] = [];
-  const fromB: Uint8Array[] = [];
 
   const a: Channel = {
     send(data) {
-      if (!up) {
-        fromA.push(data.slice());
-        return;
-      }
+      if (!up) throw new Error("channel down");
       if (bCb) bCb(data);
     },
     receive(cb) {
@@ -214,10 +209,7 @@ export function createFaultChannelPair(): {
   };
   const b: Channel = {
     send(data) {
-      if (!up) {
-        fromB.push(data.slice());
-        return;
-      }
+      if (!up) throw new Error("channel down");
       if (aCb) aCb(data);
     },
     receive(cb) {
@@ -233,16 +225,7 @@ export function createFaultChannelPair(): {
       up = false;
     },
     goUp() {
-      if (up) return;
       up = true;
-      while (fromA.length > 0) {
-        const frame = fromA.shift() as Uint8Array;
-        if (bCb) bCb(frame);
-      }
-      while (fromB.length > 0) {
-        const frame = fromB.shift() as Uint8Array;
-        if (aCb) aCb(frame);
-      }
     },
     isUp: () => up,
   };

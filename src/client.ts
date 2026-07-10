@@ -9,12 +9,15 @@
  * coordinate via epoch to avoid redundant resets.
  *
  * Transport death is NOT a session event: the session is bound to key
- * material, not to a transport instance. Channel liveness (reconnect,
- * queueing frames that never left) is the adapter's job — see the Channel
- * jsdoc in common.ts and the shipped adapters in channels/. A call's
- * outcome is decided by exactly two events: a reply that decrypts, or the
- * call's own timeout. Per-call AbortSignal and abortPending() cancel
- * waiting without touching the session.
+ * material, not to a transport instance. Channel liveness (reconnect) is
+ * the adapter's job — see the Channel jsdoc in common.ts and the shipped
+ * adapters in channels/. Delivery bookkeeping is OURS: a frame whose
+ * `channel.send` throws enters the core outbound queue and is retried
+ * until `sendTimeout`; the sent boundary (send returned / promise
+ * resolved) decides every rejection's class — `RPCAbortedError` = the
+ * request left, outcome UNKNOWN; plain local `RPCError` = it provably
+ * never left, safe to resend. Per-call AbortSignal cancels waiting
+ * without touching the session.
  */
 
 import { randomBytes } from "@noble/ciphers/utils.js";
@@ -46,6 +49,7 @@ import {
   buildHelloTranscript,
   buildReplyTranscript,
   RPCError,
+  RPCAbortedError,
   type Router,
   type Procedure,
   type Channel,
@@ -57,6 +61,10 @@ import {
 const PROOF_LEN = 32;
 const MAX_PENDING = 256;
 const DEFAULT_TIMEOUT = 30_000;
+const DEFAULT_SEND_TIMEOUT = 10_000;
+// Outbound retry tick. Internal, not a caller lever — `sendTimeout` is the
+// contract; the tick only bounds how fast a revived channel is noticed.
+const SEND_RETRY_MS = 250;
 const MAX_KNOWN_PROCEDURES = 1024;
 
 // ─── Client types ─────────────────────────────────────────
@@ -79,11 +87,12 @@ export class RemoteRPCError extends RPCError {
  */
 export interface CallOptions {
   /**
-   * Abort THIS call. Rejects the call with `RPCError("ABORTED")` (the
-   * signal's reason on `.cause`). Client-local: like a TIMEOUT, the outcome
-   * on the server is UNKNOWN — the request may still execute there. The
-   * session is never touched; a shared in-progress handshake continues for
-   * other callers.
+   * Abort THIS call (code `ABORTED`, the signal's reason on `.cause`).
+   * Client-local: the session is never touched; a shared in-progress
+   * handshake continues for other callers. The rejection's class tells
+   * you whether the request had already left: `RPCAbortedError` = sent,
+   * outcome on the server UNKNOWN; plain `RPCError` = provably never
+   * sent, safe to resend.
    */
   signal?: AbortSignal;
 }
@@ -136,6 +145,15 @@ export interface ClientOptions {
   /** Max concurrent pending RPC calls. Default: 256. */
   maxPending?: number;
   /**
+   * How long (ms) a frame may wait for a live channel before the call
+   * fails with a definite never-sent error (plain `RPCError("CHANNEL")`).
+   * A `send` that throws does not fail the call — the frame enters the
+   * core outbound queue and is retried until this expires. Default:
+   * 10000ms (below `timeout`, so an unsent frame always fails via the
+   * definite path before the global timer can fire).
+   */
+  sendTimeout?: number;
+  /**
    * Max time (ms) to complete the handshake from when the client hello
    * is sent. Triggered lazily by the first RPC call, or on retry after
    * a previous handshake failure / reset. Default: 5000ms.
@@ -151,7 +169,6 @@ export function client<T extends Router>(
   opts: ClientOptions,
 ): {
   api: Client<T>;
-  abortPending: (err?: RPCError) => void;
   destroy: () => void;
 } {
   if (typeof channel.send !== "function") {
@@ -166,6 +183,15 @@ export function client<T extends Router>(
   const timeout = opts.timeout !== undefined ? opts.timeout : DEFAULT_TIMEOUT;
   const maxPending =
     opts.maxPending !== undefined ? opts.maxPending : MAX_PENDING;
+  const sendTimeout =
+    opts.sendTimeout !== undefined ? opts.sendTimeout : DEFAULT_SEND_TIMEOUT;
+  if (
+    typeof sendTimeout !== "number" ||
+    !Number.isFinite(sendTimeout) ||
+    sendTimeout < 0
+  ) {
+    throw new TypeError("client() sendTimeout must be a number ≥ 0 ms");
+  }
   const hsTimeout =
     opts.handshakeTimeout !== undefined
       ? opts.handshakeTimeout
@@ -211,16 +237,209 @@ export function client<T extends Router>(
   let handshakeReject: ((err: unknown) => void) | null = null;
   let hsTimer: ReturnType<typeof setTimeout> | null = null;
 
-  // Pending RPC responses
-  const pending = new Map<
-    string,
-    {
-      resolve: (v: unknown) => void;
-      reject: (e: unknown) => void;
-      timer: ReturnType<typeof setTimeout>;
-    }
-  >();
+  // Pending RPC responses. `sent` is the wire boundary: true once
+  // `channel.send` returned without throwing (or its promise was handed
+  // off — optimistic, see enqueue comment). It decides the class of every
+  // terminal rejection: sent → RPCAbortedError (outcome UNKNOWN), unsent →
+  // plain RPCError (provably never left).
+  interface PendingEntry {
+    resolve: (v: unknown) => void;
+    reject: (e: unknown) => void;
+    timer: ReturnType<typeof setTimeout>;
+    sent: boolean;
+  }
+  const pending = new Map<string, PendingEntry>();
   let counter = 0;
+
+  // ── Outbound queue: frames whose send failed, retried until sendTimeout ─
+  // The channel contract (common.ts) forbids adapter queues — the core is
+  // the only owner of undelivered frames, so "never left" is a fact it
+  // knows, not an inference. Frames are already encrypted; `epoch` stales
+  // them on reset (ciphertext under a zeroed key can never succeed).
+  type OutboundEntry =
+    | { kind: "hello"; frame: Uint8Array; epoch: number }
+    | {
+        kind: "msg";
+        frame: Uint8Array;
+        id: string;
+        prop: string;
+        epoch: number;
+        expiresAt: number;
+        cause?: unknown;
+      };
+  const outbound: OutboundEntry[] = [];
+  let flushTimer: ReturnType<typeof setInterval> | null = null;
+  // True while an async `send` of a queued frame is unresolved — blocks
+  // concurrent flush passes so order is preserved.
+  let flushInflight = false;
+
+  function isThenable(v: unknown): v is Promise<void> {
+    return (
+      v !== null &&
+      typeof v === "object" &&
+      typeof (v as { then?: unknown }).then === "function"
+    );
+  }
+
+  function startFlushTimer(): void {
+    if (flushTimer === null) {
+      flushTimer = setInterval(flushOutbound, SEND_RETRY_MS);
+    }
+  }
+
+  function stopFlushTimerIfIdle(): void {
+    if (flushTimer !== null && outbound.length === 0 && !flushInflight) {
+      clearInterval(flushTimer);
+      flushTimer = null;
+    }
+  }
+
+  function enqueueMsg(
+    id: string,
+    prop: string,
+    frame: Uint8Array,
+    cause?: unknown,
+  ): void {
+    outbound.push({
+      kind: "msg",
+      frame,
+      id,
+      prop,
+      epoch,
+      expiresAt: Date.now() + sendTimeout,
+      cause,
+    });
+    startFlushTimer();
+  }
+
+  function removeOutboundMsg(id: string): void {
+    for (let i = 0; i < outbound.length; i++) {
+      const e = outbound[i];
+      if (e !== undefined && e.kind === "msg" && e.id === id) {
+        outbound.splice(i, 1);
+        break;
+      }
+    }
+    stopFlushTimerIfIdle();
+  }
+
+  // Reject a still-queued call with a plain (never-left) error and drop
+  // its frame. Used by expiry, reset staling, and destroy.
+  function failQueued(e: OutboundEntry & { kind: "msg" }, err: RPCError): void {
+    const p = pending.get(e.id);
+    if (p === undefined) return;
+    pending.delete(e.id);
+    clearTimeout(p.timer);
+    p.reject(err);
+  }
+
+  // Drop entries that can no longer be sent meaningfully:
+  // • hellos of a dead attempt (state/epoch mismatch) — silently; this is
+  //   what revokes a stale hello after handshakeTimeout, no residual flush;
+  // • msgs whose call already settled — silently;
+  // • msgs staled by a reset (epoch mismatch) — plain CHANNEL (belt for
+  //   reset()'s own purge);
+  // • msgs past their sendTimeout — plain CHANNEL, the definite failure.
+  function dropStaleAndExpired(): void {
+    const now = Date.now();
+    for (let i = outbound.length - 1; i >= 0; i--) {
+      const e = outbound[i];
+      if (e === undefined) continue;
+      if (e.kind === "hello") {
+        if (state !== "handshaking" || epoch !== e.epoch) {
+          outbound.splice(i, 1);
+        }
+        continue;
+      }
+      const p = pending.get(e.id);
+      if (p === undefined || p.sent) {
+        outbound.splice(i, 1);
+        continue;
+      }
+      if (epoch !== e.epoch) {
+        outbound.splice(i, 1);
+        failQueued(
+          e,
+          new RPCError(
+            "CHANNEL",
+            "Session reset before send: " + e.prop,
+            undefined,
+            { cause: e.cause },
+          ),
+        );
+        continue;
+      }
+      if (now >= e.expiresAt) {
+        outbound.splice(i, 1);
+        failQueued(
+          e,
+          new RPCError(
+            "CHANNEL",
+            "Not sent within sendTimeout: " + e.prop,
+            undefined,
+            { cause: e.cause },
+          ),
+        );
+      }
+    }
+  }
+
+  function markSent(e: OutboundEntry): void {
+    if (e.kind !== "msg") return;
+    const p = pending.get(e.id);
+    if (p !== undefined) p.sent = true;
+  }
+
+  function flushOutbound(): void {
+    if (flushInflight) return;
+    dropStaleAndExpired();
+    while (outbound.length > 0) {
+      const e = outbound[0];
+      if (e === undefined) break;
+      let res: unknown;
+      try {
+        res = channel.send(e.frame) as unknown;
+      } catch (err: unknown) {
+        // Channel still down — head-of-line: if it can't take this frame
+        // it can't take the next. Keep the freshest cause for diagnostics.
+        if (e.kind === "msg") e.cause = err;
+        break;
+      }
+      if (isThenable(res)) {
+        // Optimistic sent: an unconfirmed frame counts as "left" — a false
+        // "unknown outcome" is safe, a false "never left" is not. Rolled
+        // back on rejection.
+        outbound.shift();
+        markSent(e);
+        flushInflight = true;
+        res.then(
+          function onFlushSent() {
+            flushInflight = false;
+            flushOutbound();
+          },
+          function onFlushFail(err: unknown) {
+            flushInflight = false;
+            if (e.kind === "msg") {
+              const p = pending.get(e.id);
+              if (p !== undefined && p.sent) {
+                p.sent = false;
+                e.cause = err;
+                outbound.unshift(e);
+                startFlushTimer();
+              }
+            } else if (state === "handshaking" && epoch === e.epoch) {
+              outbound.unshift(e);
+              startFlushTimer();
+            }
+          },
+        );
+        return;
+      }
+      outbound.shift();
+      markSent(e);
+    }
+    stopFlushTimerIfIdle();
+  }
 
   const knownProcedures = new Set<string>();
 
@@ -339,9 +558,16 @@ export function client<T extends Router>(
       zero(helloPayload);
       try {
         await channel.send(hello);
-      } catch (err: unknown) {
+      } catch {
         if (state !== "handshaking" || epoch !== currentEpoch) return;
-        failHandshake(err);
+        // Channel down — not a handshake failure. Queue the hello and let
+        // the flush tick retry; the attempt stays bounded by hsTimer. If
+        // the attempt dies first, the queued hello is revoked by the
+        // state/epoch check in dropStaleAndExpired — it never flushes
+        // late. The send error is intentionally not surfaced:
+        // transport-down is the queue's normal input, not a failure.
+        outbound.push({ kind: "hello", frame: hello, epoch: currentEpoch });
+        startFlushTimer();
       }
     })().catch(function onProduceError(err: unknown) {
       if (state !== "handshaking" || epoch !== currentEpoch) return;
@@ -661,13 +887,7 @@ export function client<T extends Router>(
         }
       }
 
-      const timer = setTimeout(function onRpcTimeout() {
-        pending.delete(id);
-        settle();
-        rej(new RPCError("TIMEOUT", "Timed out: " + prop));
-      }, timeout);
-
-      pending.set(id, {
+      const entry: PendingEntry = {
         resolve: function resolveSettled(v: unknown) {
           settle();
           res(v);
@@ -676,54 +896,77 @@ export function client<T extends Router>(
           settle();
           rej(e);
         },
-        timer,
-      });
+        timer: setTimeout(function onRpcTimeout() {
+          pending.delete(id);
+          settle();
+          if (entry.sent) {
+            // The request left; a reply never came. Outcome UNKNOWN —
+            // this is the one signal that the session may be desynced,
+            // and the only trigger of the auto-reset (proxy catch).
+            rej(new RPCAbortedError("TIMEOUT", "Timed out: " + prop));
+          } else {
+            // Global timer beat sendTimeout (timeout < sendTimeout
+            // config) while the frame was still queued — it never left.
+            removeOutboundMsg(id);
+            rej(new RPCError("TIMEOUT", "Timed out: " + prop));
+          }
+        }, timeout),
+        sent: false,
+      };
+      pending.set(id, entry);
 
       if (signal !== undefined) {
         onAbort = function onCallAbort() {
           onAbort = null; // {once:true} already removed the listener
-          const entry = pending.get(id);
-          if (entry === undefined) return;
+          if (pending.get(id) !== entry) return;
           pending.delete(id);
           clearTimeout(entry.timer);
-          // The request may have executed on the server — same UNKNOWN
-          // outcome as a timeout. A late reply finds no pending entry and
-          // is silently dropped. The session is not touched.
-          rej(abortError(prop, signal.reason));
+          if (entry.sent) {
+            // The request may have executed on the server — same UNKNOWN
+            // outcome as a timeout. A late reply finds no pending entry
+            // and is silently dropped. The session is not touched.
+            rej(
+              new RPCAbortedError(
+                "ABORTED",
+                "Call aborted: " + prop,
+                undefined,
+                { cause: signal.reason },
+              ),
+            );
+          } else {
+            // Still in the outbound queue — provably never left.
+            removeOutboundMsg(id);
+            rej(abortError(prop, signal.reason));
+          }
         };
         signal.addEventListener("abort", onAbort, { once: true });
       }
 
-      // Give the send path a typed failure code. A raw adapter error (bare
-      // Error / DOMException) would slip past the caller's documented
-      // `instanceof RPCError` taxonomy; `CHANNEL` means "request provably
-      // never left", the retry predicate's clean trigger. The original error
-      // is preserved on `.cause` for debugging. Handles BOTH a synchronous
-      // throw (e.g. a closed MessagePort) and an async rejection (WS/queue
-      // adapters) from `channel.send`.
-      function onSendError(err: unknown): void {
-        pending.delete(id);
-        clearTimeout(timer);
-        settle();
-        rej(
-          err instanceof RPCError
-            ? err
-            : new RPCError("CHANNEL", "Channel send failed", undefined, {
-                cause: err,
-              }),
-        );
-      }
-      try {
-        const sent = channel.send(encrypted) as unknown;
-        if (
-          sent !== null &&
-          typeof sent === "object" &&
-          typeof (sent as { then?: unknown }).then === "function"
-        ) {
-          (sent as Promise<void>).catch(onSendError);
+      // Send now if the line is clear; queue behind earlier frames
+      // otherwise (a non-empty queue means the channel was down a tick
+      // ago — jumping it would reorder for no gain). A failed send does
+      // NOT reject the call: the frame provably never left, the core
+      // owns it and retries until sendTimeout. Async sends are counted
+      // sent optimistically (a false "unknown outcome" is safe, a false
+      // "never left" is not) and rolled back to the queue on rejection.
+      if (outbound.length > 0 || flushInflight) {
+        enqueueMsg(id, prop, encrypted);
+      } else {
+        try {
+          const sent = channel.send(encrypted) as unknown;
+          if (isThenable(sent)) {
+            entry.sent = true;
+            sent.catch(function onAsyncSendFail(err: unknown) {
+              if (pending.get(id) !== entry || !entry.sent) return;
+              entry.sent = false;
+              enqueueMsg(id, prop, encrypted, err);
+            });
+          } else {
+            entry.sent = true;
+          }
+        } catch (err: unknown) {
+          enqueueMsg(id, prop, encrypted, err);
         }
-      } catch (err: unknown) {
-        onSendError(err);
       }
     });
   }
@@ -767,25 +1010,28 @@ export function client<T extends Router>(
         try {
           return await sendRequest(prop, input, signal);
         } catch (err: unknown) {
-          // No auto-retry. A TIMEOUT leaves the outcome UNKNOWN (the request
-          // may have executed — auto-resending it is a silent double-execution
-          // hazard for non-idempotent handlers); a CHANNEL error means the
-          // request provably never left. Either way the error surfaces and the
-          // CALLER decides whether to retry — it alone knows if the procedure
-          // is idempotent.
+          // No auto-retry. An RPCAbortedError leaves the outcome UNKNOWN
+          // (the request may have executed — auto-resending it is a silent
+          // double-execution hazard for non-idempotent handlers); a plain
+          // local error means the request provably never left. Either way
+          // the error surfaces and the CALLER decides whether to retry —
+          // it alone knows if the procedure is idempotent.
           //
-          // We still reset the session (but do NOT resend) on TIMEOUT/CHANNEL
-          // so the NEXT call lazily re-handshakes: a desynced peer (e.g. a
-          // restarted server that silently drops TAG_MSG over a sync transport)
-          // would otherwise wedge every future call. Guardrail (CLIENT) and
-          // SESSION errors must NOT reset — a healthy session has to survive
-          // local backpressure instead of tearing down its own good key.
+          // We still reset the session (but do NOT resend) on exactly one
+          // trigger: a reply-timeout on a SENT request — "it went out and
+          // the server never answered" is the one signal the session may
+          // be desynced (e.g. a restarted server silently dropping
+          // TAG_MSG over a live transport); without the reset every
+          // future call would wedge. A never-left CHANNEL failure is a
+          // transport event, not a session event — the keys are fine,
+          // and if send throws, a re-handshake's hello couldn't leave
+          // either. ABORTED is a caller-local decision; guardrail
+          // (CLIENT) and SESSION errors must not tear down a good key.
           if (
             state === "ready" &&
             epoch === sentEpoch &&
-            err instanceof RPCError &&
-            !(err instanceof RemoteRPCError) &&
-            (err.code === "TIMEOUT" || err.code === "CHANNEL")
+            err instanceof RPCAbortedError &&
+            err.code === "TIMEOUT"
           ) {
             reset();
           }
@@ -812,41 +1058,36 @@ export function client<T extends Router>(
   });
 
   // ── Auto-reset ─────────────────────────────────────────────
-  // Called when a call's sendRequest fails (timeout or send error).
-  // Only zeros crypto and returns to idle — pending calls are left
-  // untouched. They'll time out naturally and retry individually
-  // through the same catch → epoch-check → ensureHandshake path.
-  // If another call already reset (epoch advanced), latecomers skip
-  // this and just join the in-progress handshake.
+  // Called on a reply-timeout of a SENT request (the one desync signal).
+  // Zeros crypto and returns to idle. Sent pending calls are left
+  // untouched — they'll time out naturally and retry individually
+  // through the same catch → epoch-check → ensureHandshake path. Queued
+  // UNSENT frames are failed immediately: they are ciphertext under the
+  // zeroed key and can never succeed — plain CHANNEL, the definite
+  // never-left error. If another call already reset (epoch advanced),
+  // latecomers skip this and just join the in-progress handshake.
 
   function reset(): void {
     if (state !== "ready") return;
     zeroKeys();
     state = "idle";
-  }
-
-  // ── abortPending ───────────────────────────────────────────
-  // Application-driven "stop waiting": the app knows further waiting is
-  // pointless (user logged out, tab hiding) and rejects every in-flight
-  // call (and any hello-waiter) immediately instead of letting them stack
-  // up to their timeouts. The SESSION SURVIVES: a live session's keys and
-  // `ready` state are untouched — transport death is not a session event
-  // (channel liveness is the adapter's job; a lost server session heals
-  // lazily via timeout → reset). Only an in-progress handshake attempt is
-  // failed, which zeros that attempt's ephemerals — attempt state, not a
-  // live session.
-
-  function abortPending(err?: RPCError): void {
-    if (state === "closed") return;
-    const e = err ?? new RPCError("ABORTED", "Pending calls aborted");
-    // Reject all pending RPC calls (clears their timers).
-    rejectPending(e);
-    if (state === "handshaking") {
-      // failHandshake rejects the shared handshake promise (so hello-waiters
-      // don't hang until handshakeTimeout), zeros the attempt's ephemerals,
-      // and goes idle. A `ready` session is left fully intact.
-      failHandshake(e);
+    for (let i = outbound.length - 1; i >= 0; i--) {
+      const e = outbound[i];
+      if (e === undefined) continue;
+      outbound.splice(i, 1);
+      if (e.kind === "msg") {
+        failQueued(
+          e,
+          new RPCError(
+            "CHANNEL",
+            "Session reset before send: " + e.prop,
+            undefined,
+            { cause: e.cause },
+          ),
+        );
+      }
     }
+    stopFlushTimerIfIdle();
   }
 
   // ── Destroy ───────────────────────────────────────────────
@@ -864,11 +1105,28 @@ export function client<T extends Router>(
       handshakePromise = null;
       handshakeResolve = null;
       handshakeReject = null;
+      // Hello-waiters were never sent as calls — plain, retryable against
+      // a fresh client.
       rej(new RPCError("SESSION", "Session destroyed"));
     }
 
-    rejectPending(new RPCError("SESSION", "Session destroyed"));
+    // Split the pending map by the sent boundary: still-queued frames
+    // provably never left → plain; everything else was handed to the
+    // transport → outcome unknown → RPCAbortedError.
+    for (let i = outbound.length - 1; i >= 0; i--) {
+      const e = outbound[i];
+      if (e === undefined) continue;
+      outbound.splice(i, 1);
+      if (e.kind === "msg") {
+        failQueued(e, new RPCError("SESSION", "Session destroyed"));
+      }
+    }
+    if (flushTimer !== null) {
+      clearInterval(flushTimer);
+      flushTimer = null;
+    }
+    rejectPending(new RPCAbortedError("SESSION", "Session destroyed"));
   }
 
-  return { api, abortPending, destroy };
+  return { api, destroy };
 }

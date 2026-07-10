@@ -1,12 +1,10 @@
 /**
- * Transport lifecycle — 0.7.0 retry semantics (F1 / Option A) + abortPending.
+ * Transport lifecycle — 0.7.0 retry semantics (F1 / Option A).
  *
- * The client no longer auto-retries. A lost reply (TIMEOUT, outcome unknown)
- * or a send failure (CHANNEL, request never left) surfaces to the caller with
- * a typed code and resets the session — but is NOT resent. The caller, the
- * only party that knows whether a procedure is idempotent, decides. This kills
- * the silent double-execution hazard the old auto-retry created for
- * fund-moving handlers.
+ * The client no longer auto-retries. A lost reply (TIMEOUT, outcome
+ * unknown) surfaces as RPCAbortedError and resets the session. A send
+ * failure (CHANNEL, request never left) surfaces as plain RPCError and
+ * does NOT reset the session. The caller decides whether to retry.
  */
 import { describe, it, expect } from "vitest";
 import { randomBytes } from "@noble/ciphers/utils.js";
@@ -15,6 +13,7 @@ import {
   client,
   server,
   RPCError,
+  RPCAbortedError,
   type Channel,
   type Router,
 } from "../../src/index.ts";
@@ -24,7 +23,7 @@ import {
 } from "../helpers/channels.ts";
 
 describe("transport lifecycle / retry semantics (F1 Option A)", () => {
-  it("a lost reply surfaces TIMEOUT and the handler runs exactly once (no auto-resend)", async () => {
+  it("a lost reply surfaces RPCAbortedError(TIMEOUT) and the handler runs exactly once (no auto-resend)", async () => {
     const psk = randomBytes(32);
     const { a, b, mitm } = createMitmChannelPair();
     let execCount = 0;
@@ -57,7 +56,9 @@ describe("transport lifecycle / retry semantics (F1 Option A)", () => {
         return d;
       });
 
-      await expect(api.ping({})).rejects.toMatchObject({ code: "TIMEOUT" });
+      const timeoutErr = await api.ping({}).catch((e: unknown) => e);
+      expect(timeoutErr).toBeInstanceOf(RPCAbortedError);
+      expect((timeoutErr as RPCAbortedError).code).toBe("TIMEOUT");
       // Handler executed once for the lost-reply call; there was NO resend.
       expect(execCount).toBe(2);
     } finally {
@@ -66,7 +67,7 @@ describe("transport lifecycle / retry semantics (F1 Option A)", () => {
     }
   });
 
-  it("a send failure surfaces CHANNEL and the request never executes", async () => {
+  it("a send failure queues and retries until sendTimeout, then surfaces plain RPCError(CHANNEL); session not reset", async () => {
     const psk = randomBytes(32);
     const { a, b } = createChannelPair();
     let execCount = 0;
@@ -80,25 +81,41 @@ describe("transport lifecycle / retry semantics (F1 Option A)", () => {
 
     // Wrap the client channel so send() throws for TAG_MSG once armed.
     let failSend = false;
+    let hellosSent = 0;
     const bFail: Channel = {
       send(data) {
         if (failSend && data[0] === 0x01) throw new Error("socket dead");
-        return b.send(data);
+        const r = b.send(data);
+        // Count hellos only on successful delivery (never fails for 0x00)
+        if (data[0] === 0x00) hellosSent++;
+        return r;
       },
       receive: (cb) => b.receive(cb),
     };
     const { api, destroy } = client(bFail, {
       auth: { secret: () => psk },
-      timeout: 500,
+      timeout: 2000,
+      sendTimeout: 150, // frame expires before global timeout
     });
     try {
       expect(await api.ping({})).toBe("pong");
       expect(execCount).toBe(1);
+      expect(hellosSent).toBe(1);
 
+      // With failSend=true, the frame is re-queued and retried by the core
+      // until sendTimeout (150 ms) expires → definite plain RPCError(CHANNEL).
       failSend = true;
-      await expect(api.ping({})).rejects.toMatchObject({ code: "CHANNEL" });
+      const chanErr = await api.ping({}).catch((e: unknown) => e);
+      expect(chanErr).toBeInstanceOf(RPCError);
+      expect(chanErr).not.toBeInstanceOf(RPCAbortedError);
+      expect((chanErr as RPCError).code).toBe("CHANNEL");
       // Request provably never left — handler count unchanged.
       expect(execCount).toBe(1);
+
+      // Session NOT reset on CHANNEL: next call succeeds without re-handshake.
+      failSend = false;
+      expect(await api.ping({})).toBe("pong");
+      expect(hellosSent).toBe(1); // still only the original hello
     } finally {
       destroy();
       srv.destroy();
@@ -132,73 +149,5 @@ describe("transport lifecycle / retry semantics (F1 Option A)", () => {
       destroy();
       srv.destroy();
     }
-  });
-});
-
-describe("transport lifecycle / abortPending (F3, 0.7.0 semantics)", () => {
-  it("rejects in-flight calls with ABORTED and the session survives", async () => {
-    const psk = randomBytes(32);
-    const { a, b, mitm } = createMitmChannelPair();
-    let execCount = 0;
-    const router: Router = {
-      slow: chain().handler(async () => {
-        execCount++;
-        return new Promise<string>((r) => setTimeout(() => r("done"), 400));
-      }),
-    };
-    const srv = server(router, a, { auth: { secret: () => psk } });
-    const { api, abortPending, destroy } = client(b, {
-      auth: { secret: () => psk },
-      timeout: 5000,
-    });
-    try {
-      const p1 = api.slow({});
-      // Let the handshake + request go out.
-      await new Promise((r) => setTimeout(r, 60));
-      abortPending();
-      await expect(p1).rejects.toMatchObject({ code: "ABORTED" });
-
-      // The session SURVIVED: the next call succeeds without a second
-      // handshake (exactly one hello on the wire).
-      expect(await api.slow({})).toBe("done");
-      const helloCount = mitm.state.captures.filter(
-        (c) => c.dir === "BtoA" && c.data[0] === 0x00,
-      ).length;
-      expect(helloCount).toBe(1);
-      expect(execCount).toBe(2);
-    } finally {
-      destroy();
-      srv.destroy();
-    }
-  });
-
-  it("uses a caller-supplied error and fails an in-progress handshake", async () => {
-    const psk = randomBytes(32);
-    // Black-hole server side: never answers, so the client stays handshaking.
-    const b: Channel = { send() {}, receive: () => () => {} };
-    const { api, abortPending, destroy } = client(b, {
-      auth: { secret: () => psk },
-      timeout: 5000,
-      handshakeTimeout: 5000,
-    });
-    try {
-      const p = api.anything({});
-      await new Promise((r) => setTimeout(r, 30));
-      // A hello-waiter must not hang to handshakeTimeout.
-      abortPending(new RPCError("CHANNEL_DOWN", "dead"));
-      await expect(p).rejects.toMatchObject({ code: "CHANNEL_DOWN" });
-    } finally {
-      destroy();
-    }
-  });
-
-  it("is a no-op after destroy()", () => {
-    const psk = randomBytes(32);
-    const b: Channel = { send() {}, receive: () => () => {} };
-    const { abortPending, destroy } = client(b, {
-      auth: { secret: () => psk },
-    });
-    destroy();
-    expect(() => abortPending()).not.toThrow();
   });
 });
