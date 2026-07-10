@@ -181,6 +181,13 @@ export function client<T extends Router>(
   validateAuthConfig(opts.auth);
   const auth = opts.auth;
   const timeout = opts.timeout !== undefined ? opts.timeout : DEFAULT_TIMEOUT;
+  if (
+    typeof timeout !== "number" ||
+    !Number.isFinite(timeout) ||
+    timeout <= 0
+  ) {
+    throw new TypeError("client() timeout must be a number > 0 ms");
+  }
   const maxPending =
     opts.maxPending !== undefined ? opts.maxPending : MAX_PENDING;
   const sendTimeout =
@@ -430,9 +437,26 @@ export function client<T extends Router>(
               const p = pending.get(e.id);
               if (p !== undefined && p.sent) {
                 p.sent = false;
-                e.cause = err;
-                outbound.unshift(e);
-                startFlushTimer();
+                if (state === "ready" && epoch === e.epoch) {
+                  e.cause = err;
+                  outbound.unshift(e);
+                  startFlushTimer();
+                } else {
+                  // The session was reset (or replaced) while this frame's
+                  // async send was in flight. The rejection proves it never
+                  // left, and its ciphertext is under the zeroed key — it
+                  // can never succeed. Fail NOW (reset invalidates the
+                  // queue); resurrecting it would retry dead ciphertext.
+                  failQueued(
+                    e,
+                    new RPCError(
+                      "CHANNEL",
+                      "Session reset before send: " + e.prop,
+                      undefined,
+                      { cause: err },
+                    ),
+                  );
+                }
               }
             } else if (state === "handshaking" && epoch === e.epoch) {
               outbound.unshift(e);
@@ -875,6 +899,10 @@ export function client<T extends Router>(
       );
     }
     const id = String(++counter);
+    // The frame below is encrypted under THIS epoch's key. Captured so the
+    // async-send rollback can tell a live session from one that was reset
+    // (and possibly re-established) while the send promise was in flight.
+    const sendEpoch = epoch;
     // Omit `i` entirely for `undefined` input rather than encoding it —
     // msgpack has no `undefined` primitive and would round-trip it as
     // `null`, which a `.optional()` (as opposed to `.nullish()`) Zod schema
@@ -977,7 +1005,26 @@ export function client<T extends Router>(
             sent.catch(function onAsyncSendFail(err: unknown) {
               if (pending.get(id) !== entry || !entry.sent) return;
               entry.sent = false;
-              enqueueMsg(id, prop, encrypted, err);
+              if (state === "ready" && epoch === sendEpoch) {
+                enqueueMsg(id, prop, encrypted, err);
+              } else {
+                // Reset (or reset + re-handshake) happened while the send
+                // promise was pending. `enqueueMsg` stamps the CURRENT
+                // epoch, which would smuggle old-key ciphertext past the
+                // staleness check — under a new session it can never
+                // decrypt. The rejection proves the frame never left:
+                // fail plain CHANNEL immediately.
+                pending.delete(id);
+                clearTimeout(entry.timer);
+                entry.reject(
+                  new RPCError(
+                    "CHANNEL",
+                    "Session reset before send: " + prop,
+                    undefined,
+                    { cause: err },
+                  ),
+                );
+              }
             });
           } else {
             entry.sent = true;
@@ -1089,6 +1136,12 @@ export function client<T extends Router>(
     if (state !== "ready") return;
     zeroKeys();
     state = "idle";
+    // Advance the epoch so anything encrypted under the zeroed key is
+    // epoch-stale from this point on. This is what arms the belt in
+    // dropStaleAndExpired for frames that were IN FLIGHT during the reset
+    // (shifted out of `outbound`, so the purge below can't see them) and
+    // get rolled back by an async-send rejection afterwards.
+    epoch++;
     for (let i = outbound.length - 1; i >= 0; i--) {
       const e = outbound[i];
       if (e === undefined) continue;

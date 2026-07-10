@@ -287,7 +287,7 @@ As of 0.7.0 a call that fails as `RPCAbortedError("TIMEOUT")` — the frame was 
 
 As of 0.7.0 **transport death is not a session event**. The session is bound to key material, not to a transport instance; when a socket dies, the client does nothing — keys are kept, pending calls keep waiting under their own timers. A call's outcome is decided by exactly two events: a reply that decrypts, or the call's own timeout. If the adapter's `send` throws (transport down), the core holds the frame in its outbound queue and retries until `sendTimeout` — see [Integrations § adapter contract](integrations.md#adapter-contract-send-or-throw-no-queues-stay-available) and the shipped `@dotex/saferpc/channels`. If the server lost its session with the socket, the first sent call that times out triggers the reset above, and the next call re-handshakes lazily.
 
-**Migration from 0.6.x:** `abortPending` is removed. Replace with a shared `AbortController` whose `signal` is passed to each call: `ctl.abort()` rejects every carrying call, equivalent to the old behavior with more precise class semantics (sent → `RPCAbortedError`, unsent → plain `RPCError`).
+**Migration from 0.6.x:** `abortPending` is removed. Replace with a shared `AbortController` whose `signal` is passed to each call: `ctl.abort()` rejects every carrying call, equivalent to the old behavior with more precise class semantics (sent → `RPCAbortedError`, unsent → plain `RPCError`). Also note the `timeout` default rose from `10_000` to `30_000` ms: without auto-retry the short timeout no longer doubles as a UX budget — that moved to per-call `AbortSignal.timeout(ms)`. Code that relied on the 10 s reset-and-heal cadence should pin `timeout: 10_000` explicitly.
 
 ## Replay within a session
 

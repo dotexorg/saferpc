@@ -79,7 +79,9 @@ export interface ServerOptionsBase {
   /**
    * Max time (ms) to complete a handshake AFTER a client hello arrives.
    * The server waits indefinitely for a client to connect — this timeout
-   * only governs the exchange once a hello is received.
+   * only governs the exchange once a hello is received. The budget covers
+   * the WHOLE attempt: the async auth callbacks (`verify`/`secret`/`sign`)
+   * and the wait for the first frame that decrypts under the candidate.
    * On timeout the unconfirmed candidate is dropped; the live session,
    * if any, keeps serving (make-before-break). Never destroys.
    * Default: 5000ms.
@@ -97,8 +99,10 @@ export interface ServerOptionsBase {
   replayWindow?: number;
   /**
    * Called on handshake failures and non-fatal internal errors.
-   * The server does NOT destroy on handshake failure — it resets to
-   * waiting and accepts the next hello. Use this for logging/monitoring.
+   * The server does NOT destroy on handshake failure — a failed attempt
+   * simply installs no candidate; an established live session (if any)
+   * is untouched, and the next hello is accepted as usual. Use this for
+   * logging/monitoring.
    */
   onError?: (err: unknown) => void;
 }
@@ -454,6 +458,24 @@ export function server(
       attemptEpoch++;
       const myAttempt = attemptEpoch;
 
+      // The hsTimeout budget starts NOW, at hello receipt — not after the
+      // async auth callbacks. A slow/hung `auth.verify` / `auth.secret` /
+      // `auth.sign` must not stretch the attempt: on expiry the flag kills
+      // the attempt at its await guards (a pending await itself cannot be
+      // cancelled, but nothing past it can install a candidate or reply).
+      // Whatever budget validation leaves over goes to the candidate
+      // confirmation timer below, so hello → first-decrypted-frame is
+      // bounded by ONE hsTimeout total.
+      const attemptStart = Date.now();
+      let attemptExpired = false;
+      const attemptTimer = setTimeout(function onAttemptTimeout() {
+        attemptExpired = true;
+        if (attemptEpoch !== myAttempt || destroyed) return;
+        if (onError !== null) {
+          onError(new RPCError("HANDSHAKE", "Handshake timeout"));
+        }
+      }, hsTimeout);
+
       (async function handleHello() {
         // Attempt-local ephemeral pair — never published to module scope
         // until the final synchronous publish, so a failed attempt leaves
@@ -522,7 +544,9 @@ export function server(
               nonce,
             );
             const verifyResult = await auth.verify(helloAuth, transcript);
-            if (attemptEpoch !== myAttempt || destroyed) return;
+            if (attemptEpoch !== myAttempt || destroyed || attemptExpired) {
+              return;
+            }
             if (verifyResult && typeof verifyResult === "object") {
               const a = (verifyResult as { auth?: unknown }).auth;
               if (a !== undefined) {
@@ -546,7 +570,9 @@ export function server(
 
           const secretBytes =
             auth.secret !== undefined ? await auth.secret() : EMPTY_SECRET;
-          if (attemptEpoch !== myAttempt || destroyed) return;
+          if (attemptEpoch !== myAttempt || destroyed || attemptExpired) {
+            return;
+          }
 
           if (
             !(secretBytes instanceof Uint8Array) ||
@@ -573,8 +599,8 @@ export function server(
           // If `sign` is configured, sign over the canonical reply
           // transcript (which binds BOTH ephemeral pubs) so the client
           // can authenticate the server beyond what the secret alone provides.
-          // Computed BEFORE state transition so a failure here cleanly
-          // resets the handshake.
+          // Computed BEFORE the candidate install below, so a failure here
+          // installs nothing and leaves the live session untouched.
           if (auth.sign !== undefined) {
             const replyTranscript = buildReplyTranscript(
               clientEpoch,
@@ -583,7 +609,9 @@ export function server(
               myPub,
             );
             const signed = await auth.sign(replyTranscript);
-            if (attemptEpoch !== myAttempt || destroyed) return;
+            if (attemptEpoch !== myAttempt || destroyed || attemptExpired) {
+              return;
+            }
             if (
               !(signed instanceof Uint8Array) ||
               signed.length === 0 ||
@@ -600,7 +628,17 @@ export function server(
           // FINAL install guard. The block below is fully synchronous: it
           // installs the newly-proven session as a CANDIDATE without racing a
           // newer attempt or a request.
-          if (attemptEpoch !== myAttempt || destroyed) return;
+          if (attemptEpoch !== myAttempt || destroyed || attemptExpired) {
+            return;
+          }
+
+          // Validation finished within budget — the attempt timer's job is
+          // done; the candidate timer takes over with the REMAINING budget.
+          clearTimeout(attemptTimer);
+          const remainingBudget = Math.max(
+            1,
+            hsTimeout - (Date.now() - attemptStart),
+          );
 
           // Make-before-break: install as CANDIDATE, do NOT touch the live
           // session. The live key (if any) keeps serving until a frame
@@ -628,7 +666,7 @@ export function server(
             if (onError !== null) {
               onError(new RPCError("HANDSHAKE", "Handshake timeout"));
             }
-          }, hsTimeout);
+          }, remainingBudget);
 
           const replyMsg: Record<string, unknown> = {
             pub: myPub,
@@ -650,6 +688,9 @@ export function server(
           // decrypts under the candidate to promote it. Total budget =
           // hsTimeout.
         } finally {
+          // Harmless double-clear on the success path; on every failure /
+          // stale-attempt path this stops a pending spurious timeout report.
+          clearTimeout(attemptTimer);
           if (rawShared !== null) zero(rawShared);
           if (localSessionKey !== null) zero(localSessionKey);
           if (localProof !== null) zero(localProof);

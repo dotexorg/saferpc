@@ -322,6 +322,10 @@ Hello-waiters were never sent as calls → plain.
   `AbortController` passed per call.
 - `wsChannel` `maxQueue` option removed; `send` now throws while down.
 - New `ClientOptions.sendTimeout` (default 10 000 ms).
+- `ClientOptions.timeout` default raised from 10 000 to 30 000 ms. The old
+  short default doubled as a UX budget when a timeout auto-healed via
+  reset+retry; without auto-retry the per-call UX cap belongs to
+  `AbortSignal.timeout(ms)`. Pin `timeout: 10_000` to keep the old cadence.
 - `CHANNEL` no longer triggers auto-reset; reply-timeout now surfaces as
   `RPCAbortedError` (still `code === "TIMEOUT"`, so code-based consumer
   checks keep working).
