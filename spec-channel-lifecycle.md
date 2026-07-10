@@ -156,7 +156,8 @@ Send path in `sendRequest` (and the hello path in `ensureHandshake`):
    - `sendTimeout` expiry (per-frame, counted from enqueue) → code
      `CHANNEL`, message "not sent within sendTimeout".
    - global `timeout` fires first (only possible when `timeout` is
-     configured below `sendTimeout`) → code `TIMEOUT`, plain class.
+     configured below `sendTimeout`) → code `CHANNEL`, plain class —
+     same definite never-left code as sendTimeout expiry.
    - per-call signal abort → code `ABORTED`, plain class.
    - `destroy()` → code `SESSION`, plain class.
    - session reset (epoch bump, §6) → code `CHANNEL`, plain class — the
@@ -167,8 +168,12 @@ Bounding: the queue needs no own limit — `maxPending` (256) already bounds
 in-flight calls, and at most one hello can be queued per handshake attempt.
 
 Defaults sanity: `sendTimeout` (10 s) < `timeout` (30 s), so with default
-config an unsent frame always fails via the definite `CHANNEL` path before
-the global timer can fire.
+config an unsent frame normally fails via the sendTimeout expiry. But the
+`CHANNEL` code does not depend on which timer fires first: if the global
+`timeout` beats `sendTimeout` (custom config), the still-queued frame is
+removed and rejected with the same plain `RPCError("CHANNEL")`. Plain
+`TIMEOUT` therefore never occurs — the `TIMEOUT` code always means "sent,
+no reply" and always rides the aborted class.
 
 The queue holds encrypted frames (encryption happens at call time, as
 today); the epoch captured at call time (`sentEpoch`) identifies frames
@@ -194,8 +199,7 @@ identical to `RPCError` (code, message, data?, options?).
 | `RPCAbortedError` | `TIMEOUT` | global timeout, frame was sent | UNKNOWN — check, then retry |
 | `RPCAbortedError` | `ABORTED` | signal fired, frame was sent | UNKNOWN — check, then retry |
 | `RPCAbortedError` | `SESSION` | `destroy()`, frame was sent | UNKNOWN — check, then retry |
-| `RPCError` | `CHANNEL` | sendTimeout expired / channel closed / reset staled a queued frame | never left — retry freely |
-| `RPCError` | `TIMEOUT` | global timeout, frame still queued | never left — retry freely |
+| `RPCError` | `CHANNEL` | sendTimeout or global timeout expired while still queued / channel closed / reset staled a queued frame | never left — retry freely |
 | `RPCError` | `ABORTED` | signal fired before send (incl. during handshake wait, pre-aborted signal) | never left — retry freely |
 | `RPCError` | `SESSION` | `destroy()` before send / call on closed client | never left |
 | `RPCError` | `CLIENT` / `HANDSHAKE` | guardrails / handshake failure | never left |
@@ -203,8 +207,10 @@ identical to `RPCError` (code, message, data?, options?).
 
 Invariant, stated once in api.md and enforced by tests: **class = which side
 of the wire the request died on; code = what killed it.** The same code can
-appear in both classes (`TIMEOUT`, `ABORTED`, `SESSION`) — that is by
-design, the trigger and the retry-safety are orthogonal axes.
+appear in both classes (`ABORTED`, `SESSION`) — that is by design, the
+trigger and the retry-safety are orthogonal axes. `TIMEOUT` appears only
+on the aborted class: a still-queued frame that runs out of time fails
+with the definite `CHANNEL` code, whichever timer fired.
 
 Caller-facing catch block, the whole point of the feature:
 

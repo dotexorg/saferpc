@@ -185,6 +185,43 @@ describe("channel lifecycle / core queue + send-or-throw contract", () => {
     }
   });
 
+  // ── Test 4b: global timeout beats sendTimeout → still definite CHANNEL ──
+  it("global timeout on a still-queued frame is plain RPCError(CHANNEL), not the aborted class", async () => {
+    const psk = randomBytes(32);
+    const { a, b, link } = createFaultChannelPair();
+    const router: Router = {
+      echo: chain().handler(async ({ input }) => input),
+    };
+    const srv = server(router, b, { auth: { secret: () => psk } });
+    const wrapped = countingChannel(a);
+    const { api, destroy } = client(wrapped.ch, {
+      auth: { secret: () => psk },
+      timeout: 150, // fires while the frame is still queued
+      sendTimeout: 5000, // deliberately above timeout — misconfig-proof path
+    }) as unknown as { api: LooseApi; destroy: () => void };
+    try {
+      expect(await api.echo!("warm")).toBe("warm");
+      expect(wrapped.hellos()).toBe(1);
+
+      // Frame queues; the global timer expires first. The frame provably
+      // never left → same definite CHANNEL code as sendTimeout expiry,
+      // and plain class — TIMEOUT is reserved for sent-no-reply.
+      link.goDown();
+      const err = await api.echo!("x").catch((e: unknown) => e);
+      expect(err).toBeInstanceOf(RPCError);
+      expect(err).not.toBeInstanceOf(RPCAbortedError);
+      expect((err as RPCError).code).toBe("CHANNEL");
+
+      link.goUp();
+      // Session NOT reset: next call succeeds without re-handshake
+      expect(await api.echo!("after")).toBe("after");
+      expect(wrapped.hellos()).toBe(1);
+    } finally {
+      destroy();
+      srv.destroy();
+    }
+  });
+
   // ── Test 5: class split on abort ──
   it("abort while frame queued → plain RPCError(ABORTED); abort after send → RPCAbortedError(ABORTED)", async () => {
     const psk = randomBytes(32);

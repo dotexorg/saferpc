@@ -65,7 +65,7 @@ const { api, destroy: stopClient } = client<AppRouter>(clientChannel, { auth });
 const { message } = await api.greet({ name: "World" }); // input & output typed
 ```
 
-`client()` and `server()` are synchronous. No top-level `await`. The handshake runs lazily on the first procedure call. If the session drops, the failed call surfaces a typed error (`TIMEOUT` / `CHANNEL`) and the next call re-handshakes — the client never silently resends (that would double-execute non-idempotent handlers). Transport death alone doesn't touch the session: a reconnecting adapter (see `@dotex/saferpc/channels`) lets in-flight calls complete across a socket blip. Per-call `AbortSignal` (`api.thing(input, { signal })`) and `abortPending()` cancel waiting without tearing anything down.
+`client()` and `server()` are synchronous. No top-level `await`. The handshake runs lazily on the first procedure call. If the session drops, the failed call surfaces a typed error — `RPCAbortedError` when the request was sent and the outcome is unknown, plain `RPCError` when it provably never left — and the next call re-handshakes; the client never silently resends (that would double-execute non-idempotent handlers). Transport death alone doesn't touch the session: a reconnecting adapter (see `@dotex/saferpc/channels`) lets in-flight calls complete across a socket blip. Per-call `AbortSignal` (`api.thing(input, { signal })`) cancels waiting without tearing anything down.
 
 Because `rpc` carries `Context`, procedures can be authored in any file with a fully-typed `ctx`, and `server()` requires a `context()` that returns the type your procedures expect.
 
@@ -107,15 +107,19 @@ Built-in helpers cover Ed25519, ECDSA P-256, JWT, certificate-based, and multifa
 ## Errors
 
 ```typescript
-import { RPCError, RemoteRPCError } from "@dotex/saferpc";
+import { RPCError, RPCAbortedError, RemoteRPCError } from "@dotex/saferpc";
 
 try {
   await api.greet({ name: "World" });
 } catch (err) {
   if (err instanceof RemoteRPCError) {
     // The remote peer threw. err.code / err.message / err.data come from there.
+  } else if (err instanceof RPCAbortedError) {
+    // The request WAS sent but the outcome is unknown (TIMEOUT, ABORTED,
+    // SESSION) — it may have executed. Reconcile state before retrying.
   } else if (err instanceof RPCError) {
-    // Local failure: TIMEOUT, SESSION, HANDSHAKE, CLIENT, ...
+    // Local failure, the request never left the process: CHANNEL, ABORTED,
+    // SESSION, HANDSHAKE, CLIENT, ... — safe to retry as-is.
     // (validation errors like INPUT_VALIDATION run server-side and arrive as RemoteRPCError)
   } else {
     throw err;

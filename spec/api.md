@@ -226,7 +226,7 @@ Returns synchronously. The handshake stays lazy: it starts on the first `api` ca
 
 `maxPending` caps concurrent in-flight calls. Past the cap, calls reject with `RPCError("CLIENT", "Too many pending requests")`.
 
-`timeout` applies to every call. On timeout the client throws `RPCAbortedError("TIMEOUT", "Timed out: <procedure>")` if the frame had already been sent (outcome unknown — do not blind-resend; the session resets and the next call re-handshakes), or plain `RPCError("TIMEOUT")` if the frame had not yet left the process (retry freely; no reset). Set `timeout` generously — it is the safety net, not a UX budget; shorten a single call with [`AbortSignal.timeout`](#calloptions--per-call-abort) instead.
+`timeout` applies to every call. On timeout the client throws `RPCAbortedError("TIMEOUT", "Timed out: <procedure>")` if the frame had already been sent (outcome unknown — do not blind-resend; the session resets and the next call re-handshakes), or plain `RPCError("CHANNEL")` if the frame had not yet left the process (retry freely; no reset). Set `timeout` generously — it is the safety net, not a UX budget; shorten a single call with [`AbortSignal.timeout`](#calloptions--per-call-abort) instead.
 
 `sendTimeout` is the maximum time a frame spends in the core outbound queue waiting for a live channel before the call fails with a definite `RPCError("CHANNEL")` (never sent — retry freely). Default 10 000 ms. Not a caller-facing UX knob; it is the boundary between the definite and unknown failure paths.
 
@@ -283,7 +283,7 @@ idle → handshaking → ready
 
 ## Failure handling (no auto-retry)
 
-As of 0.7.0 a call that fails as `RPCAbortedError("TIMEOUT")` — the frame was sent and no reply arrived — resets the session (zeros the key, returns to `idle`) but is **not** resent. The error surfaces so the caller, the only party that knows whether the procedure is idempotent, decides. Resending after a sent-frame timeout would silently double-execute non-idempotent handlers. A call whose frame was still in the core outbound queue when a terminal event fired (`RPCError("CHANNEL")`, or plain `RPCError("TIMEOUT")` / `RPCError("ABORTED")`) provably never left — the session is not reset. `RemoteRPCError` (server answered) and guardrail errors (`CLIENT`) never reset the session. The reset alone keeps a desynced peer from wedging future calls: the next call re-handshakes lazily. Concurrent failures share one re-handshake via an epoch counter. Full state-machine and wire-level semantics in [Protocol § Failure handling](protocol.md#failure-handling-no-auto-retry).
+As of 0.7.0 a call that fails as `RPCAbortedError("TIMEOUT")` — the frame was sent and no reply arrived — resets the session (zeros the key, returns to `idle`) but is **not** resent. The error surfaces so the caller, the only party that knows whether the procedure is idempotent, decides. Resending after a sent-frame timeout would silently double-execute non-idempotent handlers. A call whose frame was still in the core outbound queue when a terminal event fired (`RPCError("CHANNEL")` — either timer — or plain `RPCError("ABORTED")`) provably never left — the session is not reset. `RemoteRPCError` (server answered) and guardrail errors (`CLIENT`) never reset the session. The reset alone keeps a desynced peer from wedging future calls: the next call re-handshakes lazily. Concurrent failures share one re-handshake via an epoch counter. Full state-machine and wire-level semantics in [Protocol § Failure handling](protocol.md#failure-handling-no-auto-retry).
 
 As of 0.7.0 **transport death is not a session event**. The session is bound to key material, not to a transport instance; when a socket dies, the client does nothing — keys are kept, pending calls keep waiting under their own timers. A call's outcome is decided by exactly two events: a reply that decrypts, or the call's own timeout. If the adapter's `send` throws (transport down), the core holds the frame in its outbound queue and retries until `sendTimeout` — see [Integrations § adapter contract](integrations.md#adapter-contract-send-or-throw-no-queues-stay-available) and the shipped `@dotex/saferpc/channels`. If the server lost its session with the socket, the first sent call that times out triggers the reset above, and the next call re-handshakes lazily.
 
@@ -329,8 +329,8 @@ class RemoteRPCError extends RPCError {}
 class RPCAbortedError extends RPCError {}
 ```
 
-- `RPCError` is thrown for **local** failures where the request provably never left the process: `sendTimeout` expired, timeout before send, guardrail errors, session destroyed before send.
-- `RPCAbortedError extends RPCError` is thrown for **local** failures where the frame **had already been sent** — the request may have executed on the server. **Invariant: class = which side of the wire the request died on; code = what killed it.** The same code (`TIMEOUT`, `ABORTED`, `SESSION`) can appear in both classes.
+- `RPCError` is thrown for **local** failures where the request provably never left the process: `sendTimeout` expired, guardrail errors, session destroyed before send.
+- `RPCAbortedError extends RPCError` is thrown for **local** failures where the frame **had already been sent** — the request may have executed on the server. **Invariant: class = which side of the wire the request died on; code = what killed it.** The same code (`ABORTED`, `SESSION`) can appear in both classes; `TIMEOUT` appears only on `RPCAbortedError` — a still-queued frame that runs out of time (either timer) fails with the definite `CHANNEL` code instead.
 - `RemoteRPCError extends RPCError` is thrown when the remote peer's handler returned an error. The `code`, `message`, and `data` come from the remote side and are **untrusted strings** — sanitize before logging at warn/error level, or before showing them to a user.
 
 ### Standard error codes
@@ -340,8 +340,7 @@ class RPCAbortedError extends RPCError {}
 | `RPCAbortedError` | `TIMEOUT`           | Global timeout; frame was already sent — outcome unknown                                              |
 | `RPCAbortedError` | `ABORTED`           | Per-call signal fired; frame was already sent — outcome unknown. `signal.reason` on `.cause`          |
 | `RPCAbortedError` | `SESSION`           | `destroy()` called; frame was already sent — outcome unknown                                          |
-| `RPCError`        | `CHANNEL`           | `sendTimeout` expired, or channel closed / reset staled a queued frame — never left                   |
-| `RPCError`        | `TIMEOUT`           | Global timeout; frame was still queued — never left                                                   |
+| `RPCError`        | `CHANNEL`           | `sendTimeout` or global `timeout` expired while still queued, channel closed, or reset staled a queued frame — never left |
 | `RPCError`        | `ABORTED`           | Signal fired before frame was sent (pre-aborted signal, or abort during handshake wait) — never left  |
 | `RPCError`        | `SESSION`           | `destroy()` before send, or call on a closed client — never left                                     |
 | `RPCError`        | `CLIENT`            | Client-side guardrail tripped (e.g., `maxPending` exceeded)                                           |
@@ -352,7 +351,7 @@ class RPCAbortedError extends RPCError {}
 | `RPCError`        | `INTERNAL`          | Defensive: should not be reachable                                                                    |
 | `RPCError`        | `MIDDLEWARE`        | Middleware misuse (`next()` called twice, bad `extra` arg)                                            |
 
-`INPUT_VALIDATION`, `OUTPUT_VALIDATION`, `MIDDLEWARE`, and `NOT_FOUND` are raised **server-side** and always arrive as `RemoteRPCError`. `CHANNEL` is purely client-local. `TIMEOUT`, `ABORTED`, and `SESSION` appear in both `RPCAbortedError` (frame sent) and `RPCError` (frame unsent) — the class is the retry-safety signal.
+`INPUT_VALIDATION`, `OUTPUT_VALIDATION`, `MIDDLEWARE`, and `NOT_FOUND` are raised **server-side** and always arrive as `RemoteRPCError`. `CHANNEL` is purely client-local. `ABORTED` and `SESSION` appear in both `RPCAbortedError` (frame sent) and `RPCError` (frame unsent); `TIMEOUT` only in `RPCAbortedError` — the class is the retry-safety signal.
 
 Handlers may throw `RPCError(...)` with any code; those codes surface as `RemoteRPCError.code` on the client.
 

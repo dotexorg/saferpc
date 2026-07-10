@@ -1,9 +1,9 @@
 /**
  * drpc/client — Lazy RPC client (no auto-retry)
  *
- * LIFECYCLE: Handshake triggers lazily on first RPC call. On a local
- * failure while `ready` (TIMEOUT or CHANNEL send error) the session is
- * reset — but the failed call is NOT resent; the error surfaces to the
+ * LIFECYCLE: Handshake triggers lazily on first RPC call. The session
+ * auto-resets only on RPCAbortedError(TIMEOUT) — a sent request that got
+ * no reply — but the failed call is NOT resent; the error surfaces to the
  * caller, who alone knows whether the procedure is idempotent. The reset
  * only ensures the NEXT call lazily re-handshakes. Concurrent calls
  * coordinate via epoch to avoid redundant resets.
@@ -148,9 +148,9 @@ export interface ClientOptions {
    * How long (ms) a frame may wait for a live channel before the call
    * fails with a definite never-sent error (plain `RPCError("CHANNEL")`).
    * A `send` that throws does not fail the call — the frame enters the
-   * core outbound queue and is retried until this expires. Default:
-   * 10000ms (below `timeout`, so an unsent frame always fails via the
-   * definite path before the global timer can fire).
+   * core outbound queue and is retried until this expires. An unsent
+   * frame always fails with the definite `CHANNEL` code — even when the
+   * global `timeout` fires first. Default: 10000ms.
    */
   sendTimeout?: number;
   /**
@@ -214,10 +214,12 @@ export function client<T extends Router>(
   // closed:      destroyed. All calls throw.
   //
   // On handshake failure, state → idle; the next call re-handshakes.
-  // AUTO-RESET: On a TIMEOUT or CHANNEL failure while ready, zeros crypto
-  //   and goes idle WITHOUT resending. Other pending calls keep their
-  //   timers; the next call re-handshakes lazily. Epoch prevents
-  //   redundant resets. Guardrail (CLIENT) errors never reset.
+  // AUTO-RESET: Only an RPCAbortedError(TIMEOUT) — a sent request with no
+  //   reply — while ready zeros crypto and goes idle WITHOUT resending.
+  //   Plain RPCError (frame never left: CHANNEL, unsent TIMEOUT) never
+  //   resets — transport failure is not a session event. Other pending
+  //   calls keep their timers; the next call re-handshakes lazily. Epoch
+  //   prevents redundant resets. Guardrail (CLIENT) errors never reset.
   let state: "idle" | "handshaking" | "ready" | "closed" = "idle";
 
   // Ephemeral keys — regenerated per handshake attempt
@@ -312,15 +314,20 @@ export function client<T extends Router>(
     startFlushTimer();
   }
 
-  function removeOutboundMsg(id: string): void {
+  function removeOutboundMsg(
+    id: string,
+  ): (OutboundEntry & { kind: "msg" }) | undefined {
+    let removed: (OutboundEntry & { kind: "msg" }) | undefined;
     for (let i = 0; i < outbound.length; i++) {
       const e = outbound[i];
       if (e !== undefined && e.kind === "msg" && e.id === id) {
         outbound.splice(i, 1);
+        removed = e;
         break;
       }
     }
     stopFlushTimerIfIdle();
+    return removed;
   }
 
   // Reject a still-queued call with a plain (never-left) error and drop
@@ -431,6 +438,7 @@ export function client<T extends Router>(
               outbound.unshift(e);
               startFlushTimer();
             }
+            stopFlushTimerIfIdle();
           },
         );
         return;
@@ -906,9 +914,19 @@ export function client<T extends Router>(
             rej(new RPCAbortedError("TIMEOUT", "Timed out: " + prop));
           } else {
             // Global timer beat sendTimeout (timeout < sendTimeout
-            // config) while the frame was still queued — it never left.
-            removeOutboundMsg(id);
-            rej(new RPCError("TIMEOUT", "Timed out: " + prop));
+            // config) while the frame was still queued — it never left,
+            // so the definite CHANNEL code applies regardless of which
+            // timer fired first. Plain TIMEOUT thus never occurs: the
+            // TIMEOUT code always means "sent, no reply" (aborted class).
+            const q = removeOutboundMsg(id);
+            rej(
+              new RPCError(
+                "CHANNEL",
+                "Not sent within timeout: " + prop,
+                undefined,
+                { cause: q !== undefined ? q.cause : undefined },
+              ),
+            );
           }
         }, timeout),
         sent: false,
