@@ -41,7 +41,8 @@ All wire numbers are network-byte-order (big-endian) unless explicitly noted.
 | `MAX_AUTH_BYTES`         | 32,768                                              | Max size of the optional `auth` payload                                        |
 | `MAX_MSG_BYTES`          | 1,048,576                                           | Max size of an encrypted RPC frame (configurable)                              |
 | `HANDSHAKE_TIMEOUT_MS`   | 5,000                                               | Default timeout for completing the handshake                                   |
-| `RPC_TIMEOUT_MS`         | 10,000                                              | Default per-call timeout (client side)                                         |
+| `RPC_TIMEOUT_MS`         | 30,000                                              | Default per-call timeout (client side)                                         |
+| `SEND_TIMEOUT_MS`        | 10,000                                              | Default outbound-queue deadline for an unsent frame (client side)              |
 | `MAX_PENDING`            | 256                                                 | Default maximum in-flight RPCs per client                                      |
 | `MAX_ID_LEN`             | 64                                                  | Max request `id` length accepted by the server                                 |
 | `PROOF_LEN`              | 32                                                  | Length of the HMAC proof in the reply                                          |
@@ -407,38 +408,39 @@ destroy() ⇒ [destroyed], terminal
    │  reply OK + proof OK
    ▼
 [ready]
-   │  call TIMEOUT / CHANNEL send error
+   │  RPCAbortedError(TIMEOUT) — sent-call reply timeout
    ▼
 [idle]  (auto-reset, NO resend; next call re-handshakes)
 
-destroy()      ⇒ [closed], terminal
-abortPending() ⇒ [idle]   (reject in-flight, client stays usable)
+destroy() ⇒ [closed], terminal
 ```
 
 The client uses an **epoch counter** to coordinate concurrent failure-and-reset. When multiple calls fail at once, only the first one increments the epoch and resets; the rest see the new epoch and join the in-progress handshake.
 
 ## Failure handling (no auto-retry)
 
-As of 0.7.0 the client does **not** auto-retry. When a call fails with a local `TIMEOUT` or `CHANNEL` send error on a `ready` session — **and only then**:
+As of 0.7.0 the client does **not** auto-retry. When a sent call times out with `RPCAbortedError("TIMEOUT")` on a `ready` session — **and only then**:
 
 1. If `epoch === sentEpoch` (no other call has already reset), call `reset()`: zero the session key, drop encryptor/decryptor, state ← `idle`. The failed call is **not** resent.
 2. The error surfaces to the caller with its typed code. The caller — the only party that knows whether the procedure is idempotent — decides whether to retry.
 
-**Why no resend.** A `TIMEOUT` does not prove the server did not execute the request, only that no response arrived in time. Resending after a timeout can silently execute a non-idempotent procedure twice — a first-party double-execution mechanism for fund-moving handlers, layered on top of any attacker replay window. A `CHANNEL` send error means the request provably never left, so it is safe for the _caller_ to retry; the library still defers that choice to the caller so both cases follow one predictable rule.
+**Sent boundary.** A call's retry safety is determined by whether its frame reached a live transport. `channel.send` returning without throwing (sync) or its promise resolving (async) is the sent boundary. Before that point, the core holds the only copy of the frame; terminal events (timeout, abort, destroy, `sendTimeout`) reject with a plain `RPCError` — the frame provably never left and the caller may retry freely. After the sent boundary, terminal events reject with `RPCAbortedError` — outcome unknown.
 
-**Why still reset (without resending).** A desynced peer — e.g. a restarted server that silently drops `TAG_MSG` over a synchronous transport where no channel error is ever raised — would otherwise wedge every future call. Reset keeps healing lazy: the failed call fails, the _next_ call re-handshakes. The trade-off: `reset()` nulls `decrypt`, so replies to _other_ concurrent in-flight calls on the same session are dropped and those calls also fail; size the client-level `timeout` to the slowest procedure (it is the safety net, default 30 s) and shorten individual calls with `AbortSignal.timeout` — an abort never resets.
+**Core outbound queue.** When `channel.send` throws, the frame enters the core outbound queue. A retry tick (every 250 ms, running only while the queue is non-empty) attempts queued frames in order; the first throw stops the pass (head-of-line: if the channel is down, no later frame bypasses a stuck one). A frame transitions to *sent* the first time `send` succeeds; it then waits for reply-or-timeout only. `sendTimeout` (default 10 000 ms, counted from enqueue) is the per-frame deadline; expiry rejects the call with plain `RPCError("CHANNEL")` — the frame provably never left.
+
+**Why no resend.** A sent-frame `TIMEOUT` does not prove the server did not execute the request, only that no response arrived in time. Resending would silently execute a non-idempotent handler twice. Unsent frames (`RPCError`) are safe to retry; the library defers that choice to the caller in both cases.
+
+**Why still reset (without resending).** A desynced peer — e.g. a restarted server that silently drops `TAG_MSG` over a synchronous transport — would otherwise wedge every future call. Reset keeps healing lazy: the failed call surfaces its error; the _next_ call re-handshakes. The trade-off: `reset()` nulls `decrypt`, so replies to other in-flight sent calls on the same session are dropped and those calls also fail; size `timeout` to the slowest procedure (default 30 s) and shorten individual calls with `AbortSignal.timeout` — an abort never resets.
 
 Calls that received a `RemoteRPCError` (the server responded with `ok: false`) are **not** reset or retried. The server is alive and gave a real answer.
 
-**Transport death is not a session event (0.7.0).** The session is bound to key material, not to a transport instance. When the transport dies the client does nothing: keys are kept, state stays `ready`, pending calls keep waiting under their own timers. A call's outcome is decided by exactly two events — a reply that decrypts, or the call's own timeout. Transport liveness is the adapter's job (reconnect eagerly, hold the transport open); the one permitted "resend" anywhere in the stack is the adapter flushing frames that **provably never left** — frames submitted while the transport was down and queued. A frame written to a live transport has unknown outcome and is never resent by any layer. If the peer lost its session together with the transport, the encrypted frame fails to decrypt, the peer stays silent, the call hits `TIMEOUT`, and the reset path above heals lazily. Aborts (per-call `signal`, `abortPending`) are client-local and never touch the session either — `ABORTED` is outside the reset trigger set.
+**Transport death is not a session event (0.7.0).** The session is bound to key material, not to a transport instance. When the transport dies the client does nothing: keys are kept, state stays `ready`, pending calls keep waiting under their own timers. A call's outcome is decided by exactly two events — a reply that decrypts, or the call's own timeout. Transport liveness is the adapter's job (reconnect eagerly, hold the transport open, throw from `send` while down); the core retries frames the adapter rejected until `sendTimeout` expires — a definite `RPCError("CHANNEL")` if the transport stays down. A frame written to a live transport has unknown outcome and is never resent by any layer. If the peer lost its session together with the transport, the call hits `RPCAbortedError("TIMEOUT")` and the reset path above heals lazily. Per-call `signal` aborts are client-local and never touch the session — `ABORTED` is outside the reset trigger set.
 
-Local guardrail errors **must not** trigger the reset path either. The `CLIENT` backpressure error (`maxPending` exceeded), id-counter exhaustion, and any other error that does not indicate a dead session leave the session exactly as it was: resetting a healthy session on a guardrail error would tear down the encryption state for every in-flight call, force them into timeout, and re-execute their handlers — double execution with no attacker involved. The reset trigger set is exactly: local per-call `TIMEOUT`, `CHANNEL` send failure. Nothing else.
+Local guardrail errors **must not** trigger the reset path either. The `CLIENT` backpressure error (`maxPending` exceeded), id-counter exhaustion, and any other error that does not indicate a dead session leave the session exactly as it was: resetting a healthy session on a guardrail error would tear down the encryption state for every in-flight call, force them into timeout, and re-execute their handlers — double execution with no attacker involved. The reset trigger set is exactly: `RPCAbortedError` with code `TIMEOUT` — a sent call whose reply never arrived. Nothing else.
 
 Concurrent failures share one re-handshake via the epoch counter, so there are no reset storms.
 
-### abortPending
 
-A transport adapter that learns the channel died from an event (`ws.onclose`) at a moment when no `send` is in progress calls `abortPending(err?)`. It rejects every in-flight call and any hello-waiter immediately with a retryable code (`err ?? RPCError("CHANNEL", "Channel down")`), fails an in-progress handshake so waiters do not hang until `handshakeTimeout`, zeros the keys, and returns the client to `idle` — **not** `closed`. The client object keeps its identity; the next call lazily re-handshakes over the revived transport. No-op once `closed`.
 
 ## Sanitization
 
@@ -522,7 +524,7 @@ A new-language port that ticks every item is conformant:
 - [ ] The server's ephemeral pair `(s_priv, s_pub)` is generated **fresh per hello attempt** and never held at module/connection scope. This is load-bearing for make-before-break: it guarantees a duplicate hello derives a different candidate key than the live session, so replayed traffic can never decrypt under the candidate and force a promotion.
 - [ ] A validated attempt is installed as a **candidate**, not swapped into the live session. The live key is retired only when a `TAG_MSG` decrypts under the candidate key (make-before-break). Inbound frames are trial-decrypted live-first, then candidate.
 - [ ] The response-guard epoch is captured **after** promotion (not at frame arrival), so the reply to the confirming frame is not dropped by the guard.
-- [ ] Epoch counter increments per handshake attempt on both sides, is echoed in the reply, is validated as a uint32 on the wire, and never wraps (exhaustion is a terminal client error).
+- [ ] Client epoch increments per handshake attempt (and per session reset) and is echoed verbatim in the reply; it is validated as a uint32 on the wire and never wraps (exhaustion is a terminal client error). The server does NOT bump a single mirror counter — under make-before-break it keeps three internal counters: `attemptEpoch` (per incoming hello; invalidates older attempt coroutines), `candidateEpoch` (per candidate install; guards the confirmation timer), and `epoch` (per promotion; guards TAG_MSG responses).
 - [ ] The attempt counter is bumped for **every** incoming hello, including ones that arrive while a previous attempt is still suspended at an `await`. In-flight stale attempts detect themselves via the guard and abandon all writes.
 - [ ] Every `await` in the handshake path is followed by an attempt + destroyed guard before any session state is written. The candidate install happens under a final guard inside a single synchronous block.
 - [ ] A separate counter guards the candidate confirmation timer, bumped only when a candidate is installed — so a later hello that bumps the attempt counter but then fails validation cannot disarm an existing candidate's timeout.
@@ -531,7 +533,7 @@ A new-language port that ticks every item is conformant:
 - [ ] The X25519 raw shared secret is zeroed in a try/finally so a thrown `psk()` does not leak it.
 - [ ] Ephemeral private keys captured for the duration of an `await` are owned by the in-flight attempt (copied, not aliased), so a concurrent reset that zeroes the live buffer does not corrupt the in-flight derivation.
 - [ ] Server accepts new hellos in any state (including `ready`).
-- [ ] Client does **not** auto-retry. On a local `TIMEOUT` / `CHANNEL` send error while `ready` it resets the session (zeros the key, state → `idle`) **without resending**, then surfaces the error; the caller decides whether to retry. It never resets on `RemoteRPCError` or on local guardrail errors (`maxPending`, counter exhaustion) — those reject the call and leave the session intact. `abortPending()` rejects in-flight calls with a retryable code and returns the client to `idle`, not `closed`.
+- [ ] Client does **not** auto-retry. On a sent-call reply timeout (`RPCAbortedError("TIMEOUT")`) while `ready` it resets the session (zeros the key, state → `idle`) **without resending**, then surfaces the error; the caller decides whether to retry. It never resets on `RemoteRPCError`, guardrail errors (`maxPending`, counter exhaustion), or unsent-frame failures — those reject the call and leave the session intact.
 - [ ] The application's secret buffer is never mutated or zeroed by the protocol; only protocol-owned copies and derived material are zeroed.
 - [ ] Request `id` is validated: non-empty string, ≤ `MAX_ID_LEN`; `p` non-empty string; violations are silent drops.
 - [ ] Absent call input omits the `i` key entirely (never nil).

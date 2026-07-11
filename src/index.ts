@@ -36,6 +36,7 @@ export {
   EMPTY_SECRET,
   // Error
   RPCError,
+  RPCAbortedError,
   // Procedure builder + typed entry point
   saferpc,
   chain,

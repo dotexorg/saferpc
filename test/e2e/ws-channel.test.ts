@@ -1,10 +1,9 @@
 /**
  * E2E for the shipped reconnecting WebSocket adapter (src/channels/ws.ts)
- * over a real socket on 127.0.0.1. Validates the adapter lifecycle contract:
- * eager reconnect, queue-while-down with drop-oldest overflow, terminal
- * close(). The server side mirrors a long-lived session binding (the same
- * `server()` instance re-attached to each incoming connection), which is the
- * wiring where a kept client session pays off.
+ * over a real socket on 127.0.0.1. Validates the v2 adapter contract:
+ * send() throws while the transport is down and after close(); eager
+ * reconnect surfaces via onDown/onUp; the core outbound queue re-sends
+ * during the gap so a call issued while disconnected still resolves.
  */
 import { describe, it, expect } from "vitest";
 import { randomBytes } from "@noble/ciphers/utils.js";
@@ -86,7 +85,71 @@ function startBridgedServer(
 }
 
 describe("ws channel / reconnecting adapter", () => {
-  it("reconnects after socket death and a call issued during the gap resolves without re-handshake", async () => {
+  // ── Test 10: contract ────────────────────────────────────────────────────
+
+  it("contract: send throws while down and after close()", async () => {
+    const port = pickPort();
+    let ups = 0;
+    let downs = 0;
+
+    // A blockable factory lets the test control when reconnects can land.
+    // When blockConnect is true the factory throws, which the adapter treats
+    // as a failed attempt and retries with backoff — keeping sock===null and
+    // up===false for the duration of the block.
+    let blockConnect = false;
+    const wss = new WebSocketServer({ host: "127.0.0.1", port });
+    const ch = wsChannel(
+      () => {
+        if (blockConnect) throw new Error("connect blocked by test");
+        return new WsClient(
+          `ws://127.0.0.1:${port}`,
+        ) as unknown as WebSocketLike;
+      },
+      {
+        backoffMin: 20,
+        backoffMax: 200,
+        onDown: () => downs++,
+        onUp: () => ups++,
+      },
+    );
+    try {
+      await waitFor(() => ups === 1);
+
+      // Block reconnects BEFORE killing the socket so the immediate retry
+      // (delay=0) hits a factory throw and the adapter stays reliably down.
+      blockConnect = true;
+      for (const s of wss.clients) s.terminate();
+      await waitFor(() => downs === 1);
+
+      // Factory throws on every retry → sock===null, up===false.
+      // The adapter MUST throw synchronously when it cannot hand the frame
+      // to a live transport now.
+      expect(() => ch.send(new Uint8Array([1]))).toThrow(
+        "wsChannel: no open socket",
+      );
+
+      // Unblock: adapter reconnects on its own backoff schedule.
+      blockConnect = false;
+      await waitFor(() => ups === 2);
+
+      // close() is terminal — throws forever regardless of socket state.
+      ch.close();
+      expect(() => ch.send(new Uint8Array([1]))).toThrow(
+        "wsChannel: channel closed",
+      );
+      await sleep(50);
+      expect(() => ch.send(new Uint8Array([1]))).toThrow(
+        "wsChannel: channel closed",
+      );
+    } finally {
+      ch.close(); // idempotent if already closed
+      await new Promise<void>((resolve) => wss.close(() => resolve()));
+    }
+  });
+
+  // ── Test 11: reconnect + core retry end-to-end ───────────────────────────
+
+  it("call issued during a gap resolves after the adapter reconnects; TAG_HELLO == 1", async () => {
     const psk = randomBytes(32);
     const port = pickPort();
     const router: Router = {
@@ -105,12 +168,14 @@ describe("ws channel / reconnecting adapter", () => {
         onUp: () => ups++,
       },
     );
-    // Count outbound hellos to prove the session survived the reconnect.
+    // Count hellos that actually left the adapter (count after a successful
+    // ch.send, not before — a throw means the frame never left).
     let hellos = 0;
     const counting: Channel = {
       send(d) {
-        if (d[0] === TAG_HELLO) hellos++;
-        return ch.send(d);
+        const result = ch.send(d); // throws if socket not open
+        if (d[0] === TAG_HELLO) hellos++; // only reached on success
+        return result;
       },
       receive: (cb) => ch.receive(cb),
     };
@@ -128,11 +193,14 @@ describe("ws channel / reconnecting adapter", () => {
       srv.currentSock()!.terminate();
       await waitFor(() => downs === 1);
 
-      const p = api.echo!("during-gap"); // queues; flushes on reconnect
+      // Call during gap (or right after the fast reconnect — either way the
+      // call resolves and the session is continuous: no second hello).
+      const p = api.echo!("during-gap");
       expect(await p).toBe("during-gap");
+
       expect(downs).toBe(1);
       expect(ups).toBe(2);
-      expect(hellos).toBe(1); // same session across sockets
+      expect(hellos).toBe(1); // same session — no re-handshake
     } finally {
       destroy();
       ch.close();
@@ -140,58 +208,9 @@ describe("ws channel / reconnecting adapter", () => {
     }
   });
 
-  it("queue overflow drops the oldest frame", async () => {
-    const port = pickPort();
-    const received: number[] = [];
-    let wss = new WebSocketServer({ host: "127.0.0.1", port });
-    const record = (sock: import("ws").WebSocket): void => {
-      sock.on("message", (data) => {
-        received.push(toU8(data)[0] as number);
-      });
-    };
-    wss.on("connection", record);
+  // ── Updated: close() is terminal ─────────────────────────────────────────
 
-    let downs = 0;
-    let ups = 0;
-    const ch = wsChannel(
-      () => new WsClient(`ws://127.0.0.1:${port}`) as unknown as WebSocketLike,
-      {
-        maxQueue: 2,
-        backoffMin: 20,
-        backoffMax: 100,
-        onDown: () => downs++,
-        onUp: () => ups++,
-      },
-    );
-    try {
-      await waitFor(() => ups === 1);
-
-      // Take the listener fully away so the reconnect loop cannot succeed
-      // while we overflow the queue.
-      await new Promise<void>((resolve) => {
-        for (const sock of wss.clients) sock.terminate();
-        wss.close(() => resolve());
-      });
-      await waitFor(() => downs === 1);
-
-      ch.send(new Uint8Array([1]));
-      ch.send(new Uint8Array([2]));
-      ch.send(new Uint8Array([3])); // overflow: frame [1] is dropped
-
-      wss = new WebSocketServer({ host: "127.0.0.1", port });
-      wss.on("connection", record);
-      await waitFor(() => received.length >= 2);
-      await sleep(50); // give a hypothetical third frame time to arrive
-
-      expect(received).toEqual([2, 3]);
-      expect(ups).toBe(2);
-    } finally {
-      ch.close();
-      await new Promise<void>((resolve) => wss.close(() => resolve()));
-    }
-  });
-
-  it("close() is terminal: send throws and the client surfaces CHANNEL", async () => {
+  it("close() is terminal: after close() the core cannot send and surfaces CHANNEL", async () => {
     const psk = randomBytes(32);
     const port = pickPort();
     const router: Router = {
@@ -203,9 +222,12 @@ describe("ws channel / reconnecting adapter", () => {
       () => new WsClient(`ws://127.0.0.1:${port}`) as unknown as WebSocketLike,
       { onUp: () => ups++ },
     );
+    // Small sendTimeout so the CHANNEL error arrives within one flush tick
+    // (~250 ms) rather than waiting the 10 s default.
     const { api, destroy } = client(ch, {
       auth: { secret: () => psk },
-      timeout: 1000,
+      timeout: 2000,
+      sendTimeout: 100,
     }) as unknown as {
       api: Record<string, (i?: unknown) => Promise<unknown>>;
       destroy: () => void;
@@ -215,11 +237,13 @@ describe("ws channel / reconnecting adapter", () => {
       expect(await api.echo!("warm")).toBe("warm");
 
       ch.close();
+      // Adapter throws synchronously. The core queues the frame, retries for
+      // sendTimeout (100 ms), then surfaces plain RPCError("CHANNEL").
       expect(() => ch.send(new Uint8Array([9]))).toThrow();
-      // Through the client, the sync throw surfaces as a typed CHANNEL error.
       await expect(api.echo!("x")).rejects.toMatchObject({ code: "CHANNEL" });
     } finally {
       destroy();
+      ch.close(); // idempotent
       await srv.stop();
     }
   });

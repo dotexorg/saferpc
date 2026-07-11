@@ -404,6 +404,19 @@ export class RPCError extends Error {
   }
 }
 
+/**
+ * A local failure for a request that DID reach the wire — the outcome on
+ * the server is UNKNOWN: it may have executed, check before retrying.
+ *
+ * Invariant: the class says which side of the wire the request died on,
+ * `code` says what killed it. `RPCAbortedError` carries `TIMEOUT` (sent,
+ * no reply), `ABORTED` (signal fired after send) or `SESSION` (`destroy()`
+ * with the call in flight). The same codes on a plain local `RPCError`
+ * mean the request provably never left this process — safe to resend
+ * as-is. `RemoteRPCError` means the handler ran and returned an error.
+ */
+export class RPCAbortedError extends RPCError {}
+
 // ─── Types ───────────────────────────────────────────────
 
 export type Ctx = Record<string, unknown>;
@@ -471,14 +484,17 @@ export type RouterContext<T extends Router> = UnionToIntersection<
 /**
  * The transport contract: move `Uint8Array` frames both ways.
  *
- * Adapter lifecycle contract (for transports that can die, e.g. sockets):
- * reopen the transport immediately when it closes and hold it open as long
- * as possible; while it is down, `send` must not throw — queue frames that
- * provably never left (flush them in order on reconnect) and drop transport
- * errors inside the adapter. Never resend a frame that was written to a
- * live transport — its outcome is unknown. A call's fate is then decided by
- * exactly two events: a reply that decrypts, or the call's own timeout.
- * Shipped reference implementation: `@dotex/saferpc/channels` (`wsChannel`).
+ * Adapter contract: `send` MUST throw synchronously (or reject, if it
+ * returns a promise) when it cannot hand the frame to a live transport
+ * right now — no internal queues, no buffering, no retry; a channel that
+ * accepts a frame it cannot deliver lies to the core about the sent
+ * boundary. A channel SHOULD try to stay available (reopen its transport
+ * eagerly when it dies, hold it open as long as possible) — availability
+ * is the channel's job, delivery bookkeeping is the core's. An async
+ * `send` must reject, never resolve-then-error: a resolved promise is
+ * counted as "frame left the process" and is never resent by any layer.
+ * Shipped reference implementations: `@dotex/saferpc/channels`
+ * (`wsChannel`, `socketChannel`).
  */
 export interface Channel {
   send(data: Uint8Array): void | Promise<void>;

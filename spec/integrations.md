@@ -19,7 +19,7 @@ Bidirectional byte streams. Each connection maps to one Safe RPC session.
 
 The most common case: browser or service talking to a server over WS. Ships
 as code — `@dotex/saferpc/channels` — because WS is the one transport with a
-lifecycle trap (see [the adapter lifecycle contract](#adapter-lifecycle-reopen-immediately-queue-what-never-left) below).
+lifecycle trap (see [the adapter contract](#adapter-contract-send-or-throw-no-queues-stay-available) below).
 
 ```typescript
 // Server (Node.js, ws package)
@@ -54,12 +54,11 @@ const user = await api.getUser({ id: "123" });
 `wsChannel(source, opts?)` **owns the socket lifecycle**: it connects
 immediately, and when the socket closes it reconnects at once and keeps the
 transport open as long as possible (exponential backoff, forever, until
-`close()`). While the socket is down, `send` never throws — frames that
-provably never left are queued (default cap 256, drop-oldest) and flushed in
-order on reconnect; transport errors are swallowed and surfaced only through
-the optional `onDown`/`onUp` observability hooks. `source` is a URL string
-(uses the global `WebSocket`) or a factory `() => ws` for the `ws` package /
-custom construction.
+`close()`). While the socket is down `send` throws synchronously — the core
+catches that, queues the frame, and retries on its own tick. Transport errors
+are surfaced through the optional `onDown`/`onUp` observability hooks.
+`source` is a URL string (uses the global `WebSocket`) or a factory `() => ws`
+for the `ws` package / custom construction.
 
 `socketChannel(ws)` is the plain single-socket wrapper: no reconnect, no
 queue. The server uses it because a server cannot reconnect a client's
@@ -444,40 +443,32 @@ The rules are the same as everywhere else:
 1. `send` accepts `Uint8Array` and gets it to the other side.
 2. `receive(cb)` calls `cb` with each incoming `Uint8Array`. It returns an unsubscribe function.
 3. The transport is allowed to drop, duplicate, or reorder messages. Safe RPC will time out and surface a typed error (it does not auto-retry — the caller decides whether to resend). It will not behave correctly if your transport silently corrupts bytes. Wrap it in something that fails noisily if you cannot trust it.
-4. If the transport can die (sockets), the adapter owns liveness — see the lifecycle contract below.
+4. If the transport can die (sockets), the adapter owns liveness — see the [adapter contract](#adapter-contract-send-or-throw-no-queues-stay-available) below. In brief: throw from `send` when the transport is down (the core queues and retries), reconnect eagerly, never queue inside the adapter.
 
 That is the whole API surface. Encryption, framing, key management: all on the Safe RPC side. Your adapter does not need to care.
 
-### Adapter lifecycle: reopen immediately, queue what never left
+### Adapter contract: send or throw, no queues, stay available
 
-As of 0.7.0 the client core treats transport death as a non-event: the session
-is bound to key material, not to a transport instance, so when a socket dies
-the client keeps its keys and its pending calls keep waiting under their own
-timers. A call's outcome is decided by exactly two events — a reply that
-decrypts, or the call's own timeout. That works only if the adapter holds up
-its half of the deal:
+The client core owns the outbound queue. The adapter's job is simpler:
 
-- **Reopen immediately.** When the transport closes, reconnect at once and
-  keep it open as long as possible (backoff, forever). Don't wait for the
-  next `send` to notice.
-- **While down, `send` must not throw.** Queue the frame — it provably never
-  left, so flushing it after reconnect is safe and is NOT an auto-retry — and
-  drop any transport error inside the adapter (log it through your own hook
-  if you want; don't surface it per-call).
-- **Never resend a frame that was written to a live transport.** Its outcome
-  is unknown; resending is exactly the double-execution hazard the no-retry
-  rule exists to prevent. Only queued-while-down frames may be flushed.
+- **`send` MUST throw synchronously** (or reject, for async adapters) when it
+  cannot hand the frame to a live transport right now. No internal queues, no
+  buffering, no retry — accepting a frame the adapter cannot deliver lies to
+  the core about the sent boundary.
+- **No queues inside adapters.** Queueing in a transport adapter is an
+  antipattern: it duplicates state the core already owns and moves the
+  "never-left" bookkeeping to a place the core cannot see. The core retries
+  frames it gets back via throw; it cannot know about frames an adapter
+  accepted and then lost.
+- **Stay available.** When the transport closes, reconnect at once and keep
+  it open as long as possible (backoff, forever, until explicit `close()`).
+  The channel's job is availability; delivery bookkeeping is the core's.
 
 `wsChannel` in `@dotex/saferpc/channels` implements this contract; use it as
 the reference. Two WS-specific traps it absorbs, for anyone writing their
 own: browser `WebSocket.send()` on a **CLOSED** socket silently drops the
-frame (it only throws while `CONNECTING`) — without a `readyState` check in
-`send`, every failure degrades into a stacked RPC + handshake timeout (~35s
-with defaults) surfacing as a misleading `HANDSHAKE "Handshake timeout"`; and
-a socket can report OPEN before the reconnect flush has run — sending
-directly then would reorder frames past the queued ones.
-
-A fail-fast adapter (throw from `send` when the transport is down, get an
-immediate `CHANNEL` error) is still a legal, simpler choice — the failed call
-rejects at once and the caller decides. What it costs you is exactly the new
-property: calls no longer survive a socket blip.
+frame (it only throws while `CONNECTING`) — without a `readyState` check,
+every failure degrades into a stacked RPC + handshake timeout (~35 s with
+defaults) surfacing as a misleading `HANDSHAKE "Handshake timeout"`; and a
+socket in a transient non-OPEN state must be detected by checking
+`readyState`, not by catching the send exception.

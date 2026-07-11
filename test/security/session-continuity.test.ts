@@ -107,20 +107,26 @@ describe("security / session continuity (make-before-break)", () => {
     // Regression for the reqEpoch capture-timing bug: promotion advances
     // `epoch` while handling the confirming frame, so reqEpoch must be
     // captured AFTER promotion or this first post-rekey call times out.
+    //
+    // abortPending() is removed in v2. We force a genuine client reset via
+    // the only v2 reset trigger: a SENT call that times out
+    // (RPCAbortedError("TIMEOUT")) → auto-reset → idle → re-handshake.
+    // The mitm drops one server reply to produce that timeout.
     const psk = randomBytes(32);
-    const { a, b } = createMitmChannelPair();
+    const { a, b, mitm } = createMitmChannelPair();
     const router: Router = { ping: chain().handler(async () => "pong") };
     const srv = server(router, a, { auth: { secret: () => psk } });
-    const { api, abortPending, destroy } = client(b, {
+    const { api, destroy } = client(b, {
       auth: { secret: () => psk },
-      timeout: 1000,
+      timeout: 200, // short for test speed
     });
     try {
       expect(await api.ping({})).toBe("pong");
 
-      // Force the client to drop its session and lazily re-handshake with a
-      // fresh ephemeral key on the next call.
-      abortPending();
+      // Drop the next server reply → the call times out (frame was SENT) →
+      // RPCAbortedError("TIMEOUT") → auto-reset → client goes to idle.
+      mitm.dropNextAtoB(1);
+      await expect(api.ping({})).rejects.toMatchObject({ code: "TIMEOUT" });
 
       // The FIRST call after the genuine rekey must resolve, not time out.
       expect(await api.ping({})).toBe("pong");

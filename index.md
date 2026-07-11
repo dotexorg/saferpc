@@ -67,7 +67,7 @@ No HTTP. No JSON. No middleware stack. Encryption is the default because the des
 2. On the first call, a handshake runs automatically. Ephemeral X25519 keys are exchanged and a session key is derived using the secret as HKDF salt.
 3. The server proves it knows the secret with an HMAC over the transcript. The client proves it implicitly by producing valid ciphertext.
 4. All calls are encrypted with XSalsa20-Poly1305 AEAD under the session key.
-5. If the session drops, the client resets and re-handshakes lazily on the next call. The failed call surfaces a typed error (`TIMEOUT` / `CHANNEL`) — there is no silent resend; the caller decides whether to retry.
+5. If the session drops, the first sent call that times out surfaces `RPCAbortedError("TIMEOUT")` and resets the session; the next call re-handshakes lazily. A call that never left surfaces a plain `RPCError("CHANNEL")` without touching the session. There is no silent resend; the caller decides whether to retry.
 
 No certificates. No token refresh. No auth middleware. A shared secret and a channel.
 

@@ -139,20 +139,24 @@ That is the whole loop. The handshake runs on the first call, every payload is X
 
 ## Error handling
 
-Two error classes:
+Three error classes:
 
-- `RPCError`: local failure (timeout, session lost, validation error, handshake failure).
+- `RPCError`: local failure where the request provably never left (frame expired in the outbound queue, validation error, handshake failure, session destroyed before send). Safe to retry.
+- `RPCAbortedError` (subclass of `RPCError`): the request was sent and the outcome is unknown — it may have executed on the server. Retry only idempotent procedures.
 - `RemoteRPCError`: error returned from the remote peer (`code`, `message`, `data`).
 
 ```typescript
-import { RPCError, RemoteRPCError } from "@dotex/saferpc";
+import { RPCError, RPCAbortedError, RemoteRPCError } from "@dotex/saferpc";
 
 try {
   await api.greet({ name: "World" });
 } catch (err) {
   if (err instanceof RemoteRPCError) {
     if (err.code === "UNAUTHORIZED") await refreshCredentials();
+  } else if (err instanceof RPCAbortedError) {
+    // Sent, no reply — may have executed. Retry only if idempotent.
   } else if (err instanceof RPCError) {
+    // Provably never left — retrying cannot double-execute.
     if (err.code === "HANDSHAKE") console.warn("auth mismatch?");
   } else {
     throw err;
