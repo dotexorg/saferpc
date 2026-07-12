@@ -68,7 +68,7 @@ export async function manualHandshake(
     const unsubscribe = channel.receive((data) => {
       if (data[0] !== TAG_HELLO) return;
       clearTimeout(t);
-      unsubscribe();
+      unsubscribe?.();
       resolve(data);
     });
   });

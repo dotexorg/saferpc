@@ -17,37 +17,21 @@ Bidirectional byte streams. Each connection maps to one Safe RPC session.
 
 ### WebSocket
 
-The most common case: browser or service talking to a server over WS.
-
-```typescript
-function wsChannel(ws: WebSocket): Channel {
-  return {
-    send(data) {
-      ws.send(data);
-    },
-    receive(cb) {
-      const handler = (e: MessageEvent) => {
-        if (e.data instanceof ArrayBuffer) cb(new Uint8Array(e.data));
-      };
-      ws.addEventListener("message", handler);
-      return () => ws.removeEventListener("message", handler);
-    },
-  };
-}
-```
-
-Make sure `ws.binaryType = "arraybuffer"` on the browser side.
+The most common case: browser or service talking to a server over WS. Ships
+as code — `@dotex/saferpc/channels` — because WS is the one transport with a
+lifecycle trap (see [the adapter contract](#adapter-contract-send-or-throw-no-queues-stay-available) below).
 
 ```typescript
 // Server (Node.js, ws package)
 import { WebSocketServer } from "ws";
 import { server } from "@dotex/saferpc";
+import { socketChannel } from "@dotex/saferpc/channels";
 
 const serverSecret = crypto.getRandomValues(new Uint8Array(32));
 const wss = new WebSocketServer({ port: 8080 });
 
 wss.on("connection", (ws) => {
-  const { destroy } = server(router, wsChannel(ws), {
+  const { destroy } = server(router, socketChannel(ws), {
     auth: { secret: () => serverSecret },
     onError: console.error,
   });
@@ -55,18 +39,37 @@ wss.on("connection", (ws) => {
 });
 
 // Client (browser)
-const ws = new WebSocket("ws://localhost:8080");
-ws.binaryType = "arraybuffer";
-await new Promise((r) => (ws.onopen = r));
+import { client } from "@dotex/saferpc";
+import { wsChannel } from "@dotex/saferpc/channels";
 
-const { api } = client<typeof router>(wsChannel(ws), {
+const channel = wsChannel("ws://localhost:8080");
+const { api } = client<typeof router>(channel, {
   auth: { secret: () => serverSecret },
 });
 
 const user = await api.getUser({ id: "123" });
+// on app shutdown: channel.close()
 ```
 
-A WebSocket carries one logical Safe RPC session per connection. Reconnect = new handshake.
+`wsChannel(source, opts?)` **owns the socket lifecycle**: it connects
+immediately, and when the socket closes it reconnects at once and keeps the
+transport open as long as possible (exponential backoff, forever, until
+`close()`). While the socket is down `send` throws synchronously — the core
+catches that, queues the frame, and retries on its own tick. Transport errors
+are surfaced through the optional `onDown`/`onUp` observability hooks.
+`source` is a URL string (uses the global `WebSocket`) or a factory `() => ws`
+for the `ws` package / custom construction.
+
+`socketChannel(ws)` is the plain single-socket wrapper: no reconnect, no
+queue. The server uses it because a server cannot reconnect a client's
+socket — there, connection death IS session death, and `ws.on("close",
+destroy)` stays right.
+
+With a per-connection `server()` (the wiring above) the client's kept session
+is useless after a reconnect — the first call times out and the client
+re-handshakes lazily. Keeping the session pays off when the server side
+outlives the socket (a long-lived session binding that re-attaches to each
+new connection): then calls in flight across a socket blip just complete.
 
 ### TCP socket (Node.js)
 
@@ -319,8 +322,16 @@ function waitDCOpen(dc: RTCDataChannel): Promise<void> {
   return new Promise<void>((resolve, reject) => {
     if (dc.readyState === "open") return resolve();
     dc.addEventListener("open", () => resolve(), { once: true });
-    dc.addEventListener("error", () => reject(new Error("data channel error")), { once: true });
-    dc.addEventListener("close", () => reject(new Error("data channel closed")), { once: true });
+    dc.addEventListener(
+      "error",
+      () => reject(new Error("data channel error")),
+      { once: true },
+    );
+    dc.addEventListener(
+      "close",
+      () => reject(new Error("data channel closed")),
+      { once: true },
+    );
   });
 }
 ```
@@ -354,13 +365,16 @@ pc.addEventListener("datachannel", (e) => {
 
 #### Symmetric peer
 
-WebRTC peers are symmetric — nothing says one side is the server. To expose a router *and* call the other side's, open two channels on the same `RTCPeerConnection`: one where you serve, one where you call. They share the underlying DTLS/SCTP transport.
+WebRTC peers are symmetric — nothing says one side is the server. To expose a router _and_ call the other side's, open two channels on the same `RTCPeerConnection`: one where you serve, one where you call. They share the underlying DTLS/SCTP transport.
 
 ```typescript
 function joinPeer(pc: RTCPeerConnection) {
   // Serve our router on a channel we open
   const outbound = pc.createDataChannel("peer", { ordered: true });
-  const serving = server(router, webRTCChannel(outbound), { auth, onError: console.error });
+  const serving = server(router, webRTCChannel(outbound), {
+    auth,
+    onError: console.error,
+  });
 
   // Call the peer's router on the channel they open
   const calling = new Promise<Client<typeof router>>((resolve) => {
@@ -372,7 +386,10 @@ function joinPeer(pc: RTCPeerConnection) {
 
   return {
     api: () => calling,
-    close: () => { serving.destroy(); pc.close(); },
+    close: () => {
+      serving.destroy();
+      pc.close();
+    },
   };
 }
 ```
@@ -425,6 +442,33 @@ The rules are the same as everywhere else:
 
 1. `send` accepts `Uint8Array` and gets it to the other side.
 2. `receive(cb)` calls `cb` with each incoming `Uint8Array`. It returns an unsubscribe function.
-3. The transport is allowed to drop, duplicate, or reorder messages. Safe RPC will time out and retry. It will not behave correctly if your transport silently corrupts bytes. Wrap it in something that fails noisily if you cannot trust it.
+3. The transport is allowed to drop, duplicate, or reorder messages. Safe RPC will time out and surface a typed error (it does not auto-retry — the caller decides whether to resend). It will not behave correctly if your transport silently corrupts bytes. Wrap it in something that fails noisily if you cannot trust it.
+4. If the transport can die (sockets), the adapter owns liveness — see the [adapter contract](#adapter-contract-send-or-throw-no-queues-stay-available) below. In brief: throw from `send` when the transport is down (the core queues and retries), reconnect eagerly, never queue inside the adapter.
 
-That is the whole API surface. Encryption, framing, retry, key management: all on the Safe RPC side. Your adapter does not need to care.
+That is the whole API surface. Encryption, framing, key management: all on the Safe RPC side. Your adapter does not need to care.
+
+### Adapter contract: send or throw, no queues, stay available
+
+The client core owns the outbound queue. The adapter's job is simpler:
+
+- **`send` MUST throw synchronously** (or reject, for async adapters) when it
+  cannot hand the frame to a live transport right now. No internal queues, no
+  buffering, no retry — accepting a frame the adapter cannot deliver lies to
+  the core about the sent boundary.
+- **No queues inside adapters.** Queueing in a transport adapter is an
+  antipattern: it duplicates state the core already owns and moves the
+  "never-left" bookkeeping to a place the core cannot see. The core retries
+  frames it gets back via throw; it cannot know about frames an adapter
+  accepted and then lost.
+- **Stay available.** When the transport closes, reconnect at once and keep
+  it open as long as possible (backoff, forever, until explicit `close()`).
+  The channel's job is availability; delivery bookkeeping is the core's.
+
+`wsChannel` in `@dotex/saferpc/channels` implements this contract; use it as
+the reference. Two WS-specific traps it absorbs, for anyone writing their
+own: browser `WebSocket.send()` on a **CLOSED** socket silently drops the
+frame (it only throws while `CONNECTING`) — without a `readyState` check,
+every failure degrades into a stacked RPC + handshake timeout (~35 s with
+defaults) surfacing as a misleading `HANDSHAKE "Handshake timeout"`; and a
+socket in a transient non-OPEN state must be detected by checking
+`readyState`, not by catching the send exception.

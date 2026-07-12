@@ -9,6 +9,7 @@
 
 ## Learn
 - [Security & Auth](spec/security.md)
+- [Security Assessment](spec/assessment.md)
 - [Transports & Integrations](spec/integrations.md)
 
 ## Reference
@@ -45,7 +46,7 @@ No HTTP. No JSON. No middleware stack. Encryption is the default because the des
 
 ## What problems it solves
 
-**The trusted-transport assumption.** TLS protects the wire between two specific endpoints. Once a message hits a proxy, a service worker, a content script, or a postMessage bridge, TLS is gone and the payload is plaintext to anyone in that hop. Safe RPC encrypts payloads at the *application* layer, so the hop count between endpoints stops mattering. Only the two endpoints can read anything.
+**The trusted-transport assumption.** TLS protects the wire between two specific endpoints. Once a message hits a proxy, a service worker, a content script, or a postMessage bridge, TLS is gone and the payload is plaintext to anyone in that hop. Safe RPC encrypts payloads at the _application_ layer, so the hop count between endpoints stops mattering. Only the two endpoints can read anything.
 
 **The handwritten message bus.** Every team that ships a browser extension or an iframe-embedded widget eventually grows its own RPC layer: a request-id map, a `Promise` registry, a timeout sweeper, an error-coercion path, type definitions kept in sync by hand. Safe RPC is that code, written once.
 
@@ -66,7 +67,7 @@ No HTTP. No JSON. No middleware stack. Encryption is the default because the des
 2. On the first call, a handshake runs automatically. Ephemeral X25519 keys are exchanged and a session key is derived using the secret as HKDF salt.
 3. The server proves it knows the secret with an HMAC over the transcript. The client proves it implicitly by producing valid ciphertext.
 4. All calls are encrypted with XSalsa20-Poly1305 AEAD under the session key.
-5. If the session drops, the client resets and re-handshakes transparently. The pending call retries once.
+5. If the session drops, the first sent call that times out surfaces `RPCAbortedError("TIMEOUT")` and resets the session; the next call re-handshakes lazily. A call that never left surfaces a plain `RPCError("CHANNEL")` without touching the session. There is no silent resend; the caller decides whether to retry.
 
 No certificates. No token refresh. No auth middleware. A shared secret and a channel.
 
@@ -76,17 +77,17 @@ See the [Getting Started](spec/getting-started.md) guide to set it up in under f
 
 tRPC is excellent. It solved type-safe RPC for the HTTP world, and for a Next.js app calling its own backend, tRPC is the right answer. Safe RPC is for the cases tRPC's HTTP assumption rules out.
 
-|  | tRPC (+ plugins) | Safe RPC |
-|---|---|---|
-| **Transport** | HTTP, WebSocket via adapter | Any bidirectional byte channel, same API |
-| **Encryption** | TLS at the edge; plaintext after that | E2E AEAD on every message, every hop |
-| **Roles** | Server / client (asymmetric) | Peer / peer; either side can serve |
-| **Auth** | `trpc-shield`, middleware per-procedure, enforced after parse | Bound to the handshake; no session, no calls |
-| **Edge runtimes** | Mostly works; init can be async | Synchronous init, no top-level `await` |
-| **Browser extension** | Possible with a custom link and plugins | Drop-in: content script ↔ background ↔ popup |
-| **WebRTC / iframes** | Not the target use case | First-class |
-| **Dependencies** | Adapters per transport, plugins per concern | One package: `@noble/*`, `@msgpack/msgpack`, `zod` |
-| **Wire format** | JSON | msgpack inside an AEAD envelope |
+|                       | tRPC (+ plugins)                                              | Safe RPC                                           |
+| --------------------- | ------------------------------------------------------------- | -------------------------------------------------- |
+| **Transport**         | HTTP, WebSocket via adapter                                   | Any bidirectional byte channel, same API           |
+| **Encryption**        | TLS at the edge; plaintext after that                         | E2E AEAD on every message, every hop               |
+| **Roles**             | Server / client (asymmetric)                                  | Peer / peer; either side can serve                 |
+| **Auth**              | `trpc-shield`, middleware per-procedure, enforced after parse | Bound to the handshake; no session, no calls       |
+| **Edge runtimes**     | Mostly works; init can be async                               | Synchronous init, no top-level `await`             |
+| **Browser extension** | Possible with a custom link and plugins                       | Drop-in: content script ↔ background ↔ popup       |
+| **WebRTC / iframes**  | Not the target use case                                       | First-class                                        |
+| **Dependencies**      | Adapters per transport, plugins per concern                   | One package: `@noble/*`, `@msgpack/msgpack`, `zod` |
+| **Wire format**       | JSON                                                          | msgpack inside an AEAD envelope                    |
 
 The plugin route works, but it stacks. `@trpc/server` plus `@trpc/client` plus a WebSocket link plus a custom transformer plus `trpc-shield` for auth plus a logger plus a rate limiter plus something to encrypt the payload (which does not exist as a polished plugin, so you write it). Each plugin has its own release cadence and its own opinions. Safe RPC ships the whole thing as one surface because it is the same problem viewed from a different angle.
 
@@ -116,7 +117,7 @@ Encryption is the difference between trusting every box on the path and not need
 
 **Worker communication.** Web Workers, SharedWorkers, and Service Workers communicate through MessagePorts. Safe RPC provides a structured, validated API layer instead of ad-hoc message passing.
 
-**Microservices over WebSocket.** Two services need a persistent bidirectional connection. REST falls apart. Safe RPC over WebSocket gives typed calls in both directions, encrypted, with auto-retry. No API gateway, no TLS proxy.
+**Microservices over WebSocket.** Two services need a persistent bidirectional connection. REST falls apart. Safe RPC over WebSocket gives typed calls in both directions, encrypted, with lazy re-handshake on reconnect. No API gateway, no TLS proxy.
 
 **Electron / Tauri IPC.** Main process and renderer need a secure channel. Safe RPC works over any IPC mechanism that can carry binary data.
 

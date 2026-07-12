@@ -1,6 +1,6 @@
 # Security
 
-Safe RPC treats the transport as hostile. This page covers what that buys you, how to configure auth so those guarantees hold, and what is *not* covered. Wire-level mechanics (frame layout, handshake steps, state machines, key derivation) live in [Protocol](protocol.md).
+Safe RPC treats the transport as hostile. This page covers what that buys you, how to configure auth so those guarantees hold, and what is _not_ covered. Wire-level mechanics (frame layout, handshake steps, state machines, key derivation) live in [Protocol](protocol.md). How well the implementation holds up against this model — what was verified and the honest list of residual risks — lives in [Assessment](assessment.md).
 
 ## Threat model
 
@@ -19,7 +19,7 @@ Safe RPC does **not** protect against:
 
 ## Why authentication is required
 
-A bare ephemeral X25519 exchange produces a shared key, but says nothing about *who* the key was shared with. An active attacker on the transport can run the exchange separately with each side, hold two different session keys, and sit between the peers rewriting traffic in both directions. Each side sees a clean handshake; neither sees the other. This is the textbook MITM-on-DH attack and the reason `auth` is not optional.
+A bare ephemeral X25519 exchange produces a shared key, but says nothing about _who_ the key was shared with. An active attacker on the transport can run the exchange separately with each side, hold two different session keys, and sit between the peers rewriting traffic in both directions. Each side sees a clean handshake; neither sees the other. This is the textbook MITM-on-DH attack and the reason `auth` is not optional.
 
 The `auth` callbacks close that gap by binding the ephemeral keys to something the attacker does not have:
 
@@ -50,21 +50,21 @@ When the key is already in memory and the math is synchronous, return `Promise.r
 
 ## Security properties
 
-| Property | Mechanism |
-|----------|-----------|
-| Confidentiality | XSalsa20-Poly1305 AEAD per message |
-| Authentication (session) | Secret mixed into HKDF + optional asymmetric signatures |
-| Server identity | HMAC proof in handshake reply (+ optional signature) |
-| Client identity | Implicit (wrong PSK ⇒ invalid ciphertext) + optional signature |
-| Forward secrecy | Fresh ephemeral X25519 keys per session |
-| Replay across handshakes | Random nonce + epoch counter + transcript-bound signatures |
-| Replay across peers | Domain-separated transcript prefixes |
-| Replay within a session | Random 24-byte nonces per message (probabilistic) |
-| Stale responses | Epoch counter echoed in reply |
-| Prototype pollution | `sanitize()` strips `__proto__`, `constructor`, `prototype` |
-| Type confusion | msgpack extension types disabled (including Timestamp); inbound `bin` fields require exact `Uint8Array` prototype |
-| Memory hygiene | Ephemeral keys zeroed on reset/destroy |
-| Plaintext lifetime | Returned `Uint8Array` fields alias the encrypted payload (msgpack `bin` is zero-copy); copy them out if you need to zero them yourself |
+| Property                 | Mechanism                                                                                                                              |
+| ------------------------ | -------------------------------------------------------------------------------------------------------------------------------------- |
+| Confidentiality          | XSalsa20-Poly1305 AEAD per message                                                                                                     |
+| Authentication (session) | Secret mixed into HKDF + optional asymmetric signatures                                                                                |
+| Server identity          | HMAC proof in handshake reply (+ optional signature)                                                                                   |
+| Client identity          | Implicit (wrong PSK ⇒ invalid ciphertext) + optional signature                                                                         |
+| Forward secrecy          | Fresh ephemeral X25519 keys per session                                                                                                |
+| Replay across handshakes | Random nonce + epoch counter + transcript-bound signatures                                                                             |
+| Replay across peers      | Domain-separated transcript prefixes                                                                                                   |
+| Replay within a session  | Random 24-byte nonces + bounded seen-nonce set (server, default 4096)                                                                  |
+| Stale responses          | Epoch counter echoed in reply                                                                                                          |
+| Prototype pollution      | `sanitize()` strips `__proto__`, `constructor`, `prototype`                                                                            |
+| Type confusion           | msgpack extension types disabled (including Timestamp); inbound `bin` fields require exact `Uint8Array` prototype                      |
+| Memory hygiene           | Ephemeral keys zeroed on reset/destroy                                                                                                 |
+| Plaintext lifetime       | Returned `Uint8Array` fields alias the encrypted payload (msgpack `bin` is zero-copy); copy them out if you need to zero them yourself |
 
 ## Authentication modes
 
@@ -113,19 +113,19 @@ auth: {
 }
 ```
 
-Use when you want session binding *and* identity proof. An attacker must now compromise two independent things (the derivation secret and the device key) and still cannot read past sessions because of forward secrecy.
+Use when you want session binding _and_ identity proof. An attacker must now compromise two independent things (the derivation secret and the device key) and still cannot read past sessions because of forward secrecy.
 
 ### Comparison
 
-| Property | Session-derived secret | Asymmetric |
-|----------|----------------------|------------|
-| Identity granularity | Per session | Per key/device |
-| Revocation | Rotate root secret (affects all) | Revoke individual keys |
-| Compromise blast radius | All sessions sharing the root | The compromised device only |
-| Forward secrecy | Ephemeral ECDH | Ephemeral ECDH |
-| Replay protection | Epoch + nonce + key binding | Transcript bound |
-| Cost | Low (HMAC only) | Higher (signature ops) |
-| Complexity | Simple | More moving parts |
+| Property                | Session-derived secret           | Asymmetric                  |
+| ----------------------- | -------------------------------- | --------------------------- |
+| Identity granularity    | Per session                      | Per key/device              |
+| Revocation              | Rotate root secret (affects all) | Revoke individual keys      |
+| Compromise blast radius | All sessions sharing the root    | The compromised device only |
+| Forward secrecy         | Ephemeral ECDH                   | Ephemeral ECDH              |
+| Replay protection       | Epoch + nonce + key binding      | Transcript bound            |
+| Cost                    | Low (HMAC only)                  | Higher (signature ops)      |
+| Complexity              | Simple                           | More moving parts           |
 
 Forward secrecy comes from the ephemeral X25519 exchange in either mode. Even if a long-term secret leaks, past session ciphertexts remain unreadable. The ephemeral private keys were zeroed when the session ended.
 
@@ -214,6 +214,35 @@ auth: {
 
 The unsafe list shares one pattern: the attacker can reproduce the derivation, either because the input is guessable or because the secret material lives in the wrong place.
 
+### The secret is a key, not a password
+
+The `secret` **must** be a high-entropy cryptographic key (e.g. `randomBytes(32)` from a CSPRNG), not a password or passphrase. The 32-byte minimum length is a floor, not a guarantee of strength: 32 bytes of a human-chosen or dictionary-derived value still has only password-level entropy.
+
+The reason is a proof oracle inherent to the handshake. On any well-formed hello the server derives `session_key = HKDF(raw, salt=secret)` and returns `proof = HMAC(session_key, s_pub‖c_pub‖c_nonce)` — before the client has proven anything. An attacker who sends their own hello with an ephemeral pair they generated knows `raw` (X25519 is symmetric: `X25519(attacker_priv, s_pub) == X25519(s_priv, attacker_pub)`), and receives `s_pub` and `proof`. That leaves the secret as the only unknown in the proof, so the attacker can grind candidate secrets **offline**, at billions of guesses per second, with no further traffic to the server:
+
+```
+for guess in candidates:            # offline, no network
+    k = HKDF(raw, salt=guess)
+    if HMAC(k, s_pub‖c_pub‖c_nonce) == proof:  # found it
+```
+
+Against a random 32-byte key this is 2²⁵⁶ work — infeasible. Against a password-derived secret it is a fast dictionary attack. This is a property of the scheme (PSK as HKDF salt with a server-first proof), not a fixable bug; defending weak passwords would require a PAKE, which saferpc is not.
+
+```typescript
+// ✅ Real random key from a CSPRNG
+import { randomBytes } from "@noble/ciphers/utils.js";
+const key = randomBytes(32);
+auth: { secret: () => key }
+
+// ❌ Password / passphrase used directly — offline-bruteforceable via the proof
+auth: { secret: () => new TextEncoder().encode("correct horse battery staple") }
+
+// ⚠️ If you MUST start from a human password, stretch it with a slow KDF first
+//     (scrypt / argon2) — this raises the per-guess cost but does not make a
+//     weak password strong; prefer a real random key wherever possible.
+auth: { secret: async () => await scrypt(password, salt, { N: 2**17, r: 8, p: 1, dkLen: 32 }) }
+```
+
 ## Built-in signature helpers
 
 Safe RPC ships ready-made helpers for the common cases. Each one binds its proof to the handshake transcript that Safe RPC passes in.
@@ -257,7 +286,7 @@ Uses `@noble/curves` so it works in every JS runtime. No dependency on WebCrypto
 
 ```typescript
 const clientAuth = createECDSAClientAuth({
-  privateKey: ecdsaPrivateKey,      // CryptoKey (can be non-extractable)
+  privateKey: ecdsaPrivateKey, // CryptoKey (can be non-extractable)
   identifier: "device-123",
 });
 
@@ -315,30 +344,36 @@ The client embeds `{ primary, secondary }`: two pre-encoded sub-payloads.
 
 ## Replay within a session
 
-Safe RPC uses random 24-byte nonces (not counters) for XSalsa20-Poly1305. The collision probability is negligible. But **a captured ciphertext can be replayed by an attacker who can inject into a live channel**. The replayed message will decrypt and execute again.
+Safe RPC uses random 24-byte nonces (not counters) for XSalsa20-Poly1305. The collision probability is negligible. A captured ciphertext could otherwise be replayed by an attacker who can inject into a live channel, and the replayed message would decrypt and execute again.
 
-For non-idempotent operations, add an idempotency key inside the procedure input, or keep a request-ID set on the server keyed by the verified principal.
+As of 0.7.0 the server keeps a **bounded seen-nonce set** per session (`replayWindow`, default 4096): it records the nonce of every frame that passes Poly1305 and silently drops any later frame carrying a nonce it has already seen. This closes the replay window for the last `replayWindow` messages of a session, with no wire change and no ordering requirement (so lossy / reordering transports stay supported). The set is cleared on every re-handshake, and only the server needs it — the client already matches responses to a monotonic request `id` that is never reused.
 
-This is the only known replay window in the protocol. A counter-based scheme would close it, but it would also require strict transport ordering, and several supported transports (BroadcastChannel, lossy WebRTC, multi-path links) cannot promise that.
+The window is **narrowed to N, not closed**: a replay older than the last `replayWindow` accepted messages still executes. For non-idempotent operations on long-lived sessions, still add an idempotency key inside the procedure input, or keep a request-ID set keyed by the verified principal. Set `replayWindow: 0` to disable the defense. Counter-based nonces would close the window fully but require strict transport ordering and directional keys (keystream reuse otherwise on the single shared key); that is deferred to a future protocol version.
 
 ## Recommended configurations
 
 **Public web app (browser ↔ server):** asymmetric auth. No shared secrets in the bundle.
 
 ```typescript
-auth: { sign: async (t) => signWithSessionJWT(t) }
+auth: {
+  sign: async (t) => signWithSessionJWT(t);
+}
 ```
 
 **Mobile app ↔ backend:** device certificates or platform attestation.
 
 ```typescript
-auth: { sign: async (t) => getDeviceAttestation(t) }
+auth: {
+  sign: async (t) => getDeviceAttestation(t);
+}
 ```
 
 **Microservices (server ↔ server):** session-derived secret from a service-mesh identity.
 
 ```typescript
-auth: { secret: async () => deriveSessionSecret(await serviceToken(), clusterSecret) }
+auth: {
+  secret: async () => deriveSessionSecret(await serviceToken(), clusterSecret);
+}
 ```
 
 **High-security environment:** both secret and asymmetric, with hardware key storage on at least one side.
@@ -353,13 +388,13 @@ auth: {
 
 ## Constants and limits
 
-| Constant | Value | Notes |
-|----------|-------|-------|
-| `NONCE_LEN` | 24 | XSalsa20-Poly1305 per-message nonce |
-| `KEY_LEN` | 32 | Symmetric key, X25519 pub/priv, and the client hello nonce |
-| `MAX_HELLO_BYTES` | 65,536 | Sized for typical signature payloads |
-| `MAX_AUTH_BYTES` | 32,768 | Hard cap on `auth` payload inside a hello/reply |
-| `MAX_MSG_BYTES` | 1,048,576 | Per encrypted RPC frame (configurable) |
-| `HANDSHAKE_TIMEOUT` | 5,000 ms | Default |
-| Secret minimum | 32 bytes | Validated when `secret()` returns |
-| Encryption nonce | 24 bytes | Random per message |
+| Constant            | Value     | Notes                                                      |
+| ------------------- | --------- | ---------------------------------------------------------- |
+| `NONCE_LEN`         | 24        | XSalsa20-Poly1305 per-message nonce                        |
+| `KEY_LEN`           | 32        | Symmetric key, X25519 pub/priv, and the client hello nonce |
+| `MAX_HELLO_BYTES`   | 65,536    | Sized for typical signature payloads                       |
+| `MAX_AUTH_BYTES`    | 32,768    | Hard cap on `auth` payload inside a hello/reply            |
+| `MAX_MSG_BYTES`     | 1,048,576 | Per encrypted RPC frame (configurable)                     |
+| `HANDSHAKE_TIMEOUT` | 5,000 ms  | Default                                                    |
+| Secret minimum      | 32 bytes  | Validated when `secret()` returns                          |
+| Encryption nonce    | 24 bytes  | Random per message                                         |

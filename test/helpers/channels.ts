@@ -3,6 +3,9 @@
  *   - createChannelPair        — in-memory two-way pair (synchronous)
  *   - createAsyncChannelPair   — same, but send() resolves on next tick
  *   - createMitmChannelPair    — middlebox you can stop/tamper/inject through
+ *   - createFaultChannelPair   — pair whose link can go down/up; while down
+ *                                both endpoints queue their sends (adapter
+ *                                lifecycle contract) and flush in order on up
  *   - portChannel              — wrap a worker_threads MessagePort
  *   - wsChannel                — wrap a `ws` WebSocket
  */
@@ -167,6 +170,67 @@ export function createMitmChannelPair(): {
   };
 
   return { a, b, mitm };
+}
+
+export interface FaultLink {
+  goDown: () => void;
+  goUp: () => void;
+  isUp: () => boolean;
+}
+
+/**
+ * In-memory pair whose link can be taken down and brought back. Implements
+ * the v2 Channel contract (common.ts `Channel` jsdoc): while the link is
+ * down, `send` THROWS synchronously — no internal queuing, no buffering.
+ * The core outbound queue is the sole owner of undelivered frames. On
+ * `goUp()` the channel becomes available again; the core retry tick will
+ * re-send any queued frames within its next tick (≤ 250 ms).
+ */
+export function createFaultChannelPair(): {
+  a: Channel;
+  b: Channel;
+  link: FaultLink;
+} {
+  let aCb: ((data: Uint8Array) => void) | null = null;
+  let bCb: ((data: Uint8Array) => void) | null = null;
+  let up = true;
+
+  const a: Channel = {
+    send(data) {
+      if (!up) throw new Error("channel down");
+      if (bCb) bCb(data);
+    },
+    receive(cb) {
+      aCb = cb;
+      return () => {
+        if (aCb === cb) aCb = null;
+      };
+    },
+  };
+  const b: Channel = {
+    send(data) {
+      if (!up) throw new Error("channel down");
+      if (aCb) aCb(data);
+    },
+    receive(cb) {
+      bCb = cb;
+      return () => {
+        if (bCb === cb) bCb = null;
+      };
+    },
+  };
+
+  const link: FaultLink = {
+    goDown() {
+      up = false;
+    },
+    goUp() {
+      up = true;
+    },
+    isUp: () => up,
+  };
+
+  return { a, b, link };
 }
 
 /** Wrap a worker_threads MessagePort. */

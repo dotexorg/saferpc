@@ -98,6 +98,56 @@ describe("security / DoS — client backpressure", () => {
       srv.destroy();
     }
   });
+
+  // C1 regression: a maxPending overflow is a CLIENT guardrail error, not a
+  // transport failure. It must NOT trigger a session reset + re-handshake +
+  // resend of the in-flight calls (the old auto-retry path did, silently
+  // executing each of the 4 healthy calls twice while the caller saw one
+  // clean success). Assert exec count == 4 and hello count == 1.
+  it("maxPending overflow does not reset the session or double-execute", async () => {
+    const psk = randomBytes(32);
+    const { a, b, mitm } = createMitmChannelPair();
+    let execCount = 0;
+    const router: Router = {
+      slow: chain().handler(async () => {
+        execCount++;
+        return new Promise<string>((r) => setTimeout(() => r("done"), 150));
+      }),
+    };
+    const srv = server(router, a, { auth: { secret: () => psk } });
+    const { api, destroy } = client(b, {
+      auth: { secret: () => psk },
+      timeout: 5000,
+      maxPending: 4,
+    });
+    try {
+      const inflight: Array<Promise<unknown>> = [];
+      for (let i = 0; i < 4; i++) inflight.push(api.slow({}));
+      await Promise.resolve();
+
+      let blocked: unknown;
+      try {
+        await api.slow({});
+      } catch (err) {
+        blocked = err;
+      }
+      expect((blocked as RPCError).code).toBe("CLIENT");
+
+      const all = await Promise.all(inflight);
+      expect(all).toEqual(["done", "done", "done", "done"]);
+
+      // The 4 healthy calls each ran exactly once...
+      expect(execCount).toBe(4);
+      // ...and the good session was never torn down: a single handshake.
+      const helloCount = mitm.state.captures.filter(
+        (c) => c.dir === "BtoA" && c.data[0] === 0x00,
+      ).length;
+      expect(helloCount).toBe(1);
+    } finally {
+      destroy();
+      srv.destroy();
+    }
+  });
 });
 
 describe("security / DoS — depth bomb input", () => {

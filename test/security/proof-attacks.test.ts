@@ -105,7 +105,7 @@ describe("security / handshake proof", () => {
       }
     } finally {
       destroy();
-      unsubscribe();
+      unsubscribe?.();
     }
   });
 

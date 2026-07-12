@@ -15,13 +15,13 @@ npm install @dotex/saferpc
 ![Safe RPC](banner.png)
 
 - **Full docs and rationale:** <https://dotex.org/epic/saferpc>
-- [Quickstart](./spec/getting-started.md) · [API](./spec/api.md) · [Wire Protocol](./spec/protocol.md) · [Security](./spec/security.md) · [Transports](./spec/integrations.md)
+- [Quickstart](./spec/getting-started.md) · [API](./spec/api.md) · [Wire Protocol](./spec/protocol.md) · [Security](./spec/security.md) · [Assessment](./spec/assessment.md) · [Transports](./spec/integrations.md)
 
 ## Highlights
 
 - **Typed procedures** with Zod input/output validation
 - **End-to-end encryption.** X25519 ECDH, XSalsa20-Poly1305 AEAD, HKDF-SHA-256, with forward secrecy by design
-- **Lazy handshake** on the first call. Transparent auto-retry when the session drops
+- **Lazy handshake** on the first call. Lazy re-handshake on the next call when the session drops — failures surface with a typed code, never silently resent
 - **Three auth modes:** pre-shared secret, asymmetric (Ed25519 / ECDSA / JWT / cert / multifactor), or both for defense-in-depth
 - **Synchronous** `client()` and `server()`. Runs in Node.js, browsers, Service Workers, React Native, Vercel Edge, Cloudflare Workers, Deno Deploy
 - **Tiny surface.** `@noble/*` crypto, `@msgpack/msgpack`, `zod`, and nothing else
@@ -65,7 +65,7 @@ const { api, destroy: stopClient } = client<AppRouter>(clientChannel, { auth });
 const { message } = await api.greet({ name: "World" }); // input & output typed
 ```
 
-`client()` and `server()` are synchronous. No top-level `await`. The handshake runs lazily on the first procedure call. If the session drops, the next call retries once with a fresh handshake.
+`client()` and `server()` are synchronous. No top-level `await`. The handshake runs lazily on the first procedure call. If the session drops, the first sent call to hit its reply-timeout surfaces `RPCAbortedError("TIMEOUT")` and resets the session — the next call re-handshakes lazily. A call that provably never left surfaces a plain `RPCError` and resets nothing: never-left is a transport event, the keys are fine, retrying is safe. The client never silently resends either way (that would double-execute non-idempotent handlers). Transport death alone doesn't touch the session: a reconnecting adapter (see `@dotex/saferpc/channels`) lets in-flight calls complete across a socket blip. Per-call `AbortSignal` (`api.thing(input, { signal })`) cancels waiting without tearing anything down.
 
 Because `rpc` carries `Context`, procedures can be authored in any file with a fully-typed `ctx`, and `server()` requires a `context()` that returns the type your procedures expect.
 
@@ -107,15 +107,20 @@ Built-in helpers cover Ed25519, ECDSA P-256, JWT, certificate-based, and multifa
 ## Errors
 
 ```typescript
-import { RPCError, RemoteRPCError } from "@dotex/saferpc";
+import { RPCError, RPCAbortedError, RemoteRPCError } from "@dotex/saferpc";
 
 try {
   await api.greet({ name: "World" });
 } catch (err) {
   if (err instanceof RemoteRPCError) {
     // The remote peer threw. err.code / err.message / err.data come from there.
+  } else if (err instanceof RPCAbortedError) {
+    // The request WAS sent but the outcome is unknown (TIMEOUT, ABORTED,
+    // SESSION) — it may have executed. Reconcile state before retrying.
   } else if (err instanceof RPCError) {
-    // Local failure: TIMEOUT, SESSION, HANDSHAKE, INPUT_VALIDATION, ...
+    // Local failure, the request never left the process: CHANNEL, ABORTED,
+    // SESSION, HANDSHAKE, CLIENT, ... — safe to retry as-is.
+    // (validation errors like INPUT_VALIDATION run server-side and arrive as RemoteRPCError)
   } else {
     throw err;
   }
@@ -128,7 +133,7 @@ try {
 src/
   common.ts       : shared types, crypto, msgpack, procedure builder
   server.ts       : resilient handshake server
-  client.ts       : lazy handshake client with auto-retry
+  client.ts       : lazy handshake client (no auto-retry)
   auth/
     index.ts      : combined re-exports (deriveSessionSecret + client + server)
     client.ts     : Ed25519, ECDSA, JWT client helpers
@@ -143,7 +148,10 @@ import { server } from "@dotex/saferpc/server";
 import { client } from "@dotex/saferpc/client";
 import { saferpc, RPCError } from "@dotex/saferpc/common";
 // Auth helpers: combined or split per side
-import { createEd25519ClientAuth, createEd25519ServerAuth } from "@dotex/saferpc/auth";
+import {
+  createEd25519ClientAuth,
+  createEd25519ServerAuth,
+} from "@dotex/saferpc/auth";
 import { createEd25519ClientAuth } from "@dotex/saferpc/auth/client";
 import { createEd25519ServerAuth } from "@dotex/saferpc/auth/server";
 ```
@@ -154,7 +162,7 @@ Node.js 18+, modern browsers, Service / Web / Shared Workers, React Native, Verc
 
 ## Project status
 
-`0.x` with a stable wire protocol (`saferpc-v1` HKDF info, `saferpc-hs-{hello,reply}-v1` transcript prefixes). Test coverage for handshake attacks, replay, tampering, type confusion, prototype pollution, middleware misuse, and DoS limits lives in `test/security/`. A 1.0 release will lock the public API surface.
+`0.x` with a stable wire protocol (`saferpc-v1` HKDF info, `saferpc-hs-{hello,reply}-v1` transcript prefixes). Test coverage for handshake attacks, replay, tampering, type confusion, prototype pollution, middleware misuse, and DoS limits lives in `test/security/`. An internal line-by-line security review — including the honest list of residual risks and open issues — is published in [spec/assessment.md](./spec/assessment.md). A 1.0 release will lock the public API surface.
 
 ## Releasing
 

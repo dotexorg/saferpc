@@ -1,6 +1,6 @@
 {
   "name": "@dotex/saferpc",
-  "version": "0.6.1",
+  "version": "0.7.0",
   "description": "Safe RPC for any two counterparties over any bidirectional channel",
   "type": "module",
   "files": [
@@ -92,6 +92,11 @@
       "types": "./esm/server.d.ts",
       "import": "./esm/server.js",
       "require": "./cjs/server.js"
+    },
+    "./channels": {
+      "types": "./esm/channels/index.d.ts",
+      "import": "./esm/channels/index.js",
+      "require": "./cjs/channels/index.js"
     }
   },
   "sideEffects": false,
