@@ -221,14 +221,14 @@ Returns synchronously. The handshake stays lazy: it starts on the first `api` ca
 | `timeout`          | `number` (ms) | `30_000`    | —        |
 | `maxPending`       | `number`      | `256`       | —        |
 | `handshakeTimeout` | `number` (ms) | `5000`      | —        |
-| `sendTimeout`      | `number` (ms) | `10_000`    | —        |
+| `sendTimeout`      | `number` (ms) | `3_000`     | —        |
 | `maxMessageBytes`  | `number`      | `1_048_576` | —        |
 
 `maxPending` caps concurrent in-flight calls. Past the cap, calls reject with `RPCError("CLIENT", "Too many pending requests")`.
 
 `timeout` applies to every call. On timeout the client throws `RPCAbortedError("TIMEOUT", "Timed out: <procedure>")` if the frame had already been sent (outcome unknown — do not blind-resend; the session resets and the next call re-handshakes), or plain `RPCError("CHANNEL")` if the frame had not yet left the process (retry freely; no reset). Set `timeout` generously — it is the safety net, not a UX budget; shorten a single call with [`AbortSignal.timeout`](#calloptions--per-call-abort) instead.
 
-`sendTimeout` is the maximum time a frame spends in the core outbound queue waiting for a live channel before the call fails with a definite `RPCError("CHANNEL")` (never sent — retry freely). Default 10 000 ms. Not a caller-facing UX knob; it is the boundary between the definite and unknown failure paths.
+`sendTimeout` is the maximum time a frame spends in the core outbound queue waiting for a live channel before the call fails with a definite `RPCError("CHANNEL")` (never sent — retry freely). Default 3 000 ms — fail fast: the error is provably "never left", so retrying at the call site is always safe, and a frame that could not leave for 3 s is usually stale anyway. Raise it for transports with long reconnect cycles. Not a caller-facing UX knob; it is the boundary between the definite and unknown failure paths.
 
 ### `Client<T>`
 

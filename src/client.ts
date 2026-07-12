@@ -61,7 +61,7 @@ import {
 const PROOF_LEN = 32;
 const MAX_PENDING = 256;
 const DEFAULT_TIMEOUT = 30_000;
-const DEFAULT_SEND_TIMEOUT = 10_000;
+const DEFAULT_SEND_TIMEOUT = 3_000;
 // Outbound retry tick. Internal, not a caller lever — `sendTimeout` is the
 // contract; the tick only bounds how fast a revived channel is noticed.
 const SEND_RETRY_MS = 250;
@@ -150,7 +150,7 @@ export interface ClientOptions {
    * A `send` that throws does not fail the call — the frame enters the
    * core outbound queue and is retried until this expires. An unsent
    * frame always fails with the definite `CHANNEL` code — even when the
-   * global `timeout` fires first. Default: 10000ms.
+   * global `timeout` fires first. Default: 3000ms.
    */
   sendTimeout?: number;
   /**

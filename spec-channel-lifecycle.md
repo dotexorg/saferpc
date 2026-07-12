@@ -24,7 +24,7 @@ Decisions locked with CTO 2026-07-10:
    antipattern.** The `Channel` contract flips: `send` MUST throw (or reject,
    for async adapters) when it cannot hand the frame to a live transport
    right now. The client core owns the outbound queue and retries unsent
-   frames until a new **`sendTimeout`** (default 10 000 ms) expires. The
+   frames until a new **`sendTimeout`** (default 3 000 ms) expires. The
    channel's only jobs: move frames, and try to stay available
    (auto-reconnect stays in `wsChannel`).
 4. **Unchanged from v1:** lazy reconnect policy (the client core does not
@@ -135,7 +135,7 @@ New `ClientOptions` field:
 
 ```ts
 /** How long a frame may wait for a live channel before the call fails
- *  with a definite "never sent" error. Default 10_000 ms. */
+ *  with a definite "never sent" error. Default 3_000 ms. */
 sendTimeout?: number;
 ```
 
@@ -321,7 +321,7 @@ Hello-waiters were never sent as calls → plain.
 - `abortPending` removed from the client return type. Replacement: shared
   `AbortController` passed per call.
 - `wsChannel` `maxQueue` option removed; `send` now throws while down.
-- New `ClientOptions.sendTimeout` (default 10 000 ms).
+- New `ClientOptions.sendTimeout` (default 3 000 ms).
 - `ClientOptions.timeout` default raised from 10 000 to 30 000 ms. The old
   short default doubled as a UX budget when a timeout auto-healed via
   reset+retry; without auto-retry the per-call UX cap belongs to

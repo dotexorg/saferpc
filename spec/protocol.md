@@ -42,7 +42,7 @@ All wire numbers are network-byte-order (big-endian) unless explicitly noted.
 | `MAX_MSG_BYTES`          | 1,048,576                                           | Max size of an encrypted RPC frame (configurable)                              |
 | `HANDSHAKE_TIMEOUT_MS`   | 5,000                                               | Default timeout for completing the handshake                                   |
 | `RPC_TIMEOUT_MS`         | 30,000                                              | Default per-call timeout (client side)                                         |
-| `SEND_TIMEOUT_MS`        | 10,000                                              | Default outbound-queue deadline for an unsent frame (client side)              |
+| `SEND_TIMEOUT_MS`        | 3,000                                               | Default outbound-queue deadline for an unsent frame (client side)              |
 | `MAX_PENDING`            | 256                                                 | Default maximum in-flight RPCs per client                                      |
 | `MAX_ID_LEN`             | 64                                                  | Max request `id` length accepted by the server                                 |
 | `PROOF_LEN`              | 32                                                  | Length of the HMAC proof in the reply                                          |
@@ -426,7 +426,7 @@ As of 0.7.0 the client does **not** auto-retry. When a sent call times out with 
 
 **Sent boundary.** A call's retry safety is determined by whether its frame reached a live transport. `channel.send` returning without throwing (sync) or its promise resolving (async) is the sent boundary. Before that point, the core holds the only copy of the frame; terminal events (timeout, abort, destroy, `sendTimeout`) reject with a plain `RPCError` — the frame provably never left and the caller may retry freely. After the sent boundary, terminal events reject with `RPCAbortedError` — outcome unknown.
 
-**Core outbound queue.** When `channel.send` throws, the frame enters the core outbound queue. A retry tick (every 250 ms, running only while the queue is non-empty) attempts queued frames in order; the first throw stops the pass (head-of-line: if the channel is down, no later frame bypasses a stuck one). A frame transitions to *sent* the first time `send` succeeds; it then waits for reply-or-timeout only. `sendTimeout` (default 10 000 ms, counted from enqueue) is the per-frame deadline; expiry rejects the call with plain `RPCError("CHANNEL")` — the frame provably never left.
+**Core outbound queue.** When `channel.send` throws, the frame enters the core outbound queue. A retry tick (every 250 ms, running only while the queue is non-empty) attempts queued frames in order; the first throw stops the pass (head-of-line: if the channel is down, no later frame bypasses a stuck one). A frame transitions to *sent* the first time `send` succeeds; it then waits for reply-or-timeout only. `sendTimeout` (default 3 000 ms, counted from enqueue) is the per-frame deadline; expiry rejects the call with plain `RPCError("CHANNEL")` — the frame provably never left.
 
 **Why no resend.** A sent-frame `TIMEOUT` does not prove the server did not execute the request, only that no response arrived in time. Resending would silently execute a non-idempotent handler twice. Unsent frames (`RPCError`) are safe to retry; the library defers that choice to the caller in both cases.
 
