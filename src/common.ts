@@ -515,8 +515,10 @@ export type RouterContext<T extends Router> = UnionToIntersection<
  * boundary. A channel SHOULD try to stay available (reopen its transport
  * eagerly when it dies, hold it open as long as possible) — availability
  * is the channel's job, delivery bookkeeping is the core's. An async
- * `send` must reject, never resolve-then-error: a resolved promise is
- * counted as "frame left the process" and is never resent by any layer.
+ * `send` must reject, never resolve-then-error: the core counts the frame
+ * as sent at handoff (a pending promise may already be on the wire), and a
+ * rejection is the only proof that rolls it back to "never left" — a
+ * resolve-then-error would freeze a lost frame in the sent class forever.
  * Shipped reference implementations: `@dotex/saferpc/channels`
  * (`wsChannel`, `socketChannel`).
  */

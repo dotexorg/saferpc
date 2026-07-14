@@ -63,10 +63,13 @@ throw.
 > outcome unknown; plain local `RPCError` = it never left, retry freely.
 
 The **sent boundary** is defined as: `channel.send(frame)` returned without
-throwing (sync adapters) or its promise resolved (async adapters). Before
-that point the core holds the only copy of the frame and can discard it with
-certainty; after that point the frame's fate is unknowable and it is never
-resent by any layer.
+throwing (sync adapters) or handed back a pending promise (async adapters —
+handoff, not resolution). Between handoff and settlement the frame may
+already be on the wire, so the conservative classification is "outcome
+unknown"; a rejection settling later proves the frame never left and rolls
+the call back to the unsent class. Before the boundary the core holds the
+only copy of the frame and can discard it with certainty; after it the
+frame's fate is unknowable and it is never resent by any layer.
 
 ## 3. Design part I — the channel contract (revised) and `src/channels/`
 
@@ -141,10 +144,13 @@ sendTimeout?: number;
 
 Send path in `sendRequest` (and the hello path in `ensureHandshake`):
 
-1. Try `channel.send(encrypted)` immediately. Success (no throw / resolved
-   promise) → the call is **sent**: it waits for reply-or-timeout exactly as
-   today.
-2. On sync throw or async rejection → the frame enters the **outbound
+1. Try `channel.send(encrypted)` immediately. Success (no throw / a pending
+   promise handed back) → the call is **sent**: it waits for reply-or-timeout
+   exactly as today. If an async send's promise later rejects, the call rolls
+   back to unsent: the frame re-enters the outbound queue while the session
+   is unchanged, or fails with plain `RPCError("CHANNEL")` if a reset staled
+   it in flight.
+2. On sync throw → the frame enters the **outbound
    queue** with its call context. The call's global timer keeps running.
 3. A retry tick (fixed 250 ms interval, running only while the queue is
    non-empty) attempts queued frames **in order**; first throw stops the
@@ -387,8 +393,11 @@ Keep neutral naming/comments, as with `session-continuity.test.ts`.
 3. Grep Enclave for `abortPending` consumers before merging the removal —
    the WS-reconnect branch there was the known caller; it migrates to
    `wsChannel` + shared controller.
-4. Async-send adapters: a rejection arriving *after* the sent boundary was
-   already counted (promise resolved) is impossible by contract; a rejection
-   is always pre-boundary and re-enqueues the frame at the head of the
-   queue. State this in the `Channel` jsdoc so adapter authors reject
-   rather than resolve-then-error.
+4. Async-send adapters: the boundary is counted at handoff (§2), so a
+   rejection always arrives *after* the call was optimistically classed as
+   sent — it is the rollback proof: the frame provably never left, the call
+   returns to the unsent class (re-enqueued at the head of the queue while
+   the session is unchanged, failed plain `CHANNEL` if a reset staled it).
+   State in the `Channel` jsdoc that adapters must reject rather than
+   resolve-then-error — a resolved promise is the adapter's word that the
+   frame reached the transport.

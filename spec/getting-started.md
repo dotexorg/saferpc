@@ -52,31 +52,19 @@ crypto.getRandomValues(new Uint8Array(32)); // run once, store the result
 
 ```typescript
 // server.ts
-import { server, type Channel } from "@dotex/saferpc";
-import { WebSocketServer, type WebSocket } from "ws";
+import { server } from "@dotex/saferpc";
+import { socketChannel } from "@dotex/saferpc/channels";
+import { WebSocketServer } from "ws";
 import { appRouter } from "./router.js";
 
 const secret = new Uint8Array([
   /* 32 bytes from your generator */
 ]);
 
-function wsChannel(ws: WebSocket): Channel {
-  return {
-    send(data) {
-      ws.send(data);
-    },
-    receive(cb) {
-      const handler = (data: Buffer) => cb(new Uint8Array(data));
-      ws.on("message", handler);
-      return () => ws.off("message", handler);
-    },
-  };
-}
-
 const wss = new WebSocketServer({ port: 8080 });
 
 wss.on("connection", (ws) => {
-  const { destroy } = server(appRouter, wsChannel(ws), {
+  const { destroy } = server(appRouter, socketChannel(ws), {
     auth: { secret: () => secret },
     context: () => ({ user: null }),
     onError: console.error,
@@ -85,39 +73,22 @@ wss.on("connection", (ws) => {
 });
 ```
 
+`socketChannel` is the shipped single-socket adapter: it delivers inbound
+bytes and throws on `send` when the socket is not open. The server does not
+reconnect a client's socket, so connection death is session death —
+`ws.on("close", destroy)` handles that.
+
 ### Client (browser)
 
 ```typescript
 // app.ts
-import { client, type Channel } from "@dotex/saferpc";
+import { client } from "@dotex/saferpc";
+import { wsChannel } from "@dotex/saferpc/channels";
 import type { AppRouter } from "./router";
 
 const secret = new Uint8Array([
   /* same 32 bytes as the server */
 ]);
-
-function wsChannel(url: string): Channel {
-  const ws = new WebSocket(url);
-  ws.binaryType = "arraybuffer";
-
-  const ready = new Promise<void>((resolve) =>
-    ws.addEventListener("open", () => resolve(), { once: true }),
-  );
-
-  return {
-    async send(data) {
-      await ready;
-      ws.send(data);
-    },
-    receive(cb) {
-      const handler = (e: MessageEvent) => {
-        if (e.data instanceof ArrayBuffer) cb(new Uint8Array(e.data));
-      };
-      ws.addEventListener("message", handler);
-      return () => ws.removeEventListener("message", handler);
-    },
-  };
-}
 
 const { api } = client<AppRouter>(wsChannel("ws://localhost:8080"), {
   auth: { secret: () => secret },
@@ -126,6 +97,14 @@ const { api } = client<AppRouter>(wsChannel("ws://localhost:8080"), {
 const { message } = await api.greet({ name: "World" });
 console.log(message); // "Hello, World!"
 ```
+
+`wsChannel` is the shipped reconnecting adapter: it owns the socket
+lifecycle (reconnects with backoff, forever, until `close()`) and throws on
+`send` while the transport is down — the client core keeps undelivered
+frames in its own outbound queue and retries them until `sendTimeout`. That
+ordering matters: an adapter must never buffer frames itself — see
+[Integrations § adapter contract](integrations.md#adapter-contract-send-or-throw-no-queues-stay-available)
+before writing your own.
 
 That is the whole loop. The handshake runs on the first call, every payload is XSalsa20-Poly1305 AEAD over the WS, and if the session drops the client re-handshakes on the next call — the failed call surfaces a typed error (it is never silently resent).
 

@@ -73,7 +73,7 @@ new connection): then calls in flight across a socket blip just complete.
 
 ### TCP socket (Node.js)
 
-Raw TCP does not preserve message boundaries, so the adapter frames every payload with a 4-byte length prefix.
+Raw TCP does not preserve message boundaries, so the adapter frames every payload with a 4-byte length prefix. `send` checks `readyState` first: Node happily buffers `socket.write()` on a still-connecting socket, which would cross the [sent boundary](#adapter-contract-send-or-throw-no-queues-stay-available) invisibly — the core would count a frame as sent while it sits in Node's internal buffer. Throwing instead keeps the frame in the core outbound queue, which retries it until the socket is actually open.
 
 ```typescript
 import net from "net";
@@ -83,6 +83,9 @@ function tcpChannel(socket: net.Socket): Channel {
 
   return {
     send(data) {
+      if (socket.readyState !== "open") {
+        throw new Error("socket not open: " + socket.readyState);
+      }
       const len = new Uint8Array(4);
       new DataView(len.buffer).setUint32(0, data.length, false);
       socket.write(Buffer.concat([len, data]));
@@ -297,15 +300,17 @@ Direct connection between peers without a central relay.
 
 ### WebRTC DataChannel
 
-Peer-to-peer, no relay. `RTCDataChannel` is ordered and reliable by default. The signalling (offer/answer/ICE) is your problem. Safe RPC starts after the data channel fires `"open"`. And there is no central party to hold a PSK, so peers usually authenticate by signing the handshake transcript with device keys. PSK still works if both sides derive the same secret from a shared room code or account, it just rarely matches how WebRTC apps are wired.
+Peer-to-peer, no relay. `RTCDataChannel` is ordered and reliable by default. The signalling (offer/answer/ICE) is your problem. And there is no central party to hold a PSK, so peers usually authenticate by signing the handshake transcript with device keys. PSK still works if both sides derive the same secret from a shared room code or account, it just rarely matches how WebRTC apps are wired.
 
 ```typescript
 function webRTCChannel(dc: RTCDataChannel): Channel {
   dc.binaryType = "arraybuffer";
 
   return {
-    async send(data) {
-      if (dc.readyState !== "open") await waitDCOpen(dc);
+    send(data) {
+      if (dc.readyState !== "open") {
+        throw new Error("data channel not open: " + dc.readyState);
+      }
       dc.send(data);
     },
     receive(cb) {
@@ -317,26 +322,9 @@ function webRTCChannel(dc: RTCDataChannel): Channel {
     },
   };
 }
-
-function waitDCOpen(dc: RTCDataChannel): Promise<void> {
-  return new Promise<void>((resolve, reject) => {
-    if (dc.readyState === "open") return resolve();
-    dc.addEventListener("open", () => resolve(), { once: true });
-    dc.addEventListener(
-      "error",
-      () => reject(new Error("data channel error")),
-      { once: true },
-    );
-    dc.addEventListener(
-      "close",
-      () => reject(new Error("data channel closed")),
-      { once: true },
-    );
-  });
-}
 ```
 
-Sends are parked until the channel opens, so the data channel can go straight into `client()` / `server()` — no need to wait for signalling to finish first.
+`send` throws while the channel is still `connecting` (or after it closes), per the [adapter contract](#adapter-contract-send-or-throw-no-queues-stay-available). The data channel can still go straight into `client()` / `server()` before signalling finishes: the first call's frames land in the core outbound queue and are retried until `sendTimeout` — raise it if your ICE negotiation routinely takes longer. Do not park frames inside the adapter instead; a frame the adapter accepted but has not delivered looks "sent" to the core, which silently breaks retry classification and stale-frame revocation.
 
 #### Usage
 
