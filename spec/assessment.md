@@ -7,7 +7,7 @@ An internal line-by-line review of the implementation against the [Protocol](pro
 ## Method
 
 - Full read of `src/` (client, server, common, auth helpers) against every normative statement in `spec/protocol.md` and `spec/security.md`.
-- Full test suite run (266 tests, including `test/security/`: handshake attacks, replay, tampering, type confusion, prototype pollution, DoS limits, deferred reset, replay window, session continuity).
+- Full test suite run (265 tests, including `test/security/`: handshake attacks, replay, tampering, type confusion, prototype pollution, DoS limits, deferred reset, replay window, session continuity, and the 2026-07 follow-up fixes below).
 - Instrumented probes for behavioral claims that the suite does not pin (execution counts, handshake counts under fault injection).
 
 An internal review is not a third-party audit. It catches spec/code drift and design-level issues; it does not replace external cryptographic review. If you need the latter for a deployment, treat this page as the starting inventory.
@@ -39,7 +39,7 @@ Status: **fixed (narrowed) in 0.7.0.** The server keeps a bounded seen-nonce set
 
 Before 0.7.0 the client's transparent retry fired on **any** local error, including the `CLIENT` backpressure error, and — more fundamentally — resent a call after a `TIMEOUT` whose outcome is unknown. An instrumented probe reproduced a single backpressure error on a healthy session tearing the session down and re-executing every in-flight call, callers observing clean success while handlers ran twice.
 
-Status: **fixed in 0.7.0.** The auto-retry is removed entirely. A `TIMEOUT` or `CHANNEL` send error resets the session but is **not** resent — the error surfaces with its typed code and the caller decides whether to retry (a `TIMEOUT` is never blind-resent because the request may have executed). Guardrail (`CLIENT`) and `RemoteRPCError` never reset the session. See [Protocol § Failure handling](protocol.md#failure-handling-no-auto-retry).
+Status: **fixed in 0.7.0.** The auto-retry is removed entirely. Exactly one trigger resets the session (without resending): a reply-timeout on a **sent** request (`RPCAbortedError` code `TIMEOUT`) — "it went out and the server never answered" is the one signal the session may be desynced. The request may have executed, so it is never blind-resent; the caller decides whether to retry. A `CHANNEL` send error is a transport event, **not** a session event — the keys stay good and nothing resets. Guardrail (`CLIENT`), `SESSION`, and `RemoteRPCError` never reset. See [Protocol § Failure handling](protocol.md#failure-handling-no-auto-retry).
 
 ### 3. Unauthenticated session teardown — fixed in 0.7.0 (both modes, make-before-break)
 
@@ -55,7 +55,7 @@ On any well-formed hello the server returns `proof = HMAC(HKDF(raw, salt=secret)
 
 ### 3c. Core outbound queue — head-of-line blocking bounded by `sendTimeout`
 
-The client core now owns the outbound queue; adapters have no internal queues. A frame that fails to send (the adapter threw) enters the core queue and is retried every 250 ms. The queue is head-of-line: if the channel is down, no later frame can pass a stuck earlier one. The bound is `sendTimeout` (default 10 s) — every queued frame fails with a definite `RPCError("CHANNEL")` if a live channel does not appear within that window. The stale-queued-hello residual (a timed-out hello flushing after handshake timeout) is gone: the core revokes queued hellos when the handshake attempt expires.
+The client core now owns the outbound queue; adapters have no internal queues. A frame that fails to send (the adapter threw) enters the core queue and is retried every 250 ms. The queue is head-of-line: if the channel is down, no later frame can pass a stuck earlier one. The bound is `sendTimeout` (default 3 s) — every queued frame fails with a definite `RPCError("CHANNEL")` if a live channel does not appear within that window. The stale-queued-hello residual (a timed-out hello flushing after handshake timeout) is gone: the core revokes queued hellos when the handshake attempt expires.
 
 ### 4. No server-side concurrency cap — documented, application concern
 
@@ -72,6 +72,19 @@ The transcript digest binds a captured auth payload to its handshake, so it cann
 ### 7. The curve dependency pin is load-bearing — documented, pinned by test
 
 Low-order point rejection is delegated to `@noble/curves`. A future dependency release that relaxed the check would re-open the MITM attack against asymmetric-only deployments described in [Security § Ephemeral key validity](security.md#ephemeral-key-validity). The regression test exists precisely so this cannot happen silently — do not remove it, and re-run the suite on every dependency bump.
+
+## 2026-07 follow-up review — fixed
+
+A second internal read (independent context) after the 0.7.0 fixes above found a
+further set of defects, all fixed and pinned by `test/security/review-fixes-2026-07.test.ts` unless noted.
+
+- **AEAD verification vs. inner-payload decode were conflated.** The server's inbound path decrypted, msgpack-decoded, and sanitized in one step, so a decode error on an otherwise-authenticated candidate frame was handled as a Poly1305 failure — the candidate never promoted and expired, contradicting the spec (a frame that passes AEAD promotes regardless of inner shape). Split into `createAeadOpener` (Poly1305 → plaintext, promotes + records the nonce) and a separate `decodePlaintext` step that runs after promotion.
+- **A synchronous auth callback could overrun `handshakeTimeout`.** Expiry was tracked only by a boolean the timer sets; a `verify`/`secret`/`sign` that blocked the event loop past the budget resumed as a microtask before the timer macrotask, so its continuation still installed a candidate and sent a reply. Both sides now also check an absolute wall-clock deadline after every await (`attemptDead()` server-side, `hsDeadline` client-side).
+- **Defensive limits accepted `NaN`/`Infinity`.** `maxPending`, `maxMessageBytes` (client + server), and JWT `maxAge` were not validated — `length > NaN` is always false, silently disabling the limit. All now require a finite positive integer (`maxAge`: finite ≥ 0) at construction.
+- **A failed handshake-reply send left the candidate lingering.** The candidate was installed before `channel.send(reply)`; a send failure reported the error but left the candidate to expire, producing a second spurious `Handshake timeout`. The send is now guarded — on failure the candidate is dropped (if still current) and a single `HANDSHAKE` error carries the transport cause.
+- **Middleware could complete without calling `next()`.** Only a double `next()` was caught; a middleware that returned a value without calling `next()` skipped the handler while the client still saw success. Completion without `next()` now yields `RPCError("MIDDLEWARE", …)`.
+
+Separately, the `createCertificateServerAuth` and `createMultifactorServerAuth` helpers were **removed** (not fixed). Both delegated the security-critical work to an application callback (certificate chain / principal binding) while shipping a name that implied the library handled it, and neither had a client counterpart. The multifactor composer additionally merged two independently-verified principals without checking they described the same subject. The documented pattern in [Security § Custom schemes](security.md#custom-schemes-certificates-multiple-factors) replaces them: compose your own `verify` and assert the binding explicitly, where the check is visible to its author rather than hidden in a helper.
 
 ## Reporting a vulnerability
 

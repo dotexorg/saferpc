@@ -4,10 +4,12 @@
  */
 
 import { randomBytes } from "@noble/ciphers/utils.js";
+import { xsalsa20poly1305 } from "@noble/ciphers/salsa.js";
 import {
   TAG_HELLO,
   TAG_MSG,
   KEY_LEN,
+  NONCE_LEN,
   x25519,
   concatBytes,
   mpEncode,
@@ -20,6 +22,21 @@ import {
 } from "../../src/index.ts";
 
 export { TAG_HELLO, TAG_MSG, KEY_LEN };
+
+/**
+ * Build a TAG_MSG frame carrying ARBITRARY plaintext bytes under `sessionKey`
+ * — bypassing the msgpack encoder. Lets a test forge a frame that passes
+ * Poly1305 but carries a payload the RPC decoder will reject (e.g. `0xc1`,
+ * msgpack "never used"). Mirrors `createEncryptor`'s framing exactly.
+ */
+export function encryptRaw(
+  sessionKey: Uint8Array,
+  plaintext: Uint8Array,
+): Uint8Array {
+  const nonce = randomBytes(NONCE_LEN);
+  const ct = xsalsa20poly1305(sessionKey, nonce).encrypt(plaintext);
+  return concatBytes(new Uint8Array([TAG_MSG]), nonce, ct);
+}
 
 /** Build a forged client hello with the given fields (defaults filled in). */
 export function forgeHello(

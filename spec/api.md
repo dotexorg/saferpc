@@ -226,6 +226,8 @@ Returns synchronously. The handshake stays lazy: it starts on the first `api` ca
 
 `maxPending` caps concurrent in-flight calls. Past the cap, calls reject with `RPCError("CLIENT", "Too many pending requests")`.
 
+`maxPending` and `maxMessageBytes` (both client and server) must be finite positive integers, and `maxAge` a finite number ≥ 0; a `NaN`/`Infinity` value — easy to produce with `Number(process.env.X)` on an unset variable — is rejected at construction with a `TypeError` rather than silently disabling the limit (`length > NaN` is always false).
+
 `timeout` applies to every call. On timeout the client throws `RPCAbortedError("TIMEOUT", "Timed out: <procedure>")` if the frame had already been sent (outcome unknown — do not blind-resend; the session resets and the next call re-handshakes), or plain `RPCError("CHANNEL")` if the frame had not yet left the process (retry freely; no reset). Set `timeout` generously — it is the safety net, not a UX budget; shorten a single call with [`AbortSignal.timeout`](#calloptions--per-call-abort) instead.
 
 `sendTimeout` is the maximum time a frame spends in the core outbound queue waiting for a live channel before the call fails with a definite `RPCError("CHANNEL")` (never sent — retry freely). Default 3 000 ms — fail fast: the error is provably "never left", so retrying at the call site is always safe, and a frame that could not leave for 3 s is usually stale anyway. Raise it for transports with long reconnect cycles. Not a caller-facing UX knob; it is the boundary between the definite and unknown failure paths.
@@ -349,7 +351,7 @@ class RPCAbortedError extends RPCError {}
 | `RemoteRPCError`  | `OUTPUT_VALIDATION` | `.output(schema)` rejected the handler output (server-side)                                           |
 | `RPCError`        | `INVALID_DATA`      | Wire-level data rejected by `sanitize()`                                                              |
 | `RPCError`        | `INTERNAL`          | Defensive: should not be reachable                                                                    |
-| `RPCError`        | `MIDDLEWARE`        | Middleware misuse (`next()` called twice, bad `extra` arg)                                            |
+| `RPCError`        | `MIDDLEWARE`        | Middleware misuse (`next()` called twice, completed without calling `next()`, or bad `extra` arg)     |
 
 `INPUT_VALIDATION`, `OUTPUT_VALIDATION`, `MIDDLEWARE`, and `NOT_FOUND` are raised **server-side** and always arrive as `RemoteRPCError`. `CHANNEL` is purely client-local. `ABORTED` and `SESSION` appear in both `RPCAbortedError` (frame sent) and `RPCError` (frame unsent); `TIMEOUT` only in `RPCAbortedError` — the class is the retry-safety signal.
 
@@ -400,7 +402,7 @@ server(appRouter, channel, {
 });
 ```
 
-The middleware must **return** `next(...)`. Calling `next()` twice throws `RPCError("MIDDLEWARE", ...)`; so does passing a non-object `extra`.
+The middleware must **return** `next(...)`, calling it **exactly once**. Calling `next()` twice throws `RPCError("MIDDLEWARE", ...)`; so does passing a non-object `extra`. Completing without calling `next()` at all also throws `MIDDLEWARE` — otherwise the handler would be silently skipped while the caller still observed a success.
 
 The `context` factory runs **per request**, after auth verification, and receives `{ auth }` carrying the data returned by `auth.verify` for that session.
 
@@ -445,6 +447,8 @@ import {
 | `generateEd25519Keypair()`                          | `{ privateKey: Uint8Array, publicKey: Uint8Array }` | Pure JS, works everywhere.                                      |
 | `generateECDSAKeypair()`                            | `{ privateKey: CryptoKey, publicKey: CryptoKey }`   | Non-extractable.                                                |
 
+Each signing helper emits a versioned, normative wire payload (a msgpack map stamped with a profile version `v: 1`) — these are the schemas a cross-language port must reproduce to interoperate, specified in [Protocol § Auth payload profiles](protocol.md#auth-payload-profiles). The matching server helper rejects a payload whose `v` is absent or unknown.
+
 ### Server-side
 
 ```typescript
@@ -452,8 +456,6 @@ import {
   createJWTServerAuth,
   createEd25519ServerAuth,
   createECDSAServerAuth,
-  createCertificateServerAuth,
-  createMultifactorServerAuth,
 } from "@dotex/saferpc/auth/server";
 // Also re-exported from "@dotex/saferpc" and "@dotex/saferpc/auth".
 ```
@@ -463,8 +465,6 @@ import {
 | `createJWTServerAuth({ verifyToken, maxAge? })`                        | Verifies JWT + timestamp (symmetric skew check) + transcript digest. Returns the `verifyToken` result as `auth`. |
 | `createEd25519ServerAuth({ getPublicKey, validateDevice? })`           | Verifies Ed25519 signature against a device's 32-byte public key.                                                |
 | `createECDSAServerAuth({ getPublicKey, validateEntity? })`             | Verifies ECDSA P-256 signature via WebCrypto.                                                                    |
-| `createCertificateServerAuth({ verifyCertificate, validateSubject? })` | Verifies a presented certificate chain + ECDSA P-256 signature.                                                  |
-| `createMultifactorServerAuth({ primary, secondary, combineAuth? })`    | Composes two verifiers; both must pass.                                                                          |
 
 Auth payloads decode through the hardened msgpack codec: extension types rejected, prototype-pollution keys stripped, recursion depth capped. Returned `auth` data is sanitized before reaching `context`.
 

@@ -32,7 +32,14 @@ function decodeAuthPayload(proof: Uint8Array): Record<string, unknown> {
   if (typeof parsed !== "object" || parsed === null) {
     throw new RPCError("UNAUTHORIZED", "Malformed auth payload");
   }
-  return parsed as Record<string, unknown>;
+  const payload = parsed as Record<string, unknown>;
+  // Auth-payload profile version (see Protocol § Auth payload profiles). Every
+  // client helper stamps `v: 1`; a verifier MUST reject an unknown/absent
+  // version rather than best-effort decode a schema it was not written for.
+  if (payload["v"] !== 1) {
+    throw new RPCError("UNAUTHORIZED", "Unsupported auth payload version");
+  }
+  return payload;
 }
 
 // ─── JWT bearer (transcript-bound) ──────────────────────────────────
@@ -61,6 +68,13 @@ export function createJWTServerAuth(
   config: JWTServerConfig,
 ): Pick<AuthOptions, "verify"> {
   const maxAge = config.maxAge ?? 30_000;
+  // Reject NaN/Infinity outright: `Math.abs(diff) > NaN` is false for every
+  // diff, which would silently disable the staleness check entirely.
+  if (typeof maxAge !== "number" || !Number.isFinite(maxAge) || maxAge < 0) {
+    throw new TypeError(
+      "createJWTServerAuth() maxAge must be a finite number ≥ 0 ms",
+    );
+  }
   return {
     verify: async (proof, transcript) => {
       const payload = decodeAuthPayload(proof);
@@ -187,117 +201,6 @@ export function createECDSAServerAuth(
       }
 
       return { auth: { identifier, verified: true } };
-    },
-  };
-}
-
-// ─── Certificate-based authentication ──────────────────────────────
-
-export interface CertificateServerConfig {
-  /** Verify cert chain, return the bound public key + subject metadata. */
-  verifyCertificate: (
-    certBytes: Uint8Array,
-  ) => Promise<{ subject: Record<string, string>; publicKey: CryptoKey }>;
-  /** Optional subject allow-list / policy check. */
-  validateSubject?: (
-    subject: Record<string, string>,
-  ) => boolean | Promise<boolean>;
-}
-
-export function createCertificateServerAuth(
-  config: CertificateServerConfig,
-): Pick<AuthOptions, "verify"> {
-  return {
-    verify: async (proof, transcript) => {
-      const payload = decodeAuthPayload(proof);
-      const cert = payload["cert"];
-      const sig = payload["sig"];
-
-      if (!isPlainBytes(cert) || cert.length === 0) {
-        throw new RPCError("UNAUTHORIZED", "Missing certificate");
-      }
-      if (!isPlainBytes(sig) || sig.length === 0) {
-        throw new RPCError("UNAUTHORIZED", "Missing certificate signature");
-      }
-      if (typeof crypto === "undefined" || !crypto.subtle) {
-        throw new RPCError("INTERNAL", "WebCrypto not available");
-      }
-
-      const { subject, publicKey } = await config.verifyCertificate(cert);
-      if (config.validateSubject && !(await config.validateSubject(subject))) {
-        throw new RPCError("UNAUTHORIZED", "Invalid certificate subject");
-      }
-
-      const ok = await crypto.subtle.verify(
-        { name: "ECDSA", hash: "SHA-256" },
-        publicKey,
-        sig as BufferSource,
-        transcript as BufferSource,
-      );
-      if (!ok) {
-        throw new RPCError("UNAUTHORIZED", "Invalid certificate signature");
-      }
-
-      return { auth: { subject, verified: true } };
-    },
-  };
-}
-
-// ─── Multifactor (compose two verifiers) ───────────────────────────
-
-export interface MultifactorServerConfig {
-  primary: Pick<AuthOptions, "verify">;
-  secondary: Pick<AuthOptions, "verify">;
-  /** Combine the two verified principals. Default: shallow merge with `multifactor: true`. */
-  combineAuth?: (primary: Ctx | undefined, secondary: Ctx | undefined) => Ctx;
-}
-
-export function createMultifactorServerAuth(
-  config: MultifactorServerConfig,
-): Pick<AuthOptions, "verify"> {
-  if (typeof config.primary?.verify !== "function") {
-    throw new TypeError("primary.verify must be a function");
-  }
-  if (typeof config.secondary?.verify !== "function") {
-    throw new TypeError("secondary.verify must be a function");
-  }
-  return {
-    verify: async (proof, transcript) => {
-      const payload = decodeAuthPayload(proof);
-      const primary = payload["primary"];
-      const secondary = payload["secondary"];
-
-      if (!isPlainBytes(primary) || primary.length === 0) {
-        throw new RPCError("UNAUTHORIZED", "Missing primary factor");
-      }
-      if (!isPlainBytes(secondary) || secondary.length === 0) {
-        throw new RPCError("UNAUTHORIZED", "Missing secondary factor");
-      }
-
-      const primaryRes = await config.primary.verify!(primary, transcript);
-      const secondaryRes = await config.secondary.verify!(
-        secondary,
-        transcript,
-      );
-
-      const primaryAuth =
-        primaryRes && typeof primaryRes === "object"
-          ? ((primaryRes as { auth?: Ctx }).auth ?? undefined)
-          : undefined;
-      const secondaryAuth =
-        secondaryRes && typeof secondaryRes === "object"
-          ? ((secondaryRes as { auth?: Ctx }).auth ?? undefined)
-          : undefined;
-
-      const combined = config.combineAuth
-        ? config.combineAuth(primaryAuth, secondaryAuth)
-        : {
-            ...(primaryAuth ?? {}),
-            ...(secondaryAuth ?? {}),
-            multifactor: true,
-          };
-
-      return { auth: combined };
     },
   };
 }

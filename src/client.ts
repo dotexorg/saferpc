@@ -190,6 +190,11 @@ export function client<T extends Router>(
   }
   const maxPending =
     opts.maxPending !== undefined ? opts.maxPending : MAX_PENDING;
+  // Reject NaN/Infinity/non-integers outright: `pending.size >= NaN` is
+  // false for every size, which would silently disable the cap.
+  if (!Number.isInteger(maxPending) || maxPending <= 0) {
+    throw new TypeError("client() maxPending must be an integer > 0");
+  }
   const sendTimeout =
     opts.sendTimeout !== undefined ? opts.sendTimeout : DEFAULT_SEND_TIMEOUT;
   if (
@@ -212,6 +217,10 @@ export function client<T extends Router>(
   }
   const maxBytes =
     opts.maxMessageBytes !== undefined ? opts.maxMessageBytes : MAX_MSG_BYTES;
+  // Same NaN guard as maxPending: `data.length > NaN` is always false.
+  if (!Number.isInteger(maxBytes) || maxBytes <= 0) {
+    throw new TypeError("client() maxMessageBytes must be an integer > 0");
+  }
 
   // ── State machine: idle → handshaking → ready, or closed ──
   // idle:        no session. Next RPC call triggers handshake.
@@ -245,6 +254,11 @@ export function client<T extends Router>(
   let handshakeResolve: (() => void) | null = null;
   let handshakeReject: ((err: unknown) => void) | null = null;
   let hsTimer: ReturnType<typeof setTimeout> | null = null;
+  // Absolute wall-clock deadline of the current handshake attempt. Twin of
+  // hsTimer: the timer alone cannot bound a SYNCHRONOUS auth callback that
+  // blocks past the budget — its continuation resumes as a microtask BEFORE
+  // the timer macrotask fires. Guards after every await also check this.
+  let hsDeadline = 0;
 
   // Pending RPC responses. `sent` is the wire boundary: true once
   // `channel.send` returned without throwing (or its promise was handed
@@ -554,6 +568,7 @@ export function client<T extends Router>(
     // `await` can attach its own handler.
     promise.catch(() => {});
 
+    hsDeadline = Date.now() + hsTimeout;
     hsTimer = setTimeout(function onHsTimeout() {
       if (state !== "handshaking" || epoch !== currentEpoch) return;
       failHandshake(new RPCError("HANDSHAKE", "Handshake timeout"));
@@ -567,7 +582,13 @@ export function client<T extends Router>(
       if (auth.sign !== undefined) {
         const transcript = buildHelloTranscript(currentEpoch, myPub, myNonce);
         const signed = await auth.sign(transcript);
-        if (state !== "handshaking" || epoch !== currentEpoch) return;
+        if (
+          state !== "handshaking" ||
+          epoch !== currentEpoch ||
+          Date.now() >= hsDeadline
+        ) {
+          return;
+        }
         if (
           !(signed instanceof Uint8Array) ||
           signed.length === 0 ||
@@ -707,8 +728,16 @@ export function client<T extends Router>(
             );
             await auth.verify(replyAuth, transcript);
             // Epoch guard: handshake might have been reset / destroyed
-            // while verify was awaiting (e.g. user destroy()).
-            if (state !== "handshaking" || epoch !== currentEpoch) return;
+            // while verify was awaiting (e.g. user destroy()). Deadline
+            // guard: a sync verify that blocked past the budget must not
+            // publish a session the timer already condemned.
+            if (
+              state !== "handshaking" ||
+              epoch !== currentEpoch ||
+              Date.now() >= hsDeadline
+            ) {
+              return;
+            }
           }
 
           rawShared = x25519.getSharedSecret(priv, serverPub);
@@ -716,7 +745,13 @@ export function client<T extends Router>(
 
           const secretBytes =
             auth.secret !== undefined ? await auth.secret() : EMPTY_SECRET;
-          if (state !== "handshaking" || epoch !== currentEpoch) return;
+          if (
+            state !== "handshaking" ||
+            epoch !== currentEpoch ||
+            Date.now() >= hsDeadline
+          ) {
+            return;
+          }
 
           if (
             !(secretBytes instanceof Uint8Array) ||
@@ -747,7 +782,13 @@ export function client<T extends Router>(
 
           // Final guard before publishing module-level state. The block
           // below is synchronous; no further awaits can race against us.
-          if (state !== "handshaking" || epoch !== currentEpoch) return;
+          if (
+            state !== "handshaking" ||
+            epoch !== currentEpoch ||
+            Date.now() >= hsDeadline
+          ) {
+            return;
+          }
 
           sessionKey = localSessionKey;
           localSessionKey = null; // ownership transferred — finally won't zero

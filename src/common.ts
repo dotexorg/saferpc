@@ -246,23 +246,47 @@ export function createEncryptor(
   };
 }
 
-export function createDecryptor(
+/**
+ * AEAD-only opener: verifies Poly1305 and returns the raw plaintext.
+ * Throws ONLY on authentication failure — the plaintext is returned as-is,
+ * without msgpack decoding. This split matters on the server: successful
+ * AEAD verification under a candidate key is the proof that promotes the
+ * candidate (make-before-break), regardless of whether the inner payload
+ * is a well-formed RPC message. Decode failures are a separate, later step
+ * (`decodePlaintext`) and must not be conflated with crypto failures.
+ */
+export function createAeadOpener(
   sessionKey: Uint8Array,
-): (payload: Uint8Array) => unknown {
-  return function decrypt(payload: Uint8Array): unknown {
+): (payload: Uint8Array) => Uint8Array {
+  return function open(payload: Uint8Array): Uint8Array {
     const nonce = payload.slice(1, 1 + NONCE_LEN);
     const ct = payload.slice(1 + NONCE_LEN);
     const cipher = xsalsa20poly1305(sessionKey, nonce);
     const encoded = cipher.decrypt(ct);
-    const data = mpDecode(encoded);
-    // NOTE: msgpack-javascript v3 returns Uint8Array (bin) fields as
-    // zero-copy views into `encoded`. Zeroing `encoded` or `payload` here
-    // would clobber any binary field on the returned object. The plaintext
-    // remains in the caller's hands; callers that need stricter memory
-    // hygiene should sanitize and zero their own buffers after use.
     zero(nonce);
     zero(ct);
-    return sanitize(data);
+    return encoded;
+  };
+}
+
+/**
+ * Decode + sanitize an already-authenticated plaintext.
+ * NOTE: msgpack-javascript v3 returns Uint8Array (bin) fields as
+ * zero-copy views into the plaintext buffer. Zeroing it here would
+ * clobber any binary field on the returned object. The plaintext
+ * remains in the caller's hands; callers that need stricter memory
+ * hygiene should sanitize and zero their own buffers after use.
+ */
+export function decodePlaintext(encoded: Uint8Array): unknown {
+  return sanitize(mpDecode(encoded));
+}
+
+export function createDecryptor(
+  sessionKey: Uint8Array,
+): (payload: Uint8Array) => unknown {
+  const open = createAeadOpener(sessionKey);
+  return function decrypt(payload: Uint8Array): unknown {
+    return decodePlaintext(open(payload));
   };
 }
 

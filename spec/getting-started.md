@@ -257,7 +257,7 @@ const auth = createEd25519ServerAuth({
 });
 ```
 
-All built-in helpers (Ed25519, ECDSA, JWT, certificate, multifactor) bind their proof to the canonical handshake transcript. See [Security → Built-in signature helpers](security.md#built-in-signature-helpers).
+All built-in helpers (Ed25519, ECDSA, JWT) bind their proof to the canonical handshake transcript. See [Security → Built-in signature helpers](security.md#built-in-signature-helpers).
 
 ### Both (defense-in-depth)
 

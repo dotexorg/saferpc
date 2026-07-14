@@ -34,7 +34,8 @@ import {
   deriveSessionKey,
   computeProof,
   createEncryptor,
-  createDecryptor,
+  createAeadOpener,
+  decodePlaintext,
   validateAuthConfig,
   EMPTY_SECRET,
   buildHelloTranscript,
@@ -173,9 +174,9 @@ function execute(
       }
       case "m": {
         const mw = step.fn;
-        tip = function runMiddleware() {
+        tip = async function runMiddleware() {
           let called = false;
-          return mw({
+          const result = await mw({
             ctx,
             input,
             next(extra?: Ctx) {
@@ -198,6 +199,17 @@ function execute(
               return next();
             },
           });
+          // Contract: middleware must call next() exactly once. A middleware
+          // that returns without calling next() would silently skip the
+          // handler while the client still receives a success reply — reject
+          // it instead of forwarding its return value.
+          if (!called) {
+            throw new RPCError(
+              "MIDDLEWARE",
+              "Middleware completed without calling next()",
+            );
+          }
+          return result;
         };
         break;
       }
@@ -271,6 +283,11 @@ export function server(
   }
   const maxBytes =
     opts.maxMessageBytes !== undefined ? opts.maxMessageBytes : MAX_MSG_BYTES;
+  // Reject NaN/Infinity/non-integers outright: `data.length > NaN` is false
+  // for every length, which would silently disable the size limit.
+  if (!Number.isInteger(maxBytes) || maxBytes <= 0) {
+    throw new TypeError("server() maxMessageBytes must be an integer > 0");
+  }
   const replayWindow =
     opts.replayWindow !== undefined ? opts.replayWindow : DEFAULT_REPLAY_WINDOW;
   if (
@@ -306,9 +323,12 @@ export function server(
 
   // ── LIVE slot ── the confirmed session. Serves all traffic (encrypt out,
   // decrypt in). May be null before the first handshake completes.
+  // Decrypt slots hold AEAD-only openers (Poly1305 → plaintext); msgpack
+  // decoding happens separately in the TAG_MSG handler, AFTER promotion and
+  // nonce recording, so a junk inner payload cannot mask a proven key.
   let liveKey: Uint8Array | null = null;
   let liveEncrypt: ((data: unknown) => Uint8Array) | null = null;
-  let liveDecrypt: ((payload: Uint8Array) => unknown) | null = null;
+  let liveDecrypt: ((payload: Uint8Array) => Uint8Array) | null = null;
   // Verified auth data from auth.verify (server-only), bound to the live
   // session. Promoted from the candidate; cleared on teardown.
   let liveAuthData: Ctx | null = null;
@@ -319,7 +339,7 @@ export function server(
   // session — the live key is retired only when a frame decrypts under the
   // candidate (proof the counterparty holds the key material).
   let candidateKey: Uint8Array | null = null;
-  let candidateDecrypt: ((payload: Uint8Array) => unknown) | null = null;
+  let candidateDecrypt: ((payload: Uint8Array) => Uint8Array) | null = null;
   let candidateAuthData: Ctx | null = null;
 
   let destroyed = false;
@@ -467,7 +487,15 @@ export function server(
       // confirmation timer below, so hello → first-decrypted-frame is
       // bounded by ONE hsTimeout total.
       const attemptStart = Date.now();
+      // Absolute deadline twin of the timer below. The timer alone is not
+      // enough: a SYNCHRONOUS auth callback that blocks past the budget
+      // resumes as a microtask BEFORE the timer macrotask fires, so the
+      // `attemptExpired` flag is still false when the continuation runs.
+      // Every guard therefore also checks wall-clock time.
+      const attemptDeadline = attemptStart + hsTimeout;
       let attemptExpired = false;
+      const attemptDead = (): boolean =>
+        attemptExpired || Date.now() >= attemptDeadline;
       const attemptTimer = setTimeout(function onAttemptTimeout() {
         attemptExpired = true;
         if (attemptEpoch !== myAttempt || destroyed) return;
@@ -544,7 +572,7 @@ export function server(
               nonce,
             );
             const verifyResult = await auth.verify(helloAuth, transcript);
-            if (attemptEpoch !== myAttempt || destroyed || attemptExpired) {
+            if (attemptEpoch !== myAttempt || destroyed || attemptDead()) {
               return;
             }
             if (verifyResult && typeof verifyResult === "object") {
@@ -570,7 +598,7 @@ export function server(
 
           const secretBytes =
             auth.secret !== undefined ? await auth.secret() : EMPTY_SECRET;
-          if (attemptEpoch !== myAttempt || destroyed || attemptExpired) {
+          if (attemptEpoch !== myAttempt || destroyed || attemptDead()) {
             return;
           }
 
@@ -609,7 +637,7 @@ export function server(
               myPub,
             );
             const signed = await auth.sign(replyTranscript);
-            if (attemptEpoch !== myAttempt || destroyed || attemptExpired) {
+            if (attemptEpoch !== myAttempt || destroyed || attemptDead()) {
               return;
             }
             if (
@@ -628,7 +656,7 @@ export function server(
           // FINAL install guard. The block below is fully synchronous: it
           // installs the newly-proven session as a CANDIDATE without racing a
           // newer attempt or a request.
-          if (attemptEpoch !== myAttempt || destroyed || attemptExpired) {
+          if (attemptEpoch !== myAttempt || destroyed || attemptDead()) {
             return;
           }
 
@@ -651,7 +679,7 @@ export function server(
           candidateEpoch++;
           candidateKey = localSessionKey;
           localSessionKey = null; // ownership transferred — skip finally zero
-          candidateDecrypt = createDecryptor(candidateKey);
+          candidateDecrypt = createAeadOpener(candidateKey);
           candidateAuthData = localAuthData;
 
           // Arm the confirmation timer for this candidate. On expiry the
@@ -681,7 +709,20 @@ export function server(
           zero(localProof);
           localProof = null;
 
-          await channel.send(reply);
+          try {
+            await channel.send(reply);
+          } catch (sendErr: unknown) {
+            // The reply never reached the wire — this candidate can never be
+            // confirmed. Drop it NOW (if it is still ours) instead of letting
+            // it linger until the confirmation timer fires a second, spurious
+            // "Handshake timeout" on top of the send failure below.
+            if (candidateEpoch === myCandEpoch && !destroyed) {
+              dropCandidate();
+            }
+            throw new RPCError("HANDSHAKE", "Handshake reply send failed", {
+              cause: sendErr instanceof Error ? sendErr.message : String(sendErr),
+            });
+          }
           if (candidateEpoch !== myCandEpoch || destroyed) return;
 
           // Timer continues running — waiting for first valid TAG_MSG that
@@ -735,12 +776,14 @@ export function server(
         // Trial decrypt: LIVE first (steady-state cost = one decrypt), then
         // CANDIDATE. A frame that decrypts under the candidate is proof the
         // counterparty holds the key material — the authority required to
-        // retire the live session (make-before-break).
-        let raw: unknown = undefined;
+        // retire the live session (make-before-break). AEAD verification
+        // ONLY — the inner payload is decoded later, so a junk payload under
+        // a proven key still promotes and still lands in the replay window.
+        let plain: Uint8Array | null = null;
         let decryptedUnder: "live" | "candidate" | null = null;
         if (liveDecrypt !== null) {
           try {
-            raw = liveDecrypt(data);
+            plain = liveDecrypt(data);
             decryptedUnder = "live";
           } catch {
             /* fall through to candidate */
@@ -748,13 +791,13 @@ export function server(
         }
         if (decryptedUnder === null && candidateDecrypt !== null) {
           try {
-            raw = candidateDecrypt(data);
+            plain = candidateDecrypt(data);
             decryptedUnder = "candidate";
           } catch {
             /* neither key */
           }
         }
-        if (decryptedUnder === null) {
+        if (decryptedUnder === null || plain === null) {
           return; // poly1305 failure → silently drop (nonce NOT recorded)
         }
 
@@ -769,6 +812,17 @@ export function server(
         // Synchronous (runs before any await), so back-to-back duplicates
         // cannot both slip through.
         if (nKey !== null) seenAdd(nKey);
+
+        // Only now decode the authenticated plaintext. A malformed inner
+        // payload is dropped silently — the session promotion and nonce
+        // record above stand: the key was proven by Poly1305, not by the
+        // payload's shape (spec § Step 4).
+        let raw: unknown;
+        try {
+          raw = decodePlaintext(plain);
+        } catch {
+          return;
+        }
 
         if (typeof raw !== "object" || raw === null) return;
         const msg = raw as Record<string, unknown>;

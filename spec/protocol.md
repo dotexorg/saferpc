@@ -183,6 +183,8 @@ reply_transcript :=
 0x00 || msgpack({ pub: s_pub, proof: proof, epoch: epoch, auth: signed? })
 ```
 
+If sending the reply **fails** (the transport threw), the candidate just installed can never be confirmed — the implementation **must** drop it immediately (if it is still the current candidate: guard on the candidate counter), disarming its confirmation timer, rather than leaving it to expire and report a second, spurious timeout on top of the send failure. The live session, if any, is untouched. A single handshake-failure error is surfaced, carrying the transport error as its cause.
+
 The live session is **not** replaced yet. Replacement happens on the first `TAG_MSG` whose Poly1305 tag verifies under the candidate key, regardless of whether the decrypted payload is a well-formed RPC request. Producing a valid AEAD frame under the candidate is the implicit proof that the counterparty holds the key material; only then is the old live key retired (step 4). The inner shape is checked afterwards and may be silently dropped without rolling state back.
 
 ### Step 3: client processes reply
@@ -481,6 +483,55 @@ on each request:
 
 Clients can also configure `verify`. On the client side the return value is unused. Success is signaled by not throwing.
 
+## Auth payload profiles
+
+The `auth` field carried in a hello or reply frame is **opaque bytes to the core protocol** — the handshake only bounds its length (`1..MAX_AUTH_BYTES`) and hands it to the application's `sign`/`verify` pair. A custom `sign`/`verify` may put anything there; it is not bound by this section.
+
+The shipped auth helpers, however, define a fixed wire schema, and a captured helper payload is de-facto wire format: a port in another language that wants to interoperate with a TypeScript peer using a shipped helper **must** produce and accept the exact msgpack maps below. These schemas are therefore **normative when a shipped helper is used**.
+
+Every helper payload is a msgpack map carrying a profile version `v`. A verifier **must** reject a payload whose `v` is absent or not a version it implements (rather than best-effort decoding a schema it was not written for), with an `UNAUTHORIZED`-class failure. The current version for every profile is `1`. Any change to a profile's field set, field meaning, or signature input **must** bump that profile's `v`.
+
+All three signing profiles bind to the same handshake transcript defined in [Handshake](#handshake): the client-side helper signs (or digests) the **hello** transcript; a server-side signing helper would use the **reply** transcript. Byte layout of the transcript is fixed by that section.
+
+### Profile `jwt` (bearer token, digest-bound) — `v: 1`
+
+```
+{
+  v:   1,
+  jwt: string,        // non-empty; opaque to the protocol, validated by the app
+  ts:  uint,          // client clock, milliseconds since Unix epoch
+  th:  bin (32 bytes) // SHA-256(transcript)
+}
+```
+
+The verifier **must**, in order: reject unknown `v`; require `jwt` a non-empty string; require `ts` a finite number and `|now - ts| ≤ maxAge` (symmetric skew — a one-sided `>` check accepts future-dated forgeries); require `th` exactly 32 bytes and equal to `SHA-256(transcript)` compared in **constant time**; only then call the application token validator. A JWT is a bearer credential: the digest binds a captured payload to *this* handshake, but possession of the token is sufficient to mint a fresh payload — the profile does not and cannot change that. See [Security § JWT](security.md#jwt-bearer-token-transcript-bound).
+
+### Profile `ed25519` (device signature) — `v: 1`
+
+```
+{
+  v:        1,
+  deviceId: string,        // non-empty; server looks up the matching public key
+  sig:      bin (64 bytes) // Ed25519 signature over the transcript bytes
+}
+```
+
+The verifier **must**: reject unknown `v`; require `deviceId` a non-empty string; require `sig` exactly 64 bytes; resolve the device's 32-byte Ed25519 public key (rejecting an out-of-band revoked/unknown device before any crypto if a policy hook is configured); verify `sig` over the **raw transcript bytes** (not a pre-hash). The returned principal is `{ deviceId, verified: true }`.
+
+### Profile `ecdsa` (P-256 signature) — `v: 1`
+
+```
+{
+  v:          1,
+  identifier: string,   // non-empty; server looks up the matching public key
+  sig:        bin       // ECDSA P-256 signature (IEEE-P1363 r||s), SHA-256 of transcript
+}
+```
+
+The verifier **must**: reject unknown `v`; require `identifier` a non-empty string; require `sig` non-empty; resolve the P-256 public key; verify the signature over the transcript with SHA-256 as the hash. Signature encoding is WebCrypto's raw `r||s` (IEEE P-1363), **not** DER — a port using a DER-only ECDSA library must transcode. The returned principal is `{ identifier, verified: true }`.
+
+> Certificate and multi-factor composition are **not** shipped helpers and define no profile: build them from a custom `sign`/`verify`. A multi-factor verifier that composes two of the above must additionally assert both factors resolve to the **same** principal before combining them — the composition itself carries no such guarantee. See [Security § Custom schemes](security.md#custom-schemes-certificates-multiple-factors).
+
 ## Failure modes
 
 | Failure                                       | Server response                               | Client response                                           |
@@ -490,6 +541,9 @@ Clients can also configure `verify`. On the client side the return value is unus
 | msgpack decode error (hello)                  | Discard attempt, `onError`; session survives  | Fail handshake                                            |
 | Sanitization failure (hello)                  | Discard attempt, `onError`; session survives  | Fail handshake                                            |
 | Bad secret / missing secret bytes             | Discard attempt (`HANDSHAKE`), `onError`      | Fail handshake (`HANDSHAKE`)                              |
+| Auth payload `v` absent/unknown (shipped helper) | Discard attempt (`UNAUTHORIZED`), `onError` | Fail handshake                                            |
+| Reply send throws (server)                    | Drop candidate, one `HANDSHAKE` error (cause) | —                                                        |
+| Sync auth callback overruns `handshakeTimeout` | Install nothing; attempt dies at the deadline | Fail handshake (`HANDSHAKE`)                             |
 | `verify` throws                               | Discard attempt, `onError`; session survives  | Fail handshake                                            |
 | `sign` returns invalid payload                | Discard attempt                               | Fail handshake                                            |
 | Proof mismatch (client)                       | —                                             | Fail handshake                                            |
@@ -527,6 +581,11 @@ A new-language port that ticks every item is conformant:
 - [ ] Client epoch increments per handshake attempt (and per session reset) and is echoed verbatim in the reply; it is validated as a uint32 on the wire and never wraps (exhaustion is a terminal client error). The server does NOT bump a single mirror counter — under make-before-break it keeps three internal counters: `attemptEpoch` (per incoming hello; invalidates older attempt coroutines), `candidateEpoch` (per candidate install; guards the confirmation timer), and `epoch` (per promotion; guards TAG_MSG responses).
 - [ ] The attempt counter is bumped for **every** incoming hello, including ones that arrive while a previous attempt is still suspended at an `await`. In-flight stale attempts detect themselves via the guard and abandon all writes.
 - [ ] Every `await` in the handshake path is followed by an attempt + destroyed guard before any session state is written. The candidate install happens under a final guard inside a single synchronous block.
+- [ ] The handshake budget is enforced by an **absolute wall-clock deadline**, checked after every suspension point, not only by a timer/flag. A synchronous auth callback (`sign`/`verify`/`secret`) that blocks the event loop past the budget resumes before a timer macrotask can fire; a flag-only guard is still unset at that point and would install a candidate + send a reply after expiry. The deadline check (both sides) rejects that.
+- [ ] A reply-send failure on the server drops the just-installed candidate (guarded on the candidate counter) and reports a single handshake error; it does not leave the candidate to expire into a second timeout.
+- [ ] Inbound `TAG_MSG` promotion is gated on **AEAD verification only**. Decoding/sanitizing the inner payload happens *after* promotion and after the nonce is recorded in the replay set; a malformed inner payload under a proven key still promotes and still consumes its nonce (it is only dropped from producing a response). Conflating decode failure with Poly1305 failure would strand the candidate.
+- [ ] Numeric limits (`maxPending`, `maxMessageBytes`, JWT `maxAge`) are validated at construction: a non-finite or non-positive value is rejected with an error, never accepted (a `NaN` bound silently disables the check, since `x > NaN` is always false).
+- [ ] Shipped auth helpers stamp a profile version `v` and verifiers reject an absent/unknown `v` (see [Auth payload profiles](#auth-payload-profiles)); the three profile schemas are reproduced byte-for-byte.
 - [ ] A separate counter guards the candidate confirmation timer, bumped only when a candidate is installed — so a later hello that bumps the attempt counter but then fails validation cannot disarm an existing candidate's timeout.
 - [ ] Hello processing runs on **attempt-local** state; an established session keeps serving during the attempt and is retired only on promotion. An invalid hello (malformed, oversized, failed `verify`, bad secret), a byte-for-byte replayed hello, or a well-formed forged hello never disturbs an established session — at most it creates a candidate that expires unconfirmed.
 - [ ] Secret bytes equal to `EMPTY_SECRET` (32 zero bytes) are rejected at runtime when `auth.secret` is configured.

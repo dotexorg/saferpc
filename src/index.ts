@@ -88,8 +88,6 @@ export {
   createJWTServerAuth,
   createEd25519ServerAuth,
   createECDSAServerAuth,
-  createCertificateServerAuth,
-  createMultifactorServerAuth,
   // Types
   type JWTClientConfig,
   type Ed25519ClientConfig,
@@ -97,6 +95,4 @@ export {
   type JWTServerConfig,
   type Ed25519ServerConfig,
   type ECDSAServerConfig,
-  type CertificateServerConfig,
-  type MultifactorServerConfig,
 } from "./auth/index.ts";

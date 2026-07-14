@@ -255,8 +255,6 @@ import {
   createECDSAServerAuth,
   createJWTClientAuth,
   createJWTServerAuth,
-  createCertificateServerAuth,
-  createMultifactorServerAuth,
   generateEd25519Keypair,
   generateECDSAKeypair,
 } from "@dotex/saferpc";
@@ -317,30 +315,12 @@ The JWT helper does **not** sign the transcript. JWTs are bearer tokens. Instead
 
 The transcript digest prevents replay of a captured auth payload into a different handshake — the digest was computed over the old transcript and will not match the new one. It does **not** prevent an attacker who has obtained the JWT itself from mounting a fresh handshake with their own ephemeral key and recomputing the digest. JWTs are bearer credentials: anyone holding one can authenticate until it expires. Combine with PSK or a real signature mode when this matters.
 
-### Certificate-based
+### Custom schemes (certificates, multiple factors)
 
-```typescript
-const serverAuth = createCertificateServerAuth({
-  verifyCertificate: async (certBytes) => {
-    return { subject, publicKey }; // your chain verification
-  },
-});
-```
+There are no built-in helpers for certificate-based or multi-factor auth: in both cases the security-critical logic (chain verification; asserting that all factors resolve to the *same* principal) depends on application knowledge the library does not have, so a generic helper would only wrap the trivial part while its name suggested it handles the hard part. Implement `sign`/`verify` directly instead:
 
-The client embeds `{ cert, sig }` where `sig` is an ECDSA P-256 signature over the transcript using the cert's key.
-
-### Multifactor
-
-Compose two verifiers. Both must pass.
-
-```typescript
-const serverAuth = createMultifactorServerAuth({
-  primary: createEd25519ServerAuth({ getPublicKey: ... }),
-  secondary: createJWTServerAuth({ verifyToken: ... }),
-});
-```
-
-The client embeds `{ primary, secondary }`: two pre-encoded sub-payloads.
+- **Certificates** — client `sign` returns an encoded `{ cert, sig }` where `sig` is a signature over the transcript with the cert's key; server `verify` runs your chain verification, then checks the signature (the checking step is exactly what `createECDSAServerAuth` does — reuse it for the signature half if the key is P-256).
+- **Multiple factors** — client `sign` encodes both sub-proofs; server `verify` decodes them, runs each sub-verifier against the same transcript, and **must reject unless both factors resolve to the same principal** (e.g. the JWT's `sub` owns the signing `deviceId` per your own store). Only then combine them into one explicit principal. Never merge two independently verified principals blindly: a stolen bearer token plus the attacker's *own* validly registered second factor would otherwise pass as "multi-factor" for the victim's identity.
 
 ## Replay within a session
 
@@ -360,7 +340,7 @@ auth: {
 }
 ```
 
-**Mobile app ↔ backend:** device certificates or platform attestation.
+**Mobile app ↔ backend:** device keys (`createEd25519ClientAuth` / `createECDSAClientAuth`) or platform attestation.
 
 ```typescript
 auth: {
