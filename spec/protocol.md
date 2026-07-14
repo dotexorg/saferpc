@@ -29,6 +29,14 @@ Non-goals: streaming RPCs in-protocol, multiplexing over a single channel, forma
 
 All wire numbers are network-byte-order (big-endian) unless explicitly noted.
 
+### msgpack profile
+
+Every msgpack document in this protocol (hello/reply maps, RPC envelopes, auth payload profiles) follows one encoding profile. A port that deviates produces frames the reference implementation silently drops or rejects as type-mismatched — the reference decoder strict-checks native types, it does not coerce.
+
+- **Map keys** are msgpack `str`. Field values follow the schema annotations: `bin` fields **must** use the msgpack `bin` family and `string` fields the `str` family — the two are never interchangeable (a `pub`/`nonce`/`sig`/`th` sent as `str`, or an `id`/`p` sent as `bin`, fails the receiver's type guard).
+- **Integers** are encoded in the smallest msgpack integer type that holds them: a value in `0..2³²−1` uses `fixint`/`uint8`/`uint16`/`uint32` — never `int64`/`uint64` (`0xd3`/`0xcf`). Integer values outside the 32-bit range are encoded as IEEE-754 `float64` (`0xcb`), not as 64-bit integers. In particular, the JWT profile's `ts` (a millisecond timestamp ≈ 1.8×10¹²) travels as `float64`.
+- Rationale a porter must reproduce: the reference codec maps only the 64-bit integer types to a big-integer (`BigInt`); every narrower integer decodes to a native number. Receivers then strict-check native numbers — `t !== 1`, `v !== 1`, `typeof epoch !== "number"`, `typeof ts !== "number"` — so a foreign encoder that writes `t: 1` as `uint64` is decoded to a big-integer and the frame is silently dropped; a `ts` sent as `uint64` is rejected as `"Invalid timestamp"`.
+
 ## Constant reference
 
 | Name                     | Value                                               | Purpose                                                                        |
@@ -53,6 +61,8 @@ All wire numbers are network-byte-order (big-endian) unless explicitly noted.
 | `TRANSCRIPT_REPLY_MAGIC` | UTF-8 bytes of `"saferpc-hs-reply-v1\0"` (20 bytes) | Domain separation for server transcript                                        |
 | `EMPTY_SECRET`           | 32 zero bytes                                       | HKDF salt when no secret is configured (asymmetric-only mode)                  |
 
+Two scopes are mixed in this table and a port must distinguish them. **Wire-normative** (both peers must agree or they cannot interoperate): `TAG_*`, `NONCE_LEN`, `KEY_LEN`, `PROOF_LEN`, `MAX_HELLO_BYTES`, `MAX_AUTH_BYTES`, `MAX_ID_LEN`, `KDF_INFO`, `PSK_DERIVE_INFO`, `TRANSCRIPT_*_MAGIC`, `EMPTY_SECRET`. **Local-policy defaults** (each side may configure its own value; they change observable timing/limits but not wire compatibility): `MAX_MSG_BYTES`, `HANDSHAKE_TIMEOUT_MS`, `RPC_TIMEOUT_MS`, `SEND_TIMEOUT_MS`, `MAX_PENDING`, `REPLAY_WINDOW`.
+
 ## Frame format
 
 Every wire frame is a single byte tag followed by a payload.
@@ -60,6 +70,8 @@ Every wire frame is a single byte tag followed by a payload.
 ```
 frame := tag (1 byte) || payload (...)
 ```
+
+**Every frame is exactly one transport message.** The protocol is **not** self-delimiting: there is no length prefix, and decryption/decoding consumes the entire delivered buffer as one frame. The core assumes the transport preserves message boundaries (WebSocket, datagram, `MessagePort`, an in-memory pair). Over a stream transport (raw TCP/TLS — the “duplex socket” of goal #4) the channel adapter **must** add its own framing (e.g. a length prefix), reassemble, and hand each complete frame to the core as a single unit; that outer framing is out of protocol scope and not covered by the test vectors.
 
 Two tag values are defined. Implementations **must** drop frames with any other tag.
 
@@ -160,8 +172,8 @@ The server processes the hello as an **attempt**, on state local to that attempt
 1. Verify frame length and tag.
 2. Decode msgpack, sanitize, check shape. Validate `epoch` is an integer in `0..2^32-1`.
 3. If `verify` is configured: require `auth` (`1..MAX_AUTH_BYTES` bytes), build hello transcript, call `verify(auth, transcript)`. On failure, discard the attempt.
-4. Compute ECDH shared secret: `raw = X25519(s_priv, c_pub)`.
-5. Call `secret()` if configured. If fewer than `KEY_LEN` bytes, or equal to `EMPTY_SECRET`, fail. If not configured, use `EMPTY_SECRET`.
+4. Compute ECDH shared secret: `raw = X25519(s_priv, c_pub)`. The implementation **must** reject RFC 7748 §6.1 low-order `c_pub` values (normative, not guidance): either the X25519 primitive rejects them by erroring on an all-zero shared output (as the reference's `@noble/curves` does), or the handshake rejects the listed points explicitly before the ECDH. Accepting them in asymmetric-only mode yields an all-zero `raw` and a fully attacker-predictable session key.
+5. Call `secret()` if configured. If fewer than `KEY_LEN` bytes, or equal to `EMPTY_SECRET`, fail. If not configured, use `EMPTY_SECRET`. The **entire** returned byte string — not a 32-byte truncation — becomes the HKDF salt, so both peers must return byte-identical secrets of identical length.
 6. Derive session key: `session_key = HKDF(SHA-256, IKM=raw, salt=psk, info=KDF_INFO, L=KEY_LEN)`.
 7. Zero `raw`. **Do not zero or mutate the secret bytes** — the application owns that buffer, and callers legitimately return the same buffer on every handshake (`secret: () => sharedSecret`).
 8. Compute proof: `proof = HMAC-SHA-256(session_key, s_pub || c_pub || c_nonce)`.
@@ -176,7 +188,7 @@ reply_transcript :=
     s_pub
 ```
 
-10. **Install the candidate atomically**: install `session_key`/decryptor and the verified auth data into the _candidate_ slot, replacing any prior unconfirmed candidate (latest attempt wins). **Do not touch the live session** — its key keeps serving. The candidate is decrypt-only; its encryptor is created on promotion, never before, since the server never encrypts under an unconfirmed key. This install must be a single synchronous block guarded by the attempt's epoch, so a concurrent newer hello cannot interleave. Arm a confirmation timer for the candidate.
+10. **Install the candidate atomically**: install `session_key`/decryptor and the verified auth data into the _candidate_ slot, replacing any prior unconfirmed candidate (latest attempt wins). **Do not touch the live session** — its key keeps serving. The candidate is decrypt-only; its encryptor is created on promotion, never before, since the server never encrypts under an unconfirmed key. This install must be a single synchronous block guarded by the attempt's epoch, so a concurrent newer hello cannot interleave. Arm a confirmation timer for the candidate — for the **remaining** handshake budget (`handshakeTimeout` minus the time already spent validating this attempt), not a fresh full-length timer: the total hello→first-confirming-frame window for one attempt is bounded by a single `handshakeTimeout`.
 11. Send:
 
 ```
@@ -191,10 +203,10 @@ The live session is **not** replaced yet. Replacement happens on the first `TAG_
 
 1. Verify frame length and tag.
 2. Decode msgpack, sanitize, check shape.
-3. Silently drop if `reply.epoch !== this_epoch` (stale reply).
+3. A reply whose `epoch` is not a valid uint32 **fails the handshake attempt** (fail fast, surface the error); a valid `epoch` that does not equal `this_epoch` is dropped **silently** (stale reply — keep waiting for the current attempt's reply until the handshake timeout).
 4. If `verify` is configured: require `auth`, build reply transcript, call `verify(auth, transcript)`. On failure, reset handshake state.
-5. Compute ECDH shared secret: `raw = X25519(c_priv, s_pub)`.
-6. Call `secret()` if configured; otherwise use `EMPTY_SECRET`. Validate ≥ `KEY_LEN` bytes.
+5. Compute ECDH shared secret: `raw = X25519(c_priv, s_pub)`. The same low-order rejection as server step 4 applies to `s_pub` — the client **must** reject RFC 7748 §6.1 low-order server public keys (failing the handshake), for the same reason.
+6. Call `secret()` if configured; otherwise use `EMPTY_SECRET`. Validate ≥ `KEY_LEN` bytes; reject a value equal to `EMPTY_SECRET`. As on the server, the entire byte string is the HKDF salt.
 7. Derive `session_key` with the same HKDF call as the server.
 8. Recompute expected proof: `expected = HMAC-SHA-256(session_key, s_pub || c_pub || c_nonce)`.
 9. Compare `expected` to `proof` in **constant time**. Mismatch ⇒ fail.
@@ -290,6 +302,8 @@ plaintext   = XSalsa20-Poly1305-decrypt(session_key, nonce, ciphertext, AD=∅)
 message     = sanitize(msgpack_decode(plaintext))
 ```
 
+The AEAD output layout is NaCl `secretbox`: XSalsa20-Poly1305 with the 16-byte Poly1305 tag **prepended** to the ciphertext, exactly as produced by a `secretbox`-shaped library and matched by the test vector. A port using a raw XSalsa20 + Poly1305 composition must reproduce that layout or ciphertexts will not be byte-compatible.
+
 A 24-byte random nonce gives 192 bits of entropy. Collisions are negligible for any realistic message volume. Safe RPC does **not** use a counter. The trade-off: slightly higher nonce size in exchange for stateless encoding and tolerance for out-of-order or duplicated transport delivery.
 
 > **Directionality.** Both directions encrypt under the **same** session key. With random nonces this is safe for confidentiality (no keystream reuse in practice), but it means a captured frame decrypts on _either_ side. The only thing preventing a reflected client request from being accepted by that same client is the message-type check (`t: 1` vs `t: 2`, below). That check is therefore **mandatory, security-relevant, and must run before any other processing of the decrypted payload**. A port that treats it as optional shape validation loses reflection protection entirely. (A future protocol revision may introduce directional keys; any such change bumps the version strings.)
@@ -366,7 +380,13 @@ On the server, a handler throwing the implementation's typed RPC error maps to `
 
 Messages with wrong `t`, missing/empty `id`, missing/empty `p`, or any unexpected type **must** be dropped silently. The protocol has no provision for "bad message" responses. Those would be useful only to an attacker enumerating implementation behavior.
 
+Silent drop applies to malformed **envelopes** only. A **well-formed** request (`t: 1`, valid `id`, non-empty string `p`) whose `p` does not name a procedure in the router is *not* silently dropped: the server returns a normal failure response with code `NOT_FOUND`. At that point the peer has already proven key possession, so the enumeration argument no longer applies.
+
+**Protocol-level error codes.** In addition to application-defined codes, the reference server emits: `INPUT_VALIDATION`, `OUTPUT_VALIDATION`, `MIDDLEWARE`, `NOT_FOUND`, `INVALID_DATA`, `INTERNAL`. A behavior-compatible port **should** emit the same codes for the same conditions. The error `d` payload is implementation-defined (the reference puts its schema library's flattened issues there); clients **must not** depend on its shape.
+
 ## State machines
+
+The states, transitions, and their triggers in this section are **normative** — a port must produce the same observable behavior. The internal mechanics referenced alongside them (shared handshake promise, proxy objects, timer bookkeeping) are how the reference implementation realizes the transitions and are informative.
 
 ### Server
 
@@ -421,6 +441,8 @@ The client uses an **epoch counter** to coordinate concurrent failure-and-reset.
 
 ## Failure handling (no auto-retry)
 
+Normativity split for porters: the **reset trigger set** (exactly `RPCAbortedError("TIMEOUT")` on a sent call, nothing else), the **no-resend rule**, and the **sent-boundary semantics** (which rejections mean "provably never left" vs "outcome unknown") are normative — they are security decisions, and a port that widens the trigger set re-creates a double-execution hazard. The outbound-queue machinery (the 250 ms retry tick, head-of-line policy, the concrete error-class taxonomy) is reference behavior a port may realize differently as long as the observable semantics hold.
+
 As of 0.7.0 the client does **not** auto-retry. When a sent call times out with `RPCAbortedError("TIMEOUT")` on a `ready` session — **and only then**:
 
 1. If `epoch === sentEpoch` (no other call has already reset), call `reset()`: zero the session key, drop encryptor/decryptor, state ← `idle`. The failed call is **not** resent.
@@ -446,20 +468,21 @@ Concurrent failures share one re-handshake via the epoch counter, so there are n
 
 ## Sanitization
 
-Every decoded msgpack value passes through a sanitization step, inbound and outbound (the latter on error payloads). Any of the following rejects the message:
+Every decoded msgpack value passes through a sanitization step, inbound and outbound (the latter on error payloads).
+
+**Language-neutral core (normative for every port):**
 
 1. Recursion depth greater than 32 ⇒ `INVALID_DATA`.
 2. Any msgpack extension type, **including the built-in Timestamp (type -1)** ⇒ `INVALID_DATA`. The Timestamp extension is explicitly rejected because msgpack libraries hard-code its decoder.
-3. Any object whose prototype is neither `Object.prototype` nor `null`. This rejects `Date`, `Map`, `Set`, `ExtData`, and any host object that arrived through an unexpected codec path.
-4. Object keys equal to `"__proto__"`, `"constructor"`, or `"prototype"` are stripped during traversal.
+3. Reject any decoded value whose type is not in the plain-data set: nil, boolean, number/big-integer, string, `bin`, array, string-keyed map. Anything a codec maps to a richer host type (dates, native collections, wrapped ext data) is rejected.
 
-`Uint8Array` (msgpack `bin`) is preserved. `BigInt64` is decoded as JavaScript `BigInt`. Plain objects are rebuilt with `Object.create(null)` so prototype chains cannot be re-poisoned downstream.
+**JS-specific realization (how the reference implements rule 3 and defends a JS-only attack class):**
 
-A port to a language without prototype pollution still has to:
+- Any object whose prototype is neither `Object.prototype` nor `null` is rejected. This catches `Date`, `Map`, `Set`, `ExtData`, and any host object that arrived through an unexpected codec path.
+- Object keys equal to `"__proto__"`, `"constructor"`, or `"prototype"` are stripped during traversal (prototype-pollution defense; meaningless in most other languages).
+- Plain objects are rebuilt with `Object.create(null)` so prototype chains cannot be re-poisoned downstream.
 
-- Reject extension types it does not know about.
-- Limit recursion depth.
-- Reject inputs whose structure does not match the expected shape.
+`Uint8Array` (msgpack `bin`) is preserved. 64-bit wire integers are decoded as big-integers (see [msgpack profile](#msgpack-profile)). A port to a language without prototype pollution implements the language-neutral core and whatever "weird host type" rejection its own codec requires.
 
 ## Authorization data flow
 
@@ -481,6 +504,8 @@ on each request:
     procedure runs with ctx
 ```
 
+If the `context` factory itself throws, the request is answered with a generic `INTERNAL` error response — the thrown detail **must not** leak to the peer.
+
 Clients can also configure `verify`. On the client side the return value is unused. Success is signaled by not throwing.
 
 ## Auth payload profiles
@@ -491,7 +516,7 @@ The shipped auth helpers, however, define a fixed wire schema, and a captured he
 
 Every helper payload is a msgpack map carrying a profile version `v`. A verifier **must** reject a payload whose `v` is absent or not a version it implements (rather than best-effort decoding a schema it was not written for), with an `UNAUTHORIZED`-class failure. The current version for every profile is `1`. Any change to a profile's field set, field meaning, or signature input **must** bump that profile's `v`.
 
-All three signing profiles bind to the same handshake transcript defined in [Handshake](#handshake): the client-side helper signs (or digests) the **hello** transcript; a server-side signing helper would use the **reply** transcript. Byte layout of the transcript is fixed by that section.
+All three signing profiles bind to the same handshake transcript defined in [Handshake](#handshake): the client-side helper signs (or digests) the **hello** transcript; a server-side signing helper would use the **reply** transcript. Byte layout of the transcript is fixed by that section. The binding *input* differs per profile and is wire-normative: `ed25519` and `ecdsa` sign the **raw transcript bytes**; `jwt` embeds **`SHA-256(transcript)`**. Mixing these up produces payloads the counterparty rejects.
 
 ### Profile `jwt` (bearer token, digest-bound) — `v: 1`
 
@@ -503,6 +528,8 @@ All three signing profiles bind to the same handshake transcript defined in [Han
   th:  bin (32 bytes) // SHA-256(transcript)
 }
 ```
+
+On the wire `ts` is a `float64` (see [msgpack profile](#msgpack-profile)) whose value is an integer count of milliseconds; a port's verifier must accept the float and treat it as ms. The reference `maxAge` default is 30 000 ms (server-side policy, configurable, not a wire constant).
 
 The verifier **must**, in order: reject unknown `v`; require `jwt` a non-empty string; require `ts` a finite number and `|now - ts| ≤ maxAge` (symmetric skew — a one-sided `>` check accepts future-dated forgeries); require `th` exactly 32 bytes and equal to `SHA-256(transcript)` compared in **constant time**; only then call the application token validator. A JWT is a bearer credential: the digest binds a captured payload to *this* handshake, but possession of the token is sufficient to mint a fresh payload — the profile does not and cannot change that. See [Security § JWT](security.md#jwt-bearer-token-transcript-bound).
 
@@ -528,7 +555,7 @@ The verifier **must**: reject unknown `v`; require `deviceId` a non-empty string
 }
 ```
 
-The verifier **must**: reject unknown `v`; require `identifier` a non-empty string; require `sig` non-empty; resolve the P-256 public key; verify the signature over the transcript with SHA-256 as the hash. Signature encoding is WebCrypto's raw `r||s` (IEEE P-1363), **not** DER — a port using a DER-only ECDSA library must transcode. The returned principal is `{ identifier, verified: true }`.
+The verifier **must**: reject unknown `v`; require `identifier` a non-empty string; require `sig` non-empty; resolve the P-256 public key; verify the signature over the transcript with SHA-256 as the hash. Signature encoding is WebCrypto's raw `r||s` (IEEE P-1363), **not** DER — a port using a DER-only ECDSA library must transcode. Unlike `ed25519`, `sig` has no length guard: a wrong-length value fails at signature verification, not at a shape check. The returned principal is `{ identifier, verified: true }`.
 
 > Certificate and multi-factor composition are **not** shipped helpers and define no profile: build them from a custom `sign`/`verify`. A multi-factor verifier that composes two of the above must additionally assert both factors resolve to the **same** principal before combining them — the composition itself carries no such guarantee. See [Security § Custom schemes](security.md#custom-schemes-certificates-multiple-factors).
 
@@ -536,6 +563,7 @@ The verifier **must**: reject unknown `v`; require `identifier` a non-empty stri
 
 | Failure                                       | Server response                               | Client response                                           |
 | --------------------------------------------- | --------------------------------------------- | --------------------------------------------------------- |
+| Empty (zero-length) frame                     | Drop silently                                 | Drop silently                                             |
 | Bad frame tag                                 | Drop silently                                 | Drop silently                                             |
 | Frame > max size                              | Drop silently                                 | Drop silently                                             |
 | msgpack decode error (hello)                  | Discard attempt, `onError`; session survives  | Fail handshake                                            |
@@ -566,7 +594,9 @@ Silent drops are deliberate. Any feedback at the wire level gives an attacker pr
 
 A new-language port that ticks every item is conformant:
 
-- [ ] Constants match the table above exactly.
+- [ ] Constants match the table above exactly (wire-normative set byte-exact; local-policy defaults may differ by configuration).
+- [ ] The msgpack profile is reproduced: smallest-width integers (never `int64`/`uint64` for values ≤ 2³²−1; `float64` beyond), `bin`/`str` families never interchanged, `str` map keys. See [msgpack profile](#msgpack-profile).
+- [ ] Frames are delivered as whole transport messages; over stream transports the adapter adds its own framing (the protocol is not self-delimiting).
 - [ ] X25519, XSalsa20-Poly1305, HKDF-SHA-256, HMAC-SHA-256 implementations are constant-time where the spec requires (proof comparison, MAC verification).
 - [ ] The X25519 implementation rejects RFC 7748 §6.1 low-order public keys (or the application layer rejects them before `getSharedSecret`). Accepting them in asymmetric-only mode lets an active MITM force a deterministic all-zero ECDH output and decrypt the session. See [Security § Ephemeral key validity](security.md#ephemeral-key-validity).
 - [ ] msgpack codec rejects all extension types; built-in Timestamp explicitly.
@@ -594,7 +624,8 @@ A new-language port that ticks every item is conformant:
 - [ ] Server accepts new hellos in any state (including `ready`).
 - [ ] Client does **not** auto-retry. On a sent-call reply timeout (`RPCAbortedError("TIMEOUT")`) while `ready` it resets the session (zeros the key, state → `idle`) **without resending**, then surfaces the error; the caller decides whether to retry. It never resets on `RemoteRPCError`, guardrail errors (`maxPending`, counter exhaustion), or unsent-frame failures — those reject the call and leave the session intact.
 - [ ] The application's secret buffer is never mutated or zeroed by the protocol; only protocol-owned copies and derived material are zeroed.
-- [ ] Request `id` is validated: non-empty string, ≤ `MAX_ID_LEN`; `p` non-empty string; violations are silent drops.
+- [ ] Request `id` is validated: non-empty string, ≤ `MAX_ID_LEN`; `p` non-empty string; violations are silent drops. A well-formed request naming an unknown procedure gets a `NOT_FOUND` error response, not a silent drop.
+- [ ] The candidate confirmation timer is armed with the **remaining** handshake budget, so one attempt's hello→confirmation window never exceeds a single `handshakeTimeout`.
 - [ ] Absent call input omits the `i` key entirely (never nil).
 - [ ] The `t` type check on decrypted messages runs before any other processing — it is the reflection defense for the shared bidirectional key, not cosmetic validation.
 - [ ] Remote error fields are coerced defensively (`c` non-empty string else `UNKNOWN`, `m` string else empty); non-`RPCError` handler throws map to `INTERNAL` with no detail leakage.
@@ -681,3 +712,52 @@ frame     = 0x01 || msg_nonce || XSalsa20-Poly1305(session_key, msg_nonce, plain
 A port must decrypt this frame to the plaintext above, and its own encryption of the same plaintext under the same key and nonce must produce the identical frame. (In real operation the nonce is random per message — the fixed nonce exists only for this vector.)
 
 Two caveats for the frame vector. msgpack map-key order follows encoding order — the vector encodes keys as `t`, `id`, `p`; match that order when reproducing the exact bytes (the protocol itself does not require canonical key order, only this vector does). And byte-equality of ciphertext requires the same AEAD construction: XSalsa20-Poly1305 as in NaCl `secretbox`, no associated data.
+
+### Auth profile payloads
+
+Known-answer payloads for the three shipped profiles (see [Auth payload profiles](#auth-payload-profiles)), all bound to `hello_transcript` above. Key order in each map follows the field order shown in the profile schemas (`v` first). Pinned by `test/unit/vectors.test.ts`.
+
+**Profile `jwt`** — fully deterministic. Note `ts` on the wire is a `float64` (`0xcb`), per the [msgpack profile](#msgpack-profile).
+
+```
+jwt     = "test.jwt.token"
+ts      = 1700000000000
+th      = SHA-256(hello_transcript)
+        = c76c6aaff8ac6c00e1168ffdafc87255a79eef052a4a7b39c542506a81010c9e
+payload = msgpack({v:1, jwt, ts, th})
+        = 84a17601a36a7774ae746573742e6a77742e746f6b656ea27473cb4278bcfe56800000
+          a27468c420c76c6aaff8ac6c00e1168ffdafc87255a79eef052a4a7b39c542506a81010c9e
+```
+
+**Profile `ed25519`** — fully deterministic (RFC 8032 signatures are deterministic); a conformant port reproduces the payload byte-for-byte.
+
+```
+seed     = 6162636465666768696a6b6c6d6e6f707172737475767778797a7b7c7d7e7f80
+pub      = 882d0ea3b2864e7a587f3e698cea4459998312e655e05fa5e8b5119d8baac8cd
+deviceId = "device-1"
+sig      = Ed25519(seed, hello_transcript)
+         = c056e0893556d73576ab05fa9ef2314d16686f326905c3e1e1f0b2b10eb003f5
+           1a6a41aa2d1e14f737fdfeede47d7ecec84380d7e70733cd3579653db72c7105
+payload  = msgpack({v:1, deviceId, sig})
+         = 83a17601a86465766963654964a86465766963652d31a3736967c440
+           c056e0893556d73576ab05fa9ef2314d16686f326905c3e1e1f0b2b10eb003f5
+           1a6a41aa2d1e14f737fdfeede47d7ecec84380d7e70733cd3579653db72c7105
+```
+
+**Profile `ecdsa`** — ECDSA is randomized in most signers (including WebCrypto), so this vector's signature is the **RFC 6979 deterministic** lowS signature (SHA-256 prehash, P-1363 `r||s`). A port with a randomized signer will not reproduce these bytes — and does not have to. The two-sided conformance check: (a) this payload **must verify** in the port's verifier against the public key below; (b) a payload produced by the port's signer **must verify** against the same public key, and its envelope (everything except the `sig` value) must be byte-identical to this vector's structure.
+
+```
+priv       = a1a2a3a4a5a6a7a8a9aaabacadaeafb0b1b2b3b4b5b6b7b8b9babbbcbdbebfc0
+pub        = 04ad137f7ef829eef8a8571bf4d307664ea8e024e05bda4e26da8f7ae8844560
+             58a88e48c9a1d9386471f13f2559758edc4bc1e11394eb415d63e2d33e4d38519d
+identifier = "entity-1"
+sig        = ECDSA-P256-RFC6979-lowS(priv, SHA-256(hello_transcript))
+           = 383ae1bc960796f9ae710ffa7dc73cc8bdb7522567e0f5b2180f4a74cac0f68a
+             00bea85c160d745e881050a72bdb9fbb4a03a2aba4c65dcf29c29dc319796b01
+payload    = msgpack({v:1, identifier, sig})
+           = 83a17601aa6964656e746966696572a8656e746974792d31a3736967c440
+             383ae1bc960796f9ae710ffa7dc73cc8bdb7522567e0f5b2180f4a74cac0f68a
+             00bea85c160d745e881050a72bdb9fbb4a03a2aba4c65dcf29c29dc319796b01
+```
+
+(Hex line breaks are for readability; each value is one contiguous byte string.)

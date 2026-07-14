@@ -3,7 +3,8 @@
 // Run: node scripts/gen-vectors.mjs   (requires node >= 22 w/ strip-types? no —
 // we import from noble directly + replicate the exact derivation calls)
 
-import { x25519 } from "@noble/curves/ed25519.js";
+import { x25519, ed25519 } from "@noble/curves/ed25519.js";
+import { p256 } from "@noble/curves/nist.js";
 import { hkdf } from "@noble/hashes/hkdf.js";
 import { sha256 } from "@noble/hashes/sha2.js";
 import { hmac } from "@noble/hashes/hmac.js";
@@ -69,6 +70,40 @@ const plaintext = encode({ t: 1, id: "1", p: "ping" }); // default codec fine: n
 const ct = xsalsa20poly1305(session_key_psk, msg_nonce).encrypt(plaintext);
 const frame = concatBytes(new Uint8Array([0x01]), msg_nonce, ct);
 
+// ── Auth profile payload KATs ──
+// All bind to hello_transcript above. Encoded with the library codec options
+// ({ useBigInt64: true } — matters for jwt.ts, which must land as float64).
+const mp = (data) => encode(data, { useBigInt64: true });
+
+// jwt profile: fully deterministic given fixed ts.
+const jwt_token = "test.jwt.token";
+const jwt_ts = 1700000000000; // fixed; encodes as msgpack float64 (0xcb)
+const jwt_payload = mp({
+  v: 1,
+  jwt: jwt_token,
+  ts: jwt_ts,
+  th: sha256(hello_transcript),
+});
+
+// ed25519 profile: RFC 8032 signatures are deterministic — byte-exact KAT.
+const ed_seed = fromPattern(0x61); // 0x61..0x80
+const ed_pub = ed25519.getPublicKey(ed_seed);
+const ed_sig = ed25519.sign(hello_transcript, ed_seed); // exact call from src/auth/client.ts
+const ed_payload = mp({ v: 1, deviceId: "device-1", sig: ed_sig });
+
+// ecdsa profile: WebCrypto signing is randomized, so the KAT signature is the
+// RFC 6979 deterministic lowS signature (prehash SHA-256, P-1363 r||s) — it
+// verifies under WebCrypto like any other valid signature. A port with a
+// randomized signer will NOT reproduce these bytes; its payload must instead
+// VERIFY against ecdsa_pub, and this payload must verify in its verifier.
+const ecdsa_priv = fromPattern(0xa1); // 0xa1..0xc0, valid P-256 scalar
+const ecdsa_pub = p256.getPublicKey(ecdsa_priv, false); // uncompressed, 65 bytes
+const ecdsa_sig = p256.sign(hello_transcript, ecdsa_priv, {
+  lowS: true,
+  prehash: true,
+});
+const ecdsa_payload = mp({ v: 1, identifier: "entity-1", sig: ecdsa_sig });
+
 const out = {
   inputs: {
     c_priv: hex(c_priv),
@@ -92,6 +127,29 @@ const out = {
     msg_nonce: hex(msg_nonce),
     plaintext_msgpack: hex(plaintext),
     frame: hex(frame),
+  },
+  auth_profiles: {
+    transcript: "hello_transcript (above)",
+    jwt: {
+      token: jwt_token,
+      ts: jwt_ts,
+      th: hex(sha256(hello_transcript)),
+      payload: hex(jwt_payload),
+    },
+    ed25519: {
+      seed: hex(ed_seed),
+      publicKey: hex(ed_pub),
+      deviceId: "device-1",
+      sig: hex(ed_sig),
+      payload: hex(ed_payload),
+    },
+    ecdsa: {
+      privateScalar: hex(ecdsa_priv),
+      publicKeyUncompressed: hex(ecdsa_pub),
+      identifier: "entity-1",
+      sig: hex(ecdsa_sig),
+      payload: hex(ecdsa_payload),
+    },
   },
 };
 console.log(JSON.stringify(out, null, 2));
