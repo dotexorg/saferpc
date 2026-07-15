@@ -23,6 +23,11 @@ export { concatBytes } from "@noble/ciphers/utils.js";
 
 export const NONCE_LEN = 24;
 export const KEY_LEN = 32;
+// msgpack `useBigInt64` encodes a bigint as int64 (down to -2^63) or uint64
+// (up to 2^64-1). Anything outside that range silently wraps, so the sanitizer
+// rejects it up front instead of shipping a changed value.
+export const BIGINT_MIN: bigint = -(2n ** 63n);
+export const BIGINT_MAX: bigint = 2n ** 64n - 1n;
 export const TAG_HELLO = 0x00;
 export const TAG_MSG = 0x01;
 export const MAX_MSG_BYTES = 1_048_576;
@@ -134,7 +139,12 @@ export function toPlainBytes(v: Uint8Array): Uint8Array {
  * resulting session has no secret authentication. Refuse it at runtime.
  */
 export function isEmptySecret(buf: Uint8Array): boolean {
-  if (buf.length !== KEY_LEN) return false;
+  // An all-zero secret of ANY length is treated as empty. A caller that
+  // returns zeros (forgot to set the secret, or derived it from all-zero
+  // material) must fail loudly rather than silently degrade to asymmetric-only
+  // mode. The earlier guard only inspected exactly KEY_LEN bytes, so 33 / 64 /
+  // 65 zero bytes slipped through.
+  if (buf.length === 0) return true;
   let acc = 0;
   for (let i = 0; i < buf.length; i++) acc |= buf[i]!;
   return acc === 0;
@@ -157,6 +167,15 @@ function sanitizeValue(
   if (v === null || v === undefined) return v;
   if (typeof v === "function" || typeof v === "symbol") {
     throw new RPCError("INVALID_DATA", "Unsupported value type");
+  }
+  if (typeof v === "bigint") {
+    if (v < BIGINT_MIN || v > BIGINT_MAX) {
+      throw new RPCError(
+        "INVALID_DATA",
+        "BigInt out of encodable range (-2^63 .. 2^64-1)",
+      );
+    }
+    return v;
   }
   if (typeof v !== "object") return v;
   if (v instanceof Uint8Array) return v;
@@ -185,11 +204,17 @@ function sanitizeValue(
     for (let i = 0; i < keys.length; i++) {
       const k = keys[i]!;
       if (POISON.has(k)) continue;
-      out[k] = sanitizeValue(
+      const sv = sanitizeValue(
         (v as Record<string, unknown>)[k],
         depth + 1,
         active,
       );
+      // Drop undefined-valued keys so a nested `undefined` matches the
+      // top-level omission semantics. Otherwise msgpack encodes it as nil,
+      // which decodes to null on the peer and fails a `.optional()`
+      // (non-nullable) schema field the inferred type says should be absent.
+      if (sv === undefined) continue;
+      out[k] = sv;
     }
     return out;
   } finally {
@@ -245,6 +270,14 @@ export function deriveSessionSecret(
   }
   if (!(secret instanceof Uint8Array) || secret.length < KEY_LEN) {
     throw new TypeError(`secret must be at least ${KEY_LEN} bytes`);
+  }
+  // All-zero input material derives to a non-zero but publicly reproducible
+  // key that the empty-secret runtime guard cannot catch (it inspects the
+  // derived output, which HKDF makes non-zero). Reject it here so
+  // `deriveSessionSecret(id, new Uint8Array(32))` fails loudly, as the
+  // security guide documents.
+  if (isEmptySecret(secret)) {
+    throw new TypeError("secret must not be all-zero");
   }
   const sessionBytes = new TextEncoder().encode(sessionId);
   const info = new TextEncoder().encode("saferpc-session-v1");

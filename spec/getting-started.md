@@ -238,6 +238,8 @@ const auth = createEd25519ServerAuth({
 
 All built-in helpers (Ed25519, ECDSA, JWT) bind their proof to the canonical handshake transcript. See [Security → Built-in signature helpers](security.md#built-in-signature-helpers).
 
+> **Authentication is directional.** Client `sign` + server `verify` proves the _client's_ identity to the server — it does **not** prove the server's identity to the client. For mutual authentication both sides need `sign` **and** `verify`, or a shared `secret` (PSK). See [Security → Authentication is directional](security.md#authentication-is-directional).
+
 ### Both (defense-in-depth)
 
 Combine a pre-shared secret and asymmetric when you need session binding _and_ individual revocation.

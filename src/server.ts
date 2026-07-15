@@ -211,7 +211,18 @@ function execute(
                   }
                   ctx = Object.assign(Object.create(null), ctx, extra);
                 }
-                return next();
+                const downstream = next();
+                // The spec permits an unreturned (fire-and-forget) next(). If
+                // the middleware neither awaits nor returns this promise and
+                // the downstream step later rejects, that rejection would
+                // surface as an unhandledRejection and can terminate the
+                // process. Attach a swallowing reaction so an unobserved
+                // rejection is never unhandled; a middleware that DOES
+                // await/return this still receives the rejection through its
+                // own await (this extra reaction only covers the nobody-
+                // observed case).
+                void Promise.resolve(downstream).catch(() => {});
+                return downstream;
               },
             });
           } finally {
@@ -364,6 +375,11 @@ export function server(
   // Confirmation timer for the pending candidate. On expiry the candidate is
   // dropped; the live session (if any) is untouched.
   let candidateTimer: ReturnType<typeof setTimeout> | null = null;
+  // Absolute wall-clock deadline for the pending candidate (hello receipt +
+  // hsTimeout). The candidate timer is only a wakeup and may fire late if the
+  // loop was busy; the promotion path checks this deadline directly so an
+  // overdue confirming frame cannot promote an expired candidate.
+  let candidateDeadline = 0;
 
   // ── D2: bounded seen-nonce set (in-session replay defense) ────────
   // Ring buffer of the last `replayWindow` accepted nonce keys + a Set for
@@ -512,11 +528,17 @@ export function server(
       // Every guard therefore also checks wall-clock time.
       const attemptDeadline = attemptStart + hsTimeout;
       let attemptExpired = false;
+      // One attempt reports at most one onError. The attempt timer, the
+      // candidate timer, and the failure catch all gate on this flag so a
+      // timeout followed by a late async rejection (or reply-send failure)
+      // cannot emit two errors for the same handshake.
+      let reported = false;
       const attemptDead = (): boolean =>
         attemptExpired || Date.now() >= attemptDeadline;
       const attemptTimer = setTimeout(function onAttemptTimeout() {
         attemptExpired = true;
-        if (attemptEpoch !== myAttempt || destroyed) return;
+        if (attemptEpoch !== myAttempt || destroyed || reported) return;
+        reported = true;
         if (onError !== null) {
           onError(new RPCError("HANDSHAKE", "Handshake timeout"));
         }
@@ -699,6 +721,10 @@ export function server(
           localSessionKey = null; // ownership transferred — skip finally zero
           candidateDecrypt = createAeadOpener(candidateKey);
           candidateAuthData = localAuthData;
+          // Absolute twin of the confirmation timer below: total budget is
+          // hello receipt + hsTimeout, so the candidate expires at the same
+          // wall-clock instant the timer is scheduled for.
+          candidateDeadline = attemptStart + hsTimeout;
 
           // Arm the confirmation timer for this candidate. On expiry the
           // candidate is dropped and the live session is untouched. Keyed on
@@ -709,6 +735,8 @@ export function server(
           candidateTimer = setTimeout(function onCandidateTimeout() {
             if (candidateEpoch !== myCandEpoch || destroyed) return;
             dropCandidate();
+            if (reported) return;
+            reported = true;
             if (onError !== null) {
               onError(new RPCError("HANDSHAKE", "Handshake timeout"));
             }
@@ -766,7 +794,8 @@ export function server(
       })().catch(function onHsError(err: unknown) {
         // The attempt failed. Under D1 the live session (if any) was never
         // touched, so there is nothing to reset — only report the failure.
-        if (attemptEpoch !== myAttempt || destroyed) return;
+        if (attemptEpoch !== myAttempt || destroyed || reported) return;
+        reported = true;
         if (onError !== null) {
           onError(
             err instanceof RPCError
@@ -828,19 +857,21 @@ export function server(
         // Promotion advances `epoch`; capture reqEpoch AFTER it so the reply
         // to THIS confirming frame survives the response guard below. The
         // confirming frame is not an in-flight leftover — it is the promoter.
-        if (decryptedUnder === "candidate") promoteCandidate();
+        if (decryptedUnder === "candidate") {
+          // Absolute-deadline check: the candidate timer is only a wakeup and
+          // may fire late if the loop was busy past the budget. If this
+          // confirming frame arrives after the candidate expired, do NOT
+          // promote — leave the (now overdue) candidate timer to drop it and
+          // report the timeout. The nonce is not recorded and the handler is
+          // not run, so an expired candidate cannot execute a request.
+          if (Date.now() >= candidateDeadline) return;
+          promoteCandidate();
+        }
         const reqEpoch = epoch;
 
-        // Poly1305 verified — record the nonce in the (now-current) live
-        // window so a later duplicate of this exact frame is rejected.
-        // Synchronous (runs before any await), so back-to-back duplicates
-        // cannot both slip through.
-        if (nKey !== null) seenAdd(nKey);
-
-        // Only now decode the authenticated plaintext. A malformed inner
-        // payload is dropped silently — the session promotion and nonce
-        // record above stand: the key was proven by Poly1305, not by the
-        // payload's shape (spec § Step 4).
+        // Decode the authenticated plaintext. A malformed inner payload is
+        // dropped silently — the session promotion above stands: the key was
+        // proven by Poly1305, not by the payload's shape (spec § Step 4).
         let raw: unknown;
         try {
           raw = decodePlaintext(plain);
@@ -851,7 +882,19 @@ export function server(
         if (typeof raw !== "object" || raw === null) return;
         const msg = raw as Record<string, unknown>;
 
+        // Direction guard: t === 1 marks a REQUEST. Both directions share one
+        // session key, so a genuine server RESPONSE reflected back to the
+        // server also passes Poly1305 — dropping it BEFORE recording its
+        // nonce keeps opposite-direction frames from consuming replay-window
+        // slots (which would shrink the effective window against real
+        // request replays).
         if (msg["t"] !== 1) return;
+
+        // Request-direction frame, Poly1305-verified — record its nonce in
+        // the (now-current) live window so a later duplicate is rejected.
+        // Still synchronous (no await since decrypt), so back-to-back
+        // duplicates cannot both slip through.
+        if (nKey !== null) seenAdd(nKey);
         const rawId = msg["id"];
         if (
           typeof rawId !== "string" ||

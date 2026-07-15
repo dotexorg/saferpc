@@ -158,7 +158,7 @@ import { createEd25519ServerAuth } from "@dotex/saferpc/auth/server";
 
 ## Compatibility
 
-Node.js 18+, modern browsers, Service / Web / Shared Workers, React Native, Vercel Edge, Cloudflare Workers, Deno Deploy. WebCrypto is required only for the ECDSA helpers.
+Node.js 20.19+ (the `@noble/*` dependencies require `>=20.19.0`; older 18.x / 20.18 fail to load the ESM-only crypto packages under CommonJS), modern browsers, Service / Web / Shared Workers, React Native, Vercel Edge, Cloudflare Workers, Deno Deploy. WebCrypto is required only for the ECDSA helpers.
 
 ## Project status
 

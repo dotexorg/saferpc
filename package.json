@@ -51,7 +51,7 @@
     "ws": "^8.21.0"
   },
   "engines": {
-    "node": ">=18"
+    "node": ">=20.19.0"
   },
   "main": "./cjs/index.js",
   "types": "./esm/index.d.ts",

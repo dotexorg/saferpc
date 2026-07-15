@@ -206,6 +206,51 @@ describe("security / middleware pipeline", () => {
     }
   });
 
+  it("fire-and-forget next() with a rejecting downstream does not leak an unhandledRejection (#7)", async () => {
+    // The spec permits an unreturned next(). If the middleware returns its own
+    // value and the downstream handler then rejects, that rejection must be
+    // observed by the runtime — otherwise it surfaces as an unhandledRejection
+    // that can terminate the process.
+    const psk = randomBytes(32);
+    const { a, b } = createChannelPair();
+    const unhandled: unknown[] = [];
+    const onUnhandled = (reason: unknown): void => {
+      unhandled.push(reason);
+    };
+    process.on("unhandledRejection", onUnhandled);
+    const router: Router = {
+      fireForget: chain()
+        .use((({ next }: { next: () => Promise<unknown> }) => {
+          void next(); // fire-and-forget: not awaited, not returned
+          return "outer-success";
+        }) as never)
+        .handler(async () => {
+          throw new Error("downstream-boom");
+        }),
+    };
+    const srv = server(router, a, { auth: { secret: () => psk } });
+    const { api, destroy } = client(b, {
+      auth: { secret: () => psk },
+      timeout: 1000,
+    });
+    try {
+      await expect(api.fireForget({})).resolves.toBe("outer-success");
+      // Give any pending rejection a few ticks to be reported.
+      await new Promise((resolve) => setTimeout(resolve, 30));
+      expect(
+        unhandled.some((r) =>
+          String((r as Error | undefined)?.message ?? r).includes(
+            "downstream-boom",
+          ),
+        ),
+      ).toBe(false);
+    } finally {
+      process.off("unhandledRejection", onUnhandled);
+      destroy();
+      srv.destroy();
+    }
+  });
+
   it("middleware-thrown RPCError is not masked as INTERNAL", async () => {
     const psk = randomBytes(32);
     const { a, b } = createChannelPair();

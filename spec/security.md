@@ -201,9 +201,10 @@ auth: { secret: () => new TextEncoder().encode("secret123") }
 auth: { secret: () => deriveSessionSecret("user-123", secret) }
 
 // ❌ All-zero or weak derivation material: no security at all.
-// Safe RPC refuses an all-zero secret at runtime: `HANDSHAKE` is thrown with
-// "Application returned an all-zero secret" so this mistake fails loudly
-// instead of silently degrading into the asymmetric-only mode.
+// `deriveSessionSecret` rejects all-zero input material outright, and the
+// handshake refuses an all-zero secret of ANY length at runtime ("Application
+// returned an all-zero secret") — either way this mistake fails loudly instead
+// of silently degrading into the asymmetric-only mode.
 auth: { secret: () => deriveSessionSecret(sessionId, new Uint8Array(32)) }
 
 // ❌ Secret material in client-side bundle
@@ -315,6 +316,8 @@ The JWT helper does **not** sign the transcript. JWTs are bearer tokens. Instead
 
 The transcript digest prevents replay of a captured auth payload into a different handshake — the digest was computed over the old transcript and will not match the new one. It does **not** prevent an attacker who has obtained the JWT itself from mounting a fresh handshake with their own ephemeral key and recomputing the digest. JWTs are bearer credentials: anyone holding one can authenticate until it expires. Combine with PSK or a real signature mode when this matters.
 
+**The token is wire-visible.** The hello frame is not yet encrypted — it carries the ephemeral public key that establishes the session — so the JWT rides it in cleartext. A passive observer of the transport (already in scope in the threat model above) reads the token directly off the opening frame; obtaining it does not require any out-of-band access. JWT-only mode therefore assumes a **confidential transport** (TLS / DTLS) or a second factor (PSK or a signature mode). Over an untrusted transport the token is disclosed on every handshake. Signature modes (`ed25519` / `ecdsa`) do not have this property: their payload is a signature over the transcript, not a reusable secret.
+
 ### Custom schemes (certificates, multiple factors)
 
 There are no built-in helpers for certificate-based or multi-factor auth: in both cases the security-critical logic (chain verification; asserting that all factors resolve to the *same* principal) depends on application knowledge the library does not have, so a generic helper would only wrap the trivial part while its name suggested it handles the hard part. Implement `sign`/`verify` directly instead:
@@ -365,6 +368,12 @@ auth: {
   verify: (p, t) => verifyWithPKI(p, t),
 }
 ```
+
+### Authentication is directional
+
+`sign` / `verify` authenticate one direction at a time, and the examples above (client `sign`, server `verify`) are **one-directional**: they prove the _client's_ identity to the server. They do **not** prove the _server's_ identity to the client — a client configured with only `sign` learns nothing about the peer beyond "it completed the key exchange". Under an empty secret the reply proof only demonstrates that the peer derived the same session key, which any endpoint reachable on the wire can do; a client with a real device key will therefore complete a handshake with any server that accepts it.
+
+For **mutual** authentication configure both directions — the server also `sign`s and the client also `verify`s (as in the high-security block above) — or bind both peers to a shared `secret` (PSK), which authenticates symmetrically. Choose one-directional only when the unauthenticated side is genuinely untrusted (a public server serving anonymous clients, for instance).
 
 ## Constants and limits
 
