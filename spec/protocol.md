@@ -6,14 +6,14 @@ The reference implementation is in TypeScript, but this document is the contract
 
 **Document map for porters.** This file is the only fully normative document; where any other document disagrees with it, this one wins.
 
-| Document | Role for a port |
-| --- | --- |
-| `protocol.md` (this file) | Normative wire contract + conformance checklist + test vectors. |
-| [`security.md`](security.md) | Threat model and rationale. Contains porter obligations referenced from the checklist (e.g. low-order X25519 rejection). |
-| [`api.md`](api.md) | The TypeScript reference surface. Ports mirror the *semantics* (error classes, timeout behavior, option validation), not the JS names or types. |
+| Document                                                                         | Role for a port                                                                                                                                    |
+| -------------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `protocol.md` (this file)                                                        | Normative wire contract + conformance checklist + test vectors.                                                                                    |
+| [`security.md`](security.md)                                                     | Threat model and rationale. Contains porter obligations referenced from the checklist (e.g. low-order X25519 rejection).                           |
+| [`api.md`](api.md)                                                               | The TypeScript reference surface. Ports mirror the _semantics_ (error classes, timeout behavior, option validation), not the JS names or types.    |
 | [`getting-started.md`](getting-started.md), [`integrations.md`](integrations.md) | Usage and adapter examples for the reference implementation. The adapter contract in integrations.md restates protocol rules; the examples are JS. |
-| [`assessment.md`](assessment.md) | Dated internal review of the reference — a methodology template for reviewing a port, not a contract. |
-| `spec-channel-lifecycle.md`, `spec-make-before-break.md` (repo root) | Historical design documents behind two shipped features. Rationale only. |
+| [`assessment.md`](assessment.md)                                                 | Dated internal review of the reference — a methodology template for reviewing a port, not a contract.                                              |
+| `spec-channel-lifecycle.md`, `spec-make-before-break.md` (repo root)             | Historical design documents behind two shipped features. Rationale only.                                                                           |
 
 ## Goals and non-goals
 
@@ -46,6 +46,9 @@ Every msgpack document in this protocol (hello/reply maps, RPC envelopes, auth p
 
 - **Map keys** are msgpack `str`. Field values follow the schema annotations: `bin` fields **must** use the msgpack `bin` family and `string` fields the `str` family — the two are never interchangeable (a `pub`/`nonce`/`sig`/`th` sent as `str`, or an `id`/`p` sent as `bin`, fails the receiver's type guard).
 - **Integers** are encoded in the smallest msgpack integer type that holds them: a value in `0..2³²−1` uses `fixint`/`uint8`/`uint16`/`uint32` — never `int64`/`uint64` (`0xd3`/`0xcf`). Integer values outside the 32-bit range are encoded as IEEE-754 `float64` (`0xcb`), not as 64-bit integers. In particular, the JWT profile's `ts` (a millisecond timestamp ≈ 1.8×10¹²) travels as `float64`.
+- **Negative integers, non-integers, and special values** (application payload data only — no protocol field carries them): a negative value in signed 32-bit range uses `fixint`-neg/`int8`/`int16`/`int32`; any other real number, including negatives beyond int32 and all fractional numbers, uses `float64`. Negative zero encodes as positive zero (`0x00`). `NaN` and ±`Infinity` are encodable as `float64` and survive [sanitization](#sanitization) (they are numbers) — a port choosing to reject them must do so in its own application layer, not at the codec. Only a **big-integer** typed value ever selects the 64-bit int family; a language without a distinct big-integer type therefore never emits `0xd3`/`0xcf` and needs no special decode for them beyond what the strict-check above already covers.
+- **Framing and decoder strictness** (a port's decoder must match, or it diverges on hostile input): a frame carries exactly **one** top-level msgpack value — trailing bytes after it are a decode error and the frame is dropped (the reference throws `"Extra N byte(s)"`). On a **duplicate map key** the reference is last-value-wins and does **not** reject; honest peers never emit duplicate keys and every map here has a fixed key set, but a stricter port that rejects duplicates stays interoperable with honest traffic. Strings are UTF-8; behavior on **invalid UTF-8** is decoder-defined (the reference does not throw, it substitutes) — no honest field is non-UTF-8, so a port may reject or substitute, but **must not** depend on the reference's substituted bytes.
+- **Unknown map fields are ignored** on every map in the protocol — hello, reply, request, and response alike. Receivers extract known keys by name and never enumerate for exact-shape rejection. This is the forward-compatibility rule: a future field can be added to any map without breaking an older peer, which simply ignores it.
 - Rationale a porter must reproduce: the reference codec maps only the 64-bit integer types to a big-integer (`BigInt`); every narrower integer decodes to a native number. Receivers then strict-check native numbers — `t !== 1`, `v !== 1`, `typeof epoch !== "number"`, `typeof ts !== "number"` — so a foreign encoder that writes `t: 1` as `uint64` is decoded to a big-integer and the frame is silently dropped; a `ts` sent as `uint64` is rejected as `"Invalid timestamp"`.
 
 ## Constant reference
@@ -116,6 +119,8 @@ The payload is a msgpack-encoded map. The frame is sent in both handshake direct
 
 A frame longer than `MAX_HELLO_BYTES` (tag included) **must** be dropped without state change. A frame that fails msgpack decoding, or decodes to anything other than a map with the required fields, **must** fail the handshake _attempt_ it belongs to (and call `onError` if observed by the server). On the server an invalid hello **must not** disturb an established session — see Re-handshake.
 
+The `auth` field is present exactly when the sender is configured to authenticate this direction. When the receiver has **no** verifier configured it never reads `auth` — an absent, empty, or oversized `auth` is simply ignored (an unauthenticated peer is legal only if neither side configured a verifier for that direction; construction-time validation enforces the pairing). When the receiver **does** have a verifier configured, `auth` is **required** and its length **must** be `1..MAX_AUTH_BYTES`: absent, non-`bin`, empty (`bin(0)`), or oversized all fail the handshake attempt before any session state is derived.
+
 ### `TAG_MSG = 0x01`
 
 The payload is an encrypted RPC message:
@@ -154,7 +159,9 @@ The client generates:
 
 - A fresh X25519 keypair `(c_priv, c_pub)`.
 - A fresh 32-byte random nonce `c_nonce`.
-- The next epoch value: start at 1, increment on every handshake attempt. Epochs are unsigned 32-bit; values outside `0..2^32-1` are invalid on the wire and **must** be rejected. The counter does not wrap — an implementation that exhausts it (2³² handshake attempts in one client lifetime) must fail the handshake with a terminal error rather than reuse epoch values. Recreating the client resets the counter safely: epochs only disambiguate attempts within one client instance.
+- The next epoch value: start at 1, increment on every handshake attempt. Epochs are unsigned 32-bit; values outside `0..2^32-1` are invalid on the wire and **must** be rejected. The counter does not wrap and epoch values are never reused within one client instance.
+  - **The reference counter also advances on session reset**, not only on handshake attempts. It doubles as the client's internal staleness generation: a reset bumps it so any frame encrypted under the just-zeroed key is recognizably epoch-stale if an in-flight send later rolls back. Only handshake attempts put an epoch on the wire, so **wire epoch values may skip** (a reset that is not immediately followed by a new hello burns a value that never appears in any hello). The server **must not** assume contiguous or gap-free client epochs — it validates the range, echoes the value, and binds it into the transcript, nothing more. A port may keep the wire epoch and the staleness generation as two separate counters, but if it reuses one counter (as the reference does) it must advance it on reset too, or its in-flight-frame invalidation breaks.
+  - **Exhaustion** (2³² attempts in one client lifetime — unreachable in practice: one per second is 136 years) is handled by never wrapping and never reusing. The reference does not emit a distinct client-side terminal error; it keeps incrementing past `2³²`, at which point every hello carries an out-of-range epoch that the server rejects (`"Invalid epoch"` → a permanent `HANDSHAKE` failure on every subsequent call). A port **may** instead raise an explicit terminal error client-side before sending; either way it **must not** wrap or reuse. Recreating the client resets the counter safely: epochs only disambiguate attempts within one client instance.
 
 If asymmetric `sign` is configured, the client computes the **hello transcript**:
 
@@ -238,6 +245,27 @@ The established session, if one exists, **must survive until a frame decrypts un
 **Underlying rule (normative).** A transition that _destroys_ authenticated state must be authenticated at least as strongly as the state it destroys. A hello proves at most the sender's chosen identity; it may _create_ a candidate. Retiring a live session is _destruction_ and must be gated on proof of key possession — a frame that decrypts under the candidate. (This is the same failure family as forged TCP resets and Wi-Fi deauth: an unauthenticated message tearing down an authenticated connection.)
 
 This make-before-break ordering is load-bearing and closes the displacement hole in **both** modes: neither a byte-for-byte replayed hello nor a well-formed forged hello (secret-only mode) can retire a live session, because neither can produce a frame that decrypts under the fresh-per-attempt candidate key. A duplicate/forged hello can at most create a candidate that expires unconfirmed on its timer.
+
+**Concurrency and generation guards (normative).** Hello processing contains `await` points (async `verify`, `secret`, `sign`); a newer hello, a candidate timeout, a promotion, or destroy may become ready between them. The reference serializes correctness with three monotonic generation counters, and a port **must** reproduce their effect however it schedules work:
+
+- **attempt generation** — advances on **every** incoming hello. After every `await` in hello processing, the attempt re-checks that it is still the current generation (and that the server is not destroyed); a superseded attempt abandons silently, installing nothing. This is what makes "latest hello wins" safe under interleaving.
+- **candidate generation** — advances only when a candidate is **installed**. The candidate confirmation timer is keyed on it, so a later hello that bumps the attempt generation but then fails validation cannot disarm an existing candidate's timer, and a stale timer cannot drop a newer candidate.
+- **live/response generation (epoch)** — advances on every **promotion**. A response captures it at request arrival and is dropped at send time if it has advanced (a promotion completed while the handler ran) or the server was destroyed — see the [execution pipeline](#procedure-execution-pipeline-server).
+
+On a single-threaded runtime these checks suffice because the synchronous install block runs to completion without interleaving. A threaded port **must additionally** serialize the trial-decrypt-and-promote step against candidate replacement: reading the candidate key, decrypting under it, and promoting must not straddle another thread swapping the candidate, or a frame may promote a candidate that was already replaced.
+
+### Handshake timing, send failures, and auth configuration
+
+**Auth configuration predicate (construction-time, normative).** A peer is valid iff **at least one** of `secret`, `sign`, `verify` is configured; a peer with none is rejected at construction (an unauthenticated handshake). Every non-empty subset is legal: `secret`-only, `sign`-only, `verify`-only, or any combination. `sign`-only and `verify`-only configure a single direction — whether a given direction is actually authenticated is decided at handshake time, not at construction: the server reads and requires `hello.auth` **iff** it has `verify`; the client embeds `auth` **iff** it has `sign`. Two peers interoperate only if their per-direction expectations line up (a server with `verify` needs a client with `sign`, and vice versa); a mismatch surfaces as a handshake failure, not a construction error.
+
+**Deadline origins (normative).** Both sides bound the whole handshake by `handshakeTimeout` measured as wall-clock elapsed from a fixed origin:
+
+- **Client**: the origin is the start of the handshake **attempt** — immediately after ephemeral keypair/nonce generation, before the (possibly async) `sign` and send. The single budget spans `sign` + hello send + reply processing + reaching `ready`. It does **not** include time spent in the caller's API before the attempt began.
+- **Server**: the origin is when it **begins processing the hello** (hello arrival). The one budget spans validation (`verify`/`secret`/`sign`) **and** candidate confirmation: on successful validation the attempt timer is retired and the candidate confirmation timer inherits the **remaining** budget (`handshakeTimeout − elapsed`), so a slow `verify` shortens the confirmation window rather than extending the total.
+
+**Client hello-send failure (normative).** A transport error while sending the hello is **not** a handshake failure. The hello is queued and retried by the outbound flush tick, still bounded by the attempt's `handshakeTimeout`; if the attempt dies first (superseded or timed out) the queued hello is revoked and never sent late. The send error is intentionally not surfaced — a down transport is the queue's normal input, not a failure signal.
+
+**Server reply-send failure (normative).** If sending the reply fails, the candidate just installed can never be confirmed (the client never got the proof). The server drops that candidate **immediately** — guarded on the candidate generation so a newer candidate installed in the meantime is not clobbered — and reports a `HANDSHAKE` error through `onError` carrying the transport error as its `cause`, rather than letting the candidate linger to a spurious second confirmation-timeout report.
 
 Residual (accepted, out of threat model): because the latest hello wins the candidate slot, a _flood_ of hellos can keep overwriting the candidate and starve a legitimate peer's reconnect before its confirming frame lands. This is a denial-of-service concern, explicitly outside saferpc's threat model; rate-limit hellos at the transport layer if it matters for your deployment. A cheap partial mitigation (drop byte-identical duplicate hellos via a small recent-transcript-hash cache before signature verification) is possible but not mandated.
 
@@ -328,7 +356,9 @@ The **server** (the side that executes requests) keeps a per-session set of the 
 1. **Check before decrypt.** On an inbound `TAG_MSG`, if the 24-byte nonce is in the set, drop the frame silently. (Cheap exact-replay rejection, no AEAD work.)
 2. **Insert only after successful Poly1305 verification.** A frame that fails to decrypt must **not** add its nonce to the set. Otherwise an attacker who cannot forge ciphertexts can still flood arbitrary nonces, forcing eviction churn and re-opening the window for entries evicted early.
 3. **Bounded, FIFO eviction.** When the set holds `REPLAY_WINDOW` entries, inserting a new nonce evicts the oldest. The honest consequence: a replay older than the last `REPLAY_WINDOW` accepted messages executes again — the window is _narrowed_, not closed. Non-idempotent procedures still want an application-level idempotency key.
-4. **Cleared on re-handshake.** A new session key makes old nonces unreplayable (AEAD fails under the new key); keeping them wastes the budget. The set's lifetime is the session key's lifetime.
+4. **Cleared on promotion, not on candidate install.** The set is cleared exactly when a candidate is **promoted** to the live session (its key becomes the live key) — not when a candidate is merely installed. During make-before-break (candidate installed, old live key still serving) the live replay window stays intact, so an old live-session request cannot be replayed in the gap. A new session key makes old nonces unreplayable anyway (AEAD fails under the new key); the set's lifetime is exactly one live key's lifetime.
+
+**Check-and-insert must be atomic** (rules 1+2 as one indivisible step). The reference records the verified nonce **synchronously, before any `await`** in the request handler, so two byte-identical frames delivered back-to-back cannot both pass the rule-1 lookup — the first records the nonce before control returns to the transport, the second sees it. A port on a threaded runtime **must** take a lock across the membership check and the post-verification insert; a check-then-`await`-then-insert gap lets concurrent duplicates both execute. **Promotion ordering is likewise indivisible with the confirming frame's insert:** the confirming frame promotes (which clears the set) and only **then** records its own nonce into the now-cleared window — so a replay of that first confirming frame is caught by rule 1 against the new live window.
 
 The client does not need a seen-nonce set for security: response `id`s are matched against the pending-call table and each `id` is used once, so a replayed response is dropped at the RPC layer. A client-side set is permitted but adds nothing.
 
@@ -351,7 +381,7 @@ After decryption, an RPC message is a msgpack-encoded map. Two kinds.
 
 Nuances a port must reproduce:
 
-- The server **must** drop requests whose `id` is empty or longer than `MAX_ID_LEN` (64), and requests whose `p` is missing, non-string, or empty. Drop means silent drop — no response frame.
+- The server **must** drop requests whose `id` is empty or longer than `MAX_ID_LEN` (64), and requests whose `p` is missing, non-string, or empty. Drop means silent drop — no response frame. The `MAX_ID_LEN` bound is a resource guard, not a wire invariant: the reference counts the id in **UTF-16 code units** (JS `String.length`), so a port counting UTF-8 bytes or Unicode scalars may pick a different rejection threshold for a non-ASCII id. Because ids are opaque, client-chosen, and **should** be ASCII (the reference generates a decimal counter), the three counts coincide in practice — a peer **must not** depend on the exact threshold for non-ASCII ids.
 - When the caller supplies no input, the `i` key is **omitted entirely**, never encoded as nil. msgpack has no `undefined`; encoding an absent input as nil would make an "optional" input schema on the server observe an explicit null instead of an absent value. An absent key must decode back to the language's absent-value representation.
 - The reference client generates `id`s from a monotonically increasing per-client counter. This is not normative — any scheme works — but `id`s **must never be reused** within a client instance: uniqueness is what makes response matching (and the client's replay immunity) sound.
 
@@ -393,7 +423,7 @@ On the server, a handler throwing the implementation's typed RPC error maps to `
 
 Messages with wrong `t`, missing/empty `id`, missing/empty `p`, or any unexpected type **must** be dropped silently. The protocol has no provision for "bad message" responses. Those would be useful only to an attacker enumerating implementation behavior.
 
-Silent drop applies to malformed **envelopes** only. A **well-formed** request (`t: 1`, valid `id`, non-empty string `p`) whose `p` does not name a procedure in the router is *not* silently dropped: the server returns a normal failure response with code `NOT_FOUND`. At that point the peer has already proven key possession, so the enumeration argument no longer applies.
+Silent drop applies to malformed **envelopes** only. A **well-formed** request (`t: 1`, valid `id`, non-empty string `p`) whose `p` does not name a procedure in the router is _not_ silently dropped: the server returns a normal failure response with code `NOT_FOUND`. At that point the peer has already proven key possession, so the enumeration argument no longer applies.
 
 **Protocol-level error codes.** In addition to application-defined codes, the reference server emits: `INPUT_VALIDATION`, `OUTPUT_VALIDATION`, `MIDDLEWARE`, `NOT_FOUND`, `INVALID_DATA`, `INTERNAL`. A behavior-compatible port **should** emit the same codes for the same conditions. The error `d` payload is implementation-defined (the reference puts its schema library's flattened issues there); clients **must not** depend on its shape.
 
@@ -408,7 +438,7 @@ The stages between a well-formed decrypted request and its response frame, in or
    - **Input schema**: validate the raw `i` value; failure ⇒ `INPUT_VALIDATION`. On success the **parsed** value replaces the raw input for the rest of the chain (schema transforms/defaults apply — the handler sees post-parse data).
    - **Middleware**: must call its continuation (`next`) **exactly once**. Calling it twice, passing a non-object context extension, or completing without calling it at all ⇒ `MIDDLEWARE`. The completed-without-`next` case is load-bearing: a middleware returning a value while skipping the handler would otherwise surface as a success reply for a handler that never ran.
    - **Output schema**: validate the handler's return value; failure ⇒ `OUTPUT_VALIDATION`. The **parsed** output is what gets serialized into `d`.
-5. **Output sanitization.** The final result passes the [sanitization](#sanitization) gate before encoding; a host object that leaked through ⇒ failure response `INVALID_DATA` (typed, instead of an opaque `INTERNAL`). Error `d` payloads are sanitized the same way — and if *that* fails, no response is sent at all.
+5. **Output sanitization.** The final result passes the [sanitization](#sanitization) gate before encoding; a host object that leaked through ⇒ failure response `INVALID_DATA` (typed, instead of an opaque `INTERNAL`). Error `d` payloads are sanitized the same way — and if _that_ fails, no response is sent at all.
 6. **Epoch guard + send.** If a promotion/re-handshake or destroy happened while the handler ran, the response belongs to a superseded session — dropped, not sent. Otherwise it is encrypted under the current live key and sent; a send failure is reported locally (`onError`), never to the peer.
 
 A handler (or step) throwing the implementation's typed RPC error maps to `{ c, m, d }` as described above; any other thrown value ⇒ `INTERNAL` with no detail.
@@ -487,7 +517,7 @@ Before the boundary, terminal events (timeout, abort, destroy, `sendTimeout`) re
 
 JS realization: `channel.send` returning a thenable is the handoff; the thenable resolving/rejecting is the completion. A port maps "initiation" and "completion" onto its own async model (future creation vs. resolution, coroutine launch vs. return, callback registration vs. invocation).
 
-**Core outbound queue.** When `channel.send` throws, the frame enters the core outbound queue. A retry tick (every 250 ms, running only while the queue is non-empty) attempts queued frames in order; the first throw stops the pass (head-of-line: if the channel is down, no later frame bypasses a stuck one). A frame transitions to *sent* the first time `send` succeeds; it then waits for reply-or-timeout only. `sendTimeout` (default 3 000 ms, counted from enqueue) is the per-frame deadline; expiry rejects the call with plain `RPCError("CHANNEL")` — the frame provably never left.
+**Core outbound queue.** When `channel.send` throws, the frame enters the core outbound queue. A retry tick (every 250 ms, running only while the queue is non-empty) attempts queued frames in order; the first throw stops the pass (head-of-line: if the channel is down, no later frame bypasses a stuck one). A frame transitions to _sent_ the first time `send` succeeds; it then waits for reply-or-timeout only. `sendTimeout` (default 3 000 ms, counted from enqueue) is the per-frame deadline; expiry rejects the call with plain `RPCError("CHANNEL")` — the frame provably never left.
 
 **Why no resend.** A sent-frame `TIMEOUT` does not prove the server did not execute the request, only that no response arrived in time. Resending would silently execute a non-idempotent handler twice. Unsent frames (`RPCError`) are safe to retry; the library defers that choice to the caller in both cases.
 
@@ -500,8 +530,6 @@ Calls that received a `RemoteRPCError` (the server responded with `ok: false`) a
 Local guardrail errors **must not** trigger the reset path either. The `CLIENT` backpressure error (`maxPending` exceeded), id-counter exhaustion, and any other error that does not indicate a dead session leave the session exactly as it was: resetting a healthy session on a guardrail error would tear down the encryption state for every in-flight call, force them into timeout, and re-execute their handlers — double execution with no attacker involved. The reset trigger set is exactly: `RPCAbortedError` with code `TIMEOUT` — a sent call whose reply never arrived. Nothing else.
 
 Concurrent failures share one re-handshake via the epoch counter, so there are no reset storms.
-
-
 
 ## Sanitization
 
@@ -523,11 +551,16 @@ Every decoded msgpack value passes through a sanitization step, inbound and outb
 
 ## Authorization data flow
 
-When `auth.verify` is configured on the server, the value it returns is the verified principal for the lifetime of the session. Safe RPC takes the returned `{ auth: ... }` object, sanitizes it, and:
+When `auth.verify` is configured on the server, the value it returns is the verified principal for the lifetime of the session. The verify callback returns a wrapper `{ auth: <principal> }`; the server extracts the **`.auth` member**, sanitizes **that** (not the wrapper), and:
 
-- Stores it on the server session.
-- Passes it as `{ auth: verified }` to the `context` factory on every request.
+- Stores the sanitized principal on the server session.
+- Passes it wrapped as `{ auth: <principal> }` to the `context` factory on every request.
 - Discards it when the session it belongs to ends: replaced by a successful re-handshake (the new session carries the new attempt's verified auth), pending-session timeout, or destroy.
+
+**Edge cases a port must reproduce:**
+
+- If the verify callback returns a value whose `.auth` member is **absent** (e.g. `{}` or a bare non-object), verification still counts as **success** (it did not throw) but **no** principal is stored — the session is authenticated-by-not-throwing yet carries no auth data. A present `.auth` that is a non-object (non-null) is a hard error (`HANDSHAKE`, "result must be an object"); a present object is sanitized and stored.
+- When **no** verifier is configured, the server stores no auth data. The `context` factory then receives an **empty object `{}`** (no `auth` key at all — not `{ auth: undefined }`). With no `context` factory configured and auth data present, the request `ctx` is the principal's own fields copied onto a null-prototype object; with no factory and no auth data, `ctx` is an empty null-prototype object.
 
 ```
 server.verify(hello.auth, hello_transcript)
@@ -553,7 +586,7 @@ The shipped auth helpers, however, define a fixed wire schema, and a captured he
 
 Every helper payload is a msgpack map carrying a profile version `v`. A verifier **must** reject a payload whose `v` is absent or not a version it implements (rather than best-effort decoding a schema it was not written for), with an `UNAUTHORIZED`-class failure. The current version for every profile is `1`. Any change to a profile's field set, field meaning, or signature input **must** bump that profile's `v`.
 
-All three signing profiles bind to the same handshake transcript defined in [Handshake](#handshake): the client-side helper signs (or digests) the **hello** transcript; a server-side signing helper would use the **reply** transcript. Byte layout of the transcript is fixed by that section. The binding *input* differs per profile and is wire-normative: `ed25519` and `ecdsa` sign the **raw transcript bytes**; `jwt` embeds **`SHA-256(transcript)`**. Mixing these up produces payloads the counterparty rejects.
+All three signing profiles bind to the same handshake transcript defined in [Handshake](#handshake): the client-side helper signs (or digests) the **hello** transcript; a server-side signing helper would use the **reply** transcript. Byte layout of the transcript is fixed by that section. The binding _input_ differs per profile and is wire-normative: `ed25519` and `ecdsa` sign the **raw transcript bytes**; `jwt` embeds **`SHA-256(transcript)`**. Mixing these up produces payloads the counterparty rejects.
 
 ### Profile `jwt` (bearer token, digest-bound) — `v: 1`
 
@@ -568,7 +601,7 @@ All three signing profiles bind to the same handshake transcript defined in [Han
 
 On the wire `ts` is a `float64` (see [msgpack profile](#msgpack-profile)) whose value is an integer count of milliseconds; a port's verifier must accept the float and treat it as ms. The reference `maxAge` default is 30 000 ms (server-side policy, configurable, not a wire constant).
 
-The verifier **must**, in order: reject unknown `v`; require `jwt` a non-empty string; require `ts` a finite number and `|now - ts| ≤ maxAge` (symmetric skew — a one-sided `>` check accepts future-dated forgeries); require `th` exactly 32 bytes and equal to `SHA-256(transcript)` compared in **constant time**; only then call the application token validator. A JWT is a bearer credential: the digest binds a captured payload to *this* handshake, but possession of the token is sufficient to mint a fresh payload — the profile does not and cannot change that. See [Security § JWT](security.md#jwt-bearer-token-transcript-bound).
+The verifier **must**, in order: reject unknown `v`; require `jwt` a non-empty string; require `ts` a finite number and `|now - ts| ≤ maxAge` (symmetric skew — a one-sided `>` check accepts future-dated forgeries); require `th` exactly 32 bytes and equal to `SHA-256(transcript)` compared in **constant time**; only then call the application token validator. A JWT is a bearer credential: the digest binds a captured payload to _this_ handshake, but possession of the token is sufficient to mint a fresh payload — the profile does not and cannot change that. See [Security § JWT](security.md#jwt-bearer-token-transcript-bound).
 
 ### Profile `ed25519` (device signature) — `v: 1`
 
@@ -582,6 +615,8 @@ The verifier **must**, in order: reject unknown `v`; require `jwt` a non-empty s
 
 The verifier **must**: reject unknown `v`; require `deviceId` a non-empty string; require `sig` exactly 64 bytes; resolve the device's 32-byte Ed25519 public key (rejecting an out-of-band revoked/unknown device before any crypto if a policy hook is configured); verify `sig` over the **raw transcript bytes** (not a pre-hash). The returned principal is `{ deviceId, verified: true }`.
 
+Verification strictness is a wire-normative parameter for cross-implementation vector agreement. The reference verifies with **ZIP-215** rules (the `@noble/curves` default: cofactored equation, non-canonical `y` and small-order/mixed-order points accepted). A port whose Ed25519 library defaults to strict RFC 8032 / NIST FIPS 186-5 verification (e.g. `ed25519-dalek`) will **disagree with the reference on edge-case signatures** — small-order or non-canonically-encoded points that ZIP-215 accepts and RFC 8032 rejects. Honest signers producing canonical signatures verify identically under both, so a port **may** choose either rule, but **must** document its choice and understand adversarial test vectors will not agree across the two. Malleability is not replay-exploitable here regardless: the transcript binds the epoch and both nonces, so a mutated signature buys no session advantage.
+
 ### Profile `ecdsa` (P-256 signature) — `v: 1`
 
 ```
@@ -594,30 +629,32 @@ The verifier **must**: reject unknown `v`; require `deviceId` a non-empty string
 
 The verifier **must**: reject unknown `v`; require `identifier` a non-empty string; require `sig` non-empty; resolve the P-256 public key; verify the signature over the transcript with SHA-256 as the hash. Signature encoding is WebCrypto's raw `r||s` (IEEE P-1363), **not** DER — a port using a DER-only ECDSA library must transcode. Unlike `ed25519`, `sig` has no length guard: a wrong-length value fails at signature verification, not at a shape check. The returned principal is `{ identifier, verified: true }`.
 
+The reference verifies via WebCrypto (`crypto.subtle.verify`), which accepts any mathematically valid `(r, s)` — it does **not** enforce low-S. A port **must** likewise accept high-S signatures (do not add a low-S/canonical-S gate) or it will reject signatures the reference and every WebCrypto peer produce. As with `ed25519`, ECDSA malleability grants no replay advantage because the transcript binds the epoch and both nonces.
+
 > Certificate and multi-factor composition are **not** shipped helpers and define no profile: build them from a custom `sign`/`verify`. A multi-factor verifier that composes two of the above must additionally assert both factors resolve to the **same** principal before combining them — the composition itself carries no such guarantee. See [Security § Custom schemes](security.md#custom-schemes-certificates-multiple-factors).
 
 ## Failure modes
 
-| Failure                                       | Server response                               | Client response                                           |
-| --------------------------------------------- | --------------------------------------------- | --------------------------------------------------------- |
-| Empty (zero-length) frame                     | Drop silently                                 | Drop silently                                             |
-| Bad frame tag                                 | Drop silently                                 | Drop silently                                             |
-| Frame > max size                              | Drop silently                                 | Drop silently                                             |
-| msgpack decode error (hello)                  | Discard attempt, `onError`; session survives  | Fail handshake                                            |
-| Sanitization failure (hello)                  | Discard attempt, `onError`; session survives  | Fail handshake                                            |
-| Bad secret / missing secret bytes             | Discard attempt (`HANDSHAKE`), `onError`      | Fail handshake (`HANDSHAKE`)                              |
-| Auth payload `v` absent/unknown (shipped helper) | Discard attempt (`UNAUTHORIZED`), `onError` | Fail handshake                                            |
-| Reply send throws (server)                    | Drop candidate, one `HANDSHAKE` error (cause) | —                                                        |
-| Sync auth callback overruns `handshakeTimeout` | Install nothing; attempt dies at the deadline | Fail handshake (`HANDSHAKE`)                             |
-| `verify` throws                               | Discard attempt, `onError`; session survives  | Fail handshake                                            |
-| `sign` returns invalid payload                | Discard attempt                               | Fail handshake                                            |
-| Proof mismatch (client)                       | —                                             | Fail handshake                                            |
-| Poly1305 mismatch (post-handshake)            | Drop frame silently                           | Drop frame silently                                       |
-| Replayed `TAG_MSG` nonce (within window)      | Drop frame silently                           | Optional (see Replay protection)                          |
-| Stale reply (`epoch` mismatch)                | —                                             | Drop reply silently                                       |
-| Stale request (after session replaced)        | Drop response (epoch guard)                   | Times out; error surfaces, caller decides (no auto-retry) |
-| RPC handler throws non-`RPCError`             | Send `{ c: "INTERNAL", m: "Internal error" }` | Surface as `RemoteRPCError`                               |
-| Local guardrail (`maxPending`, id exhaustion) | —                                             | Reject that call only; session untouched, **no retry**    |
+| Failure                                          | Server response                               | Client response                                           |
+| ------------------------------------------------ | --------------------------------------------- | --------------------------------------------------------- |
+| Empty (zero-length) frame                        | Drop silently                                 | Drop silently                                             |
+| Bad frame tag                                    | Drop silently                                 | Drop silently                                             |
+| Frame > max size                                 | Drop silently                                 | Drop silently                                             |
+| msgpack decode error (hello)                     | Discard attempt, `onError`; session survives  | Fail handshake                                            |
+| Sanitization failure (hello)                     | Discard attempt, `onError`; session survives  | Fail handshake                                            |
+| Bad secret / missing secret bytes                | Discard attempt (`HANDSHAKE`), `onError`      | Fail handshake (`HANDSHAKE`)                              |
+| Auth payload `v` absent/unknown (shipped helper) | Discard attempt (`UNAUTHORIZED`), `onError`   | Fail handshake                                            |
+| Reply send throws (server)                       | Drop candidate, one `HANDSHAKE` error (cause) | —                                                         |
+| Sync auth callback overruns `handshakeTimeout`   | Install nothing; attempt dies at the deadline | Fail handshake (`HANDSHAKE`)                              |
+| `verify` throws                                  | Discard attempt, `onError`; session survives  | Fail handshake                                            |
+| `sign` returns invalid payload                   | Discard attempt                               | Fail handshake                                            |
+| Proof mismatch (client)                          | —                                             | Fail handshake                                            |
+| Poly1305 mismatch (post-handshake)               | Drop frame silently                           | Drop frame silently                                       |
+| Replayed `TAG_MSG` nonce (within window)         | Drop frame silently                           | Optional (see Replay protection)                          |
+| Stale reply (`epoch` mismatch)                   | —                                             | Drop reply silently                                       |
+| Stale request (after session replaced)           | Drop response (epoch guard)                   | Times out; error surfaces, caller decides (no auto-retry) |
+| RPC handler throws non-`RPCError`                | Send `{ c: "INTERNAL", m: "Internal error" }` | Surface as `RemoteRPCError`                               |
+| Local guardrail (`maxPending`, id exhaustion)    | —                                             | Reject that call only; session untouched, **no retry**    |
 
 Silent drops are deliberate. Any feedback at the wire level gives an attacker probing material.
 
@@ -651,7 +688,7 @@ A new-language port that ticks every item is conformant:
 - [ ] Every `await` in the handshake path is followed by an attempt + destroyed guard before any session state is written. The candidate install happens under a final guard inside a single synchronous block.
 - [ ] The handshake budget is enforced by an **absolute wall-clock deadline**, checked after every suspension point, not only by a timer/flag. A synchronous auth callback (`sign`/`verify`/`secret`) that blocks the event loop past the budget resumes before a timer macrotask can fire; a flag-only guard is still unset at that point and would install a candidate + send a reply after expiry. The deadline check (both sides) rejects that.
 - [ ] A reply-send failure on the server drops the just-installed candidate (guarded on the candidate counter) and reports a single handshake error; it does not leave the candidate to expire into a second timeout.
-- [ ] Inbound `TAG_MSG` promotion is gated on **AEAD verification only**. Decoding/sanitizing the inner payload happens *after* promotion and after the nonce is recorded in the replay set; a malformed inner payload under a proven key still promotes and still consumes its nonce (it is only dropped from producing a response). Conflating decode failure with Poly1305 failure would strand the candidate.
+- [ ] Inbound `TAG_MSG` promotion is gated on **AEAD verification only**. Decoding/sanitizing the inner payload happens _after_ promotion and after the nonce is recorded in the replay set; a malformed inner payload under a proven key still promotes and still consumes its nonce (it is only dropped from producing a response). Conflating decode failure with Poly1305 failure would strand the candidate.
 - [ ] Numeric limits (`maxPending`, `maxMessageBytes`, JWT `maxAge`) are validated at construction: a non-finite or non-positive value is rejected with an error, never accepted (a `NaN` bound silently disables the check, since `x > NaN` is always false).
 - [ ] Shipped auth helpers stamp a profile version `v` and verifiers reject an absent/unknown `v` (see [Auth payload profiles](#auth-payload-profiles)); the three profile schemas are reproduced byte-for-byte.
 - [ ] A separate counter guards the candidate confirmation timer, bumped only when a candidate is installed — so a later hello that bumps the attempt counter but then fails validation cannot disarm an existing candidate's timeout.
