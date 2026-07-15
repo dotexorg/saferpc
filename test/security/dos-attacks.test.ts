@@ -82,6 +82,11 @@ describe("security / DoS — framing limits", () => {
       await expect(api.ping(Symbol("bad") as unknown)).rejects.toMatchObject({
         code: "INVALID_DATA",
       });
+      const cyclic: Record<string, unknown> = {};
+      cyclic.self = cyclic;
+      await expect(api.ping(cyclic)).rejects.toMatchObject({
+        code: "INVALID_DATA",
+      });
       expect(invocations).toBe(0);
       expect(framesSent).toBe(0);
     } finally {

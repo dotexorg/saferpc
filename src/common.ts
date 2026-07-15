@@ -143,6 +143,14 @@ export function isEmptySecret(buf: Uint8Array): boolean {
 const POISON = new Set(["__proto__", "constructor", "prototype"]);
 
 export function sanitize(v: unknown, depth: number = 0): unknown {
+  return sanitizeValue(v, depth, new WeakSet<object>());
+}
+
+function sanitizeValue(
+  v: unknown,
+  depth: number,
+  active: WeakSet<object>,
+): unknown {
   if (depth > MAX_DEPTH) {
     throw new RPCError("INVALID_DATA", "Max nesting depth exceeded");
   }
@@ -152,29 +160,41 @@ export function sanitize(v: unknown, depth: number = 0): unknown {
   }
   if (typeof v !== "object") return v;
   if (v instanceof Uint8Array) return v;
-  if (Array.isArray(v)) {
-    const out: unknown[] = [];
-    for (let i = 0; i < v.length; i++) {
-      out[i] = sanitize(v[i], depth + 1);
+  if (active.has(v)) {
+    throw new RPCError("INVALID_DATA", "Cyclic data rejected");
+  }
+  active.add(v);
+  try {
+    if (Array.isArray(v)) {
+      const out: unknown[] = [];
+      for (let i = 0; i < v.length; i++) {
+        out[i] = sanitizeValue(v[i], depth + 1, active);
+      }
+      return out;
+    }
+    // Reject non-plain objects (Date, Map, Set, ExtData, etc.). Any object
+    // whose prototype is neither Object.prototype nor null is suspicious —
+    // it likely came in via a msgpack ext type or a JS host object that
+    // could surprise downstream handlers.
+    const proto = Object.getPrototypeOf(v);
+    if (proto !== Object.prototype && proto !== null) {
+      throw new RPCError("INVALID_DATA", "Non-plain object rejected");
+    }
+    const out: Record<string, unknown> = Object.create(null);
+    const keys = Object.keys(v as Record<string, unknown>);
+    for (let i = 0; i < keys.length; i++) {
+      const k = keys[i]!;
+      if (POISON.has(k)) continue;
+      out[k] = sanitizeValue(
+        (v as Record<string, unknown>)[k],
+        depth + 1,
+        active,
+      );
     }
     return out;
+  } finally {
+    active.delete(v);
   }
-  // Reject non-plain objects (Date, Map, Set, ExtData, etc.). Any object
-  // whose prototype is neither Object.prototype nor null is suspicious —
-  // it likely came in via a msgpack ext type or a JS host object that
-  // could surprise downstream handlers.
-  const proto = Object.getPrototypeOf(v);
-  if (proto !== Object.prototype && proto !== null) {
-    throw new RPCError("INVALID_DATA", "Non-plain object rejected");
-  }
-  const out: Record<string, unknown> = Object.create(null);
-  const keys = Object.keys(v as Record<string, unknown>);
-  for (let i = 0; i < keys.length; i++) {
-    const k = keys[i]!;
-    if (POISON.has(k)) continue;
-    out[k] = sanitize((v as Record<string, unknown>)[k], depth + 1);
-  }
-  return out;
 }
 
 // ─── Safe msgpack wrappers ──────────────────────────────
