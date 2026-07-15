@@ -4,6 +4,17 @@ Language-agnostic specification of the Safe RPC wire protocol. Read this to port
 
 The reference implementation is in TypeScript, but this document is the contract — the code follows it.
 
+**Document map for porters.** This file is the only fully normative document; where any other document disagrees with it, this one wins.
+
+| Document | Role for a port |
+| --- | --- |
+| `protocol.md` (this file) | Normative wire contract + conformance checklist + test vectors. |
+| [`security.md`](security.md) | Threat model and rationale. Contains porter obligations referenced from the checklist (e.g. low-order X25519 rejection). |
+| [`api.md`](api.md) | The TypeScript reference surface. Ports mirror the *semantics* (error classes, timeout behavior, option validation), not the JS names or types. |
+| [`getting-started.md`](getting-started.md), [`integrations.md`](integrations.md) | Usage and adapter examples for the reference implementation. The adapter contract in integrations.md restates protocol rules; the examples are JS. |
+| [`assessment.md`](assessment.md) | Dated internal review of the reference — a methodology template for reviewing a port, not a contract. |
+| `spec-channel-lifecycle.md`, `spec-make-before-break.md` (repo root) | Historical design documents behind two shipped features. Rationale only. |
+
 ## Goals and non-goals
 
 Design constraints, in order:
@@ -374,6 +385,8 @@ The error map's fields:
 | `m`   | Human-readable message. Untrusted from the receiver's perspective.                                                 |
 | `d`   | Optional structured data, sanitized before transmission.                                                           |
 
+The `ok` discriminator itself is **never** coerced: exactly boolean `true` selects the success form and exactly boolean `false` the failure form. A response whose `ok` is anything else (absent, nil, a number, a string) is a malformed envelope — the client **must** drop it silently, before consuming the pending-call entry, so the call keeps waiting for a well-formed response under its own timer.
+
 The receiving client must treat every error field as hostile and coerce defensively: if `e` is not a map, surface code `"UNKNOWN"` with an empty message; if `c` is not a non-empty string, use `"UNKNOWN"`; if `m` is not a string, use `""`. Never `String()`-coerce arbitrary values into codes — a stringified `undefined`/object makes a misleading code.
 
 On the server, a handler throwing the implementation's typed RPC error maps to `{ c: code, m: message, d: sanitize(data) }`. Any other thrown value maps to `{ c: "INTERNAL", m: "Internal error", d: null }` — internal error details **must not** leak to the peer. If sanitizing `d` itself fails, the response is not sent at all (the client times out); handler error `data` must be a plain-data tree.
@@ -383,6 +396,22 @@ Messages with wrong `t`, missing/empty `id`, missing/empty `p`, or any unexpecte
 Silent drop applies to malformed **envelopes** only. A **well-formed** request (`t: 1`, valid `id`, non-empty string `p`) whose `p` does not name a procedure in the router is *not* silently dropped: the server returns a normal failure response with code `NOT_FOUND`. At that point the peer has already proven key possession, so the enumeration argument no longer applies.
 
 **Protocol-level error codes.** In addition to application-defined codes, the reference server emits: `INPUT_VALIDATION`, `OUTPUT_VALIDATION`, `MIDDLEWARE`, `NOT_FOUND`, `INVALID_DATA`, `INTERNAL`. A behavior-compatible port **should** emit the same codes for the same conditions. The error `d` payload is implementation-defined (the reference puts its schema library's flattened issues there); clients **must not** depend on its shape.
+
+### Procedure execution pipeline (server)
+
+The stages between a well-formed decrypted request and its response frame, in order. The stage **order** and the **error code each stage produces** are normative — they are wire-observable; the mechanism (how a port models procedures, schemas, middleware) is not.
+
+1. **Router lookup.** Unknown `p` ⇒ failure response `NOT_FOUND` (the peer has proven key possession; see above).
+2. **Auth snapshot.** The session's verified auth data is captured **at request arrival**, before any `await` — a re-handshake completing mid-request must not swap the principal under a running handler. (The response of a superseded session is dropped by the epoch guard in step 6 regardless.)
+3. **Context build.** The application `context` factory runs with `{ auth: snapshot }`. If it throws, the request is answered `INTERNAL` with no detail leakage (see [Authorization data flow](#authorization-data-flow)).
+4. **Chain execution.** A procedure is a chain of steps declared in application order — input schema, middleware, output schema interleave **in declaration order**, they are not grouped into fixed phases. Semantics per step kind:
+   - **Input schema**: validate the raw `i` value; failure ⇒ `INPUT_VALIDATION`. On success the **parsed** value replaces the raw input for the rest of the chain (schema transforms/defaults apply — the handler sees post-parse data).
+   - **Middleware**: must call its continuation (`next`) **exactly once**. Calling it twice, passing a non-object context extension, or completing without calling it at all ⇒ `MIDDLEWARE`. The completed-without-`next` case is load-bearing: a middleware returning a value while skipping the handler would otherwise surface as a success reply for a handler that never ran.
+   - **Output schema**: validate the handler's return value; failure ⇒ `OUTPUT_VALIDATION`. The **parsed** output is what gets serialized into `d`.
+5. **Output sanitization.** The final result passes the [sanitization](#sanitization) gate before encoding; a host object that leaked through ⇒ failure response `INVALID_DATA` (typed, instead of an opaque `INTERNAL`). Error `d` payloads are sanitized the same way — and if *that* fails, no response is sent at all.
+6. **Epoch guard + send.** If a promotion/re-handshake or destroy happened while the handler ran, the response belongs to a superseded session — dropped, not sent. Otherwise it is encrypted under the current live key and sent; a send failure is reported locally (`onError`), never to the peer.
+
+A handler (or step) throwing the implementation's typed RPC error maps to `{ c, m, d }` as described above; any other thrown value ⇒ `INTERNAL` with no detail.
 
 ## State machines
 
@@ -443,12 +472,20 @@ The client uses an **epoch counter** to coordinate concurrent failure-and-reset.
 
 Normativity split for porters: the **reset trigger set** (exactly `RPCAbortedError("TIMEOUT")` on a sent call, nothing else), the **no-resend rule**, and the **sent-boundary semantics** (which rejections mean "provably never left" vs "outcome unknown") are normative — they are security decisions, and a port that widens the trigger set re-creates a double-execution hazard. The outbound-queue machinery (the 250 ms retry tick, head-of-line policy, the concrete error-class taxonomy) is reference behavior a port may realize differently as long as the observable semantics hold.
 
+**Handshake sharing and call budgets.** All calls that arrive while no session exists await one shared handshake. If it fails, **every waiting call rejects with that same handshake error** and the client returns to `idle` — the next call starts a fresh attempt. The error is the failure's own typed error where it has one (protocol-level failures carry code `HANDSHAKE`; an application auth callback's typed error — e.g. `UNAUTHORIZED` — passes through as-is); any untyped failure is wrapped as `HANDSHAKE`. A per-call abort rejects **that call only**; the shared handshake keeps running for the others. The handshake is budgeted by `handshakeTimeout` alone: a call's own `timeout` starts **after** the handshake completes, when the call's frame enters the send path — so a slow handshake consumes no part of the call budget, and `timeout` values can be sized to the procedure, not to worst-case connection setup.
+
 As of 0.7.0 the client does **not** auto-retry. When a sent call times out with `RPCAbortedError("TIMEOUT")` on a `ready` session — **and only then**:
 
 1. If `epoch === sentEpoch` (no other call has already reset), call `reset()`: zero the session key, drop encryptor/decryptor, state ← `idle`. The failed call is **not** resent.
 2. The error surfaces to the caller with its typed code. The caller — the only party that knows whether the procedure is idempotent — decides whether to retry.
 
-**Sent boundary.** A call's retry safety is determined by whether its frame reached a live transport. For a synchronous adapter the boundary is `channel.send` returning without throwing. For an asynchronous adapter the boundary is deliberately **conservative**: the frame counts as sent the moment `send` hands back a pending promise — handoff, not resolution. Between handoff and settlement the frame may already be on the wire; classifying a terminal event in that window as "never left" would license a blind resend of a request the server might execute. A false "outcome unknown" merely costs the caller caution; a false "never left" re-creates the double-execution hazard — so the unknown class wins. If the pending promise later **rejects**, the frame provably never left after all: the call rolls back to the unsent class — the frame re-enters the outbound queue if the session is unchanged, or the call fails with a plain `RPCError("CHANNEL")` if a reset staled it in flight. Before the boundary, terminal events (timeout, abort, destroy, `sendTimeout`) reject with a plain `RPCError` — the frame provably never left and the caller may retry freely. After the boundary, terminal events reject with `RPCAbortedError` — outcome unknown. Consequently, while an async send is pending: a global timeout rejects with `RPCAbortedError("TIMEOUT")` and triggers the reset above, an abort rejects with `RPCAbortedError("ABORTED")`, and `sendTimeout` no longer governs the frame — it left the outbound queue at handoff. The boundary placement is normative (it is a security decision); the rollback machinery is reference behavior.
+**Sent boundary.** A call's retry safety is determined by whether its frame reached a live transport.
+
+Language-neutral core (normative): the boundary is crossed the moment the adapter **accepts** the frame — a synchronous `send` returns without error, or an asynchronous `send` is initiated without an immediate error. For an asynchronous adapter this is deliberately **conservative**: acceptance (handoff), not completion, is the boundary. Between initiation and completion the frame may already be on the wire; classifying a terminal event in that window as "never left" would license a blind resend of a request the server might execute. A false "outcome unknown" merely costs the caller caution; a false "never left" re-creates the double-execution hazard — so the unknown class wins. If the asynchronous operation later completes with an **error**, the frame provably never left after all: the call rolls back to the unsent class — the frame re-enters the outbound queue if the session is unchanged, or the call fails with a plain `RPCError("CHANNEL")` if a reset staled it in flight. An adapter must therefore report a delivery failure as the async operation's error result, never as "complete successfully, then signal an error elsewhere" — successful completion is the adapter's word that the frame reached the transport, and it is never rolled back.
+
+Before the boundary, terminal events (timeout, abort, destroy, `sendTimeout`) reject with a plain `RPCError` — the frame provably never left and the caller may retry freely. After the boundary, terminal events reject with `RPCAbortedError` — outcome unknown. Consequently, while an asynchronous send is in flight: a global timeout rejects with `RPCAbortedError("TIMEOUT")` and triggers the reset above, an abort rejects with `RPCAbortedError("ABORTED")`, and `sendTimeout` no longer governs the frame — it left the outbound queue at handoff. The boundary placement is normative (it is a security decision); the rollback machinery is reference behavior.
+
+JS realization: `channel.send` returning a thenable is the handoff; the thenable resolving/rejecting is the completion. A port maps "initiation" and "completion" onto its own async model (future creation vs. resolution, coroutine launch vs. return, callback registration vs. invocation).
 
 **Core outbound queue.** When `channel.send` throws, the frame enters the core outbound queue. A retry tick (every 250 ms, running only while the queue is non-empty) attempts queued frames in order; the first throw stops the pass (head-of-line: if the channel is down, no later frame bypasses a stuck one). A frame transitions to *sent* the first time `send` succeeds; it then waits for reply-or-timeout only. `sendTimeout` (default 3 000 ms, counted from enqueue) is the per-frame deadline; expiry rejects the call with plain `RPCError("CHANNEL")` — the frame provably never left.
 
@@ -601,10 +638,11 @@ A new-language port that ticks every item is conformant:
 - [ ] The X25519 implementation rejects RFC 7748 §6.1 low-order public keys (or the application layer rejects them before `getSharedSecret`). Accepting them in asymmetric-only mode lets an active MITM force a deterministic all-zero ECDH output and decrypt the session. See [Security § Ephemeral key validity](security.md#ephemeral-key-validity).
 - [ ] msgpack codec rejects all extension types; built-in Timestamp explicitly.
 - [ ] Sanitization rejects host objects (or the language equivalent of "weird types"), strips prototype-pollution keys, limits depth.
+- [ ] Auth payloads pass the **full** sanitization gate (not just the hardened codec) before any field access — including fields a profile ignores. A payload smuggling an unknown ext type or over-deep nesting in an extra field is rejected as `UNAUTHORIZED`.
 - [ ] Handler output is also sanitized (or otherwise restricted to plain-data trees) before encoding, so a stray host object surfaces as `INVALID_DATA` and not an opaque `INTERNAL`.
 - [ ] Frames are bounded by `MAX_HELLO_BYTES` / `MAX_MSG_BYTES`.
 - [ ] Hello transcript and reply transcript are built from the exact byte sequences shown.
-- [ ] Auth is processed **before** any session key is materialized; failed auth never leaks session state.
+- [ ] Client-auth verification (server-side `verify`) runs **before** ECDH and key derivation, so a failed verification never materializes session-key state. Server-side `sign` runs late in the attempt (step 9 of the normative order, after key derivation and proof computation); the reply transcript it signs binds both ephemeral pubs, the client nonce, and the epoch — not the proof — and a failed `sign` publishes no candidate and no reply. A failed attempt never disturbs an established live session (see make-before-break).
 - [ ] The server's ephemeral pair `(s_priv, s_pub)` is generated **fresh per hello attempt** and never held at module/connection scope. This is load-bearing for make-before-break: it guarantees a duplicate hello derives a different candidate key than the live session, so replayed traffic can never decrypt under the candidate and force a promotion.
 - [ ] A validated attempt is installed as a **candidate**, not swapped into the live session. The live key is retired only when a `TAG_MSG` decrypts under the candidate key (make-before-break). Inbound frames are trial-decrypted live-first, then candidate.
 - [ ] The response-guard epoch is captured **after** promotion (not at frame arrival), so the reply to the confirming frame is not dropped by the guard.
@@ -629,6 +667,10 @@ A new-language port that ticks every item is conformant:
 - [ ] Absent call input omits the `i` key entirely (never nil).
 - [ ] The `t` type check on decrypted messages runs before any other processing — it is the reflection defense for the shared bidirectional key, not cosmetic validation.
 - [ ] Remote error fields are coerced defensively (`c` non-empty string else `UNKNOWN`, `m` string else empty); non-`RPCError` handler throws map to `INTERNAL` with no detail leakage.
+- [ ] The response `ok` discriminator is **never** coerced: exactly boolean `true`/`false` selects a form; any other value is a malformed envelope, dropped silently before the pending-call entry is consumed.
+- [ ] The server pipeline follows the normative stage order and code map (lookup → auth snapshot → context → chain in declaration order → output sanitize → epoch guard): `NOT_FOUND` / `INTERNAL` (context throw) / `INPUT_VALIDATION` / `MIDDLEWARE` (exactly-once `next`, including completed-without-`next`) / `OUTPUT_VALIDATION` / `INVALID_DATA` (output sanitize). Parsed schema values replace raw ones for the rest of the chain.
+- [ ] Calls awaiting a shared handshake all reject with the handshake's error when it fails; a per-call abort rejects only that call and never cancels the shared handshake. A call's `timeout` starts after the handshake completes.
+- [ ] The sent boundary for asynchronous adapters is **handoff, not completion**: a frame counts as sent the moment the async send is initiated; an async error result rolls the call back to the unsent class. Terminal events on an in-flight async send report the unknown-outcome class.
 - [ ] Seen-nonce set (when enabled): membership check before decrypt, insert only after AEAD verification, FIFO eviction at capacity, cleared on re-handshake.
 - [ ] Ephemeral keys, raw shared secrets, and session keys are zeroed on reset and destroy.
 - [ ] The proof is verified in constant time.

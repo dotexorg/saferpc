@@ -1,6 +1,11 @@
 # Spec: make-before-break session replacement (saferpc server)
 
-Status: ready to implement. Target: `src/server.ts` + four spec docs + one test
+> **Design document (historical).** The implementation plan that shipped the
+> make-before-break server, kept for design rationale. It is NOT the normative
+> protocol contract: porters work from [`spec/protocol.md`](spec/protocol.md),
+> which wins wherever the two disagree.
+
+Status: shipped. Target: `src/server.ts` + four spec docs + one test
 file. Companion background (prose, already shared): `handshake-continuity-review.md`.
 
 This document is self-contained. An implementer should be able to work from it

@@ -1,11 +1,12 @@
 /**
  * Server-side authentication helpers.
  *
- * All decoders use the hardened msgpack codec (`mpDecode`) so that auth
- * payloads cannot smuggle ext types, prototype-polluting keys, or oversized
- * arrays. Every helper performs strict type validation on the decoded
- * fields and binds verification to the canonical handshake transcript that
- * Safe RPC passes in.
+ * All decoders run the full hardened-data pipeline — `mpDecode` (hardened
+ * codec) followed by `sanitize()` — so auth payloads cannot smuggle ext
+ * types, prototype-polluting keys, host objects, or over-deep nesting,
+ * even in fields a profile ignores. Every helper then performs strict type
+ * validation on the decoded fields and binds verification to the canonical
+ * handshake transcript that Safe RPC passes in.
  */
 
 import { ed25519 } from "@noble/curves/ed25519.js";
@@ -16,6 +17,7 @@ import {
   isPlainBytes,
   mpDecode,
   RPCError,
+  sanitize,
   type AuthOptions,
   type Ctx,
 } from "../common.ts";
@@ -25,7 +27,13 @@ import {
 function decodeAuthPayload(proof: Uint8Array): Record<string, unknown> {
   let parsed: unknown;
   try {
-    parsed = mpDecode(proof);
+    // Full hardened-data policy, not just the codec: `mpDecode` alone lets
+    // unregistered ext types surface as `ExtData` and enforces no depth
+    // limit — `sanitize()` is the layer that rejects non-plain objects,
+    // strips poison keys, and caps recursion. Auth payloads are
+    // attacker-controlled bytes and MUST pass the same gate as RPC frames
+    // (Protocol § Sanitization), even in fields a profile ignores.
+    parsed = sanitize(mpDecode(proof));
   } catch {
     throw new RPCError("UNAUTHORIZED", "Malformed auth payload");
   }

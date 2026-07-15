@@ -158,9 +158,9 @@ For the full wire layout of the frames that carry these signatures, see [Protoco
 
 ## Auth processing order
 
-Auth runs **before** any session key is materialized, so a failed verification never leaks ECDH artifacts. Step-by-step in [Protocol § Handshake](protocol.md#handshake).
+Client-auth **verification** (the server's `verify` callback) runs **before** ECDH and key derivation, so a failed verification never materializes session-key state and never leaks ECDH artifacts. The server's **`sign`** step runs *after* key derivation in the normative step order (step 9; the reply transcript binds both ephemeral pubs, the client nonce, and the epoch), but a failed `sign` publishes nothing: no candidate is installed and no reply is sent. Step-by-step in [Protocol § Handshake](protocol.md#handshake).
 
-A throw at any auth step rejects the handshake. The client resets to `idle`, the server resets to `waiting`. Failed verification never silently downgrades into an unauthenticated session.
+A throw at any auth step rejects the handshake **attempt**. On the client a failed attempt returns to `idle`. On the server, under make-before-break, only the attempt is discarded — an established live session is never disturbed by a failed attempt and keeps serving. Failed verification never silently downgrades into an unauthenticated session.
 
 ## Ephemeral key validity
 

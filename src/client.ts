@@ -841,13 +841,21 @@ export function client<T extends Router>(
         const rawId = msg["id"];
         if (typeof rawId !== "string") return;
 
+        // Strict discriminator: the protocol defines exactly two response
+        // forms, `ok: true` and `ok: false`. Anything else is a malformed
+        // envelope — silent drop, BEFORE the pending entry is touched, so
+        // the call keeps waiting under its own timer instead of settling
+        // on garbage a strict port would ignore.
+        const ok = msg["ok"];
+        if (ok !== true && ok !== false) return;
+
         const entry = pending.get(rawId);
         if (entry === undefined) return;
 
         pending.delete(rawId);
         clearTimeout(entry.timer);
 
-        if (msg["ok"] === true) {
+        if (ok === true) {
           entry.resolve(msg["d"]);
         } else {
           const e = msg["e"];

@@ -1,8 +1,14 @@
 # Spec: channel lifecycle v2 — session survives transport death, core owns the send queue
 
-Status: ready to implement. Supersedes v1 (2026-07-09) after CTO review of
+> **Design document (historical).** This is the implementation plan that
+> shipped the 0.7.0 lifecycle work, kept for design rationale. It is NOT the
+> normative protocol contract: porters work from [`spec/protocol.md`](spec/protocol.md),
+> which wins wherever the two disagree (e.g. the async sent boundary is
+> handoff-based there).
+
+Status: shipped in 0.7.0. Superseded v1 (2026-07-09) after CTO review of
 PR #2 (2026-07-10). Target: `src/client.ts`, `src/common.ts`,
-`src/channels/`, spec docs, tests. Ships within the unreleased 0.7.0.
+`src/channels/`, spec docs, tests.
 
 Decisions locked with CTO 2026-07-10:
 
@@ -173,7 +179,7 @@ Send path in `sendRequest` (and the hello path in `ensureHandshake`):
 Bounding: the queue needs no own limit — `maxPending` (256) already bounds
 in-flight calls, and at most one hello can be queued per handshake attempt.
 
-Defaults sanity: `sendTimeout` (10 s) < `timeout` (30 s), so with default
+Defaults sanity: `sendTimeout` (3 s) < `timeout` (30 s), so with default
 config an unsent frame normally fails via the sendTimeout expiry. But the
 `CHANNEL` code does not depend on which timer fires first: if the global
 `timeout` beats `sendTimeout` (custom config), the still-queued frame is
@@ -268,7 +274,8 @@ can't come). Everything else must NOT reset:
 - plain `CHANNEL` (never left) — the transport was down; that is not a
   session event, the keys are fine. Note this loses nothing: the old
   CHANNEL-reset could only heal if a re-handshake could send, and if send
-  throws for 10 s the hello can't leave either; the first *sent* call that
+  throws for the whole `sendTimeout` the hello can't leave either; the
+  first *sent* call that
   times out still resets. The wedge case in the current comment (restarted
   server silently dropping TAG_MSG over a sync transport) sends fine and
   fails by reply-timeout → still resets.

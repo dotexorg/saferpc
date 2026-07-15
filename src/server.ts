@@ -719,9 +719,15 @@ export function server(
             if (candidateEpoch === myCandEpoch && !destroyed) {
               dropCandidate();
             }
-            throw new RPCError("HANDSHAKE", "Handshake reply send failed", {
-              cause: sendErr instanceof Error ? sendErr.message : String(sendErr),
-            });
+            // 4th argument: `cause` is constructor options, not `data` —
+            // the original error object rides err.cause per the protocol
+            // ("carrying the transport error as its cause").
+            throw new RPCError(
+              "HANDSHAKE",
+              "Handshake reply send failed",
+              undefined,
+              { cause: sendErr },
+            );
           }
           if (candidateEpoch !== myCandEpoch || destroyed) return;
 

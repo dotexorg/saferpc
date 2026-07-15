@@ -166,13 +166,14 @@ Node.js 18+, modern browsers, Service / Web / Shared Workers, React Native, Verc
 
 ## Releasing
 
-One command bumps the version, publishes to npm, and pushes the tag:
+Two commands: bump the version, then publish (which also pushes the tag):
 
 ```bash
 npm version patch    # or: minor / major / 1.2.3-beta.0
+npm publish
 ```
 
-`prepublishOnly` runs lint, tests, and build before publishing. The `postversion` hook then runs `npm publish && git push --follow-tags`. The pushed `vX.Y.Z` tag triggers `.github/workflows/release.yml`, which verifies the version is live on npm and creates a GitHub Release with auto-generated changelog notes since the previous tag.
+The `version` hook syncs and stages `jsr.json` into the version commit. `prepublishOnly` runs lint, tests, and build before publishing; `postpublish` runs `git push --follow-tags`. The pushed `vX.Y.Z` tag triggers `.github/workflows/release.yml`, which verifies the version is live on npm and creates a GitHub Release with auto-generated changelog notes since the previous tag.
 
 If `npm publish` fails, the tag exists locally but is not pushed. Fix the issue and re-run `npm publish && git push --follow-tags`. To abort, run `git tag -d vX.Y.Z && git reset --hard HEAD~1`.
 

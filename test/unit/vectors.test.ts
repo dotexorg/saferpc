@@ -167,7 +167,9 @@ describe("KAT vectors — auth profile payloads", () => {
       false,
       ["verify"],
     );
-    const server = createECDSAServerAuth({ getPublicKey: async () => publicKey });
+    const server = createECDSAServerAuth({
+      getPublicKey: async () => publicKey,
+    });
     const res = (await server.verify!(payload, transcript)) as {
       auth: { identifier: string; verified: boolean };
     };

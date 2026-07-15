@@ -7,7 +7,7 @@ An internal line-by-line review of the implementation against the [Protocol](pro
 ## Method
 
 - Full read of `src/` (client, server, common, auth helpers) against every normative statement in `spec/protocol.md` and `spec/security.md`.
-- Full test suite run (265 tests, including `test/security/`: handshake attacks, replay, tampering, type confusion, prototype pollution, DoS limits, deferred reset, replay window, session continuity, and the 2026-07 follow-up fixes below).
+- Full test suite run (265 tests at the review date — the suite has grown since; including `test/security/`: handshake attacks, replay, tampering, type confusion, prototype pollution, DoS limits, deferred reset, replay window, session continuity, and the 2026-07 follow-up fixes below).
 - Instrumented probes for behavioral claims that the suite does not pin (execution counts, handshake counts under fault injection).
 
 An internal review is not a third-party audit. It catches spec/code drift and design-level issues; it does not replace external cryptographic review. If you need the latter for a deployment, treat this page as the starting inventory.

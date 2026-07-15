@@ -9,6 +9,7 @@
 import { describe, it, expect } from "vitest";
 import { ed25519 } from "@noble/curves/ed25519.js";
 import { sha256 } from "@noble/hashes/sha2.js";
+import { encode as rawEncode, ExtData } from "@msgpack/msgpack";
 
 import {
   createJWTServerAuth,
@@ -77,7 +78,10 @@ describe("createJWTServerAuth", () => {
     const helper = createJWTServerAuth({ verifyToken: async () => ({}) });
     // No `v` at all.
     await expect(
-      helper.verify!(mpEncode({ jwt: "x", ts: Date.now(), th: sha256(transcript) }), transcript),
+      helper.verify!(
+        mpEncode({ jwt: "x", ts: Date.now(), th: sha256(transcript) }),
+        transcript,
+      ),
     ).rejects.toMatchObject({ code: "UNAUTHORIZED" });
     // A future/unknown version the verifier was not written for.
     await expect(
@@ -215,6 +219,66 @@ describe("createJWTServerAuth", () => {
     const proof = await clientHelper.sign!(transcript);
     const res = await serverHelper.verify!(proof, transcript);
     expect(res).toEqual({ auth: { ok: true } });
+  });
+});
+
+// ─── Auth payload sanitization (shared decodeAuthPayload gate) ───
+//
+// The decode gate is shared by all three server helpers; the JWT helper
+// stands in for all of them. Protocol § Sanitization applies to auth
+// payloads in full — including fields a profile ignores — so a payload
+// smuggling an unknown msgpack ext type or over-deep nesting in an extra
+// field must be rejected even when every validated field is well-formed.
+
+describe("auth payload sanitization", () => {
+  const validFields = () => ({
+    v: 1,
+    jwt: "jwt-1",
+    ts: Date.now(),
+    th: sha256(transcript),
+  });
+  const helper = () =>
+    createJWTServerAuth({ verifyToken: async () => ({ sub: "u" }) });
+
+  it("rejects an unknown msgpack ext type in an ignored extra field", async () => {
+    const proof = rawEncode(
+      { ...validFields(), extra: new ExtData(42, new Uint8Array([1, 2, 3])) },
+      { useBigInt64: true },
+    );
+    await expect(helper().verify!(proof, transcript)).rejects.toMatchObject({
+      code: "UNAUTHORIZED",
+    });
+  });
+
+  it("rejects nesting beyond MAX_DEPTH in an ignored extra field", async () => {
+    const deep: Record<string, unknown> = {};
+    let cur = deep;
+    for (let i = 0; i < 40; i++) {
+      const next: Record<string, unknown> = {};
+      cur["x"] = next;
+      cur = next;
+    }
+    const proof = rawEncode(
+      { ...validFields(), extra: deep },
+      { useBigInt64: true },
+    );
+    await expect(helper().verify!(proof, transcript)).rejects.toMatchObject({
+      code: "UNAUTHORIZED",
+    });
+  });
+
+  it("maps a __proto__ map key to UNAUTHORIZED, not an unhandled throw", async () => {
+    // The codec itself bans `__proto__` keys (first line of defense;
+    // `sanitize` strips constructor/prototype as depth-in-depth). The
+    // decode gate must surface that as a clean UNAUTHORIZED.
+    const proof = rawEncode(
+      { ...validFields(), ["__proto__"]: { polluted: true } },
+      { useBigInt64: true },
+    );
+    await expect(helper().verify!(proof, transcript)).rejects.toMatchObject({
+      code: "UNAUTHORIZED",
+    });
+    expect(({} as Record<string, unknown>)["polluted"]).toBeUndefined();
   });
 });
 

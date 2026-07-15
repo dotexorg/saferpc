@@ -786,12 +786,19 @@ export interface SafeRPC<TCtx = {}> extends ProcedureBuilder<
   unknown
 > {
   /**
-   * Assemble a router. An identity function at runtime; its job is to
-   * preserve each procedure's precise input/output types so
-   * `Client<typeof appRouter>` infers a typed call for every route.
-   * Equivalent to `{ ... } satisfies Router` — use whichever reads better.
+   * Assemble a router. An identity function at runtime (plus one reserved
+   * name); its job is to preserve each procedure's precise input/output
+   * types so `Client<typeof appRouter>` infers a typed call for every
+   * route. Equivalent to `{ ... } satisfies Router` — use whichever reads
+   * better.
+   *
+   * The route name `then` is **reserved** (JS-specific): the generated
+   * client is a Proxy that must not look thenable — if `client.then` were
+   * a function, `await client` (and every Promise-assimilation point)
+   * would call it, so a `then` route could never be invoked. Rejected here
+   * at creation instead of failing silently at call time.
    */
-  router<R extends Router>(routes: R): R;
+  router<R extends Router>(routes: R & { then?: never }): R;
 
   /**
    * Author a reusable middleware bound to `TCtx`. Plugs into `.use(...)`;
@@ -819,11 +826,20 @@ export interface SafeRPC<TCtx = {}> extends ProcedureBuilder<
  * ```
  */
 export function saferpc<TCtx = {}>(): SafeRPC<TCtx> {
-  const router = function router<R extends Router>(routes: R): R {
+  const router = function router<R extends Router>(
+    routes: R & { then?: never },
+  ): R {
     if (typeof routes !== "object" || routes === null) {
       throw new TypeError("router() requires an object of procedures");
     }
-    return routes;
+    if ("then" in routes) {
+      throw new TypeError(
+        'router() rejects a route named "then": the client proxy must not ' +
+          "look thenable, so that route could never be called " +
+          "(reserved, JS-specific)",
+      );
+    }
+    return routes as R;
   };
   const middleware = function middleware<TExtra>(
     mw: Middleware<TCtx, TExtra>,

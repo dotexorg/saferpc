@@ -150,6 +150,8 @@ Subscribes to `channel` and serves the router. Returns synchronously. The option
 | `replayWindow`     | `number`                                         | `4096`      | —                                                               |
 | `onError`          | `(err: unknown) => void`                         | —           | —                                                               |
 
+Numeric options are validated at construction with a synchronous `TypeError`: `handshakeTimeout` — finite number ≥ **100 ms**; `maxMessageBytes` — positive integer; `replayWindow` — integer ≥ 0 (`0` disables the seen-nonce set). `NaN`/`Infinity` never silently disables a limit.
+
 `context` runs per request and must return the router's base context `TCtx`. The `auth` argument carries whatever `auth.verify` returned for the current session. When the base context is empty, `context` is optional and the request context falls back to the verified auth data (or `{}` if none).
 
 `replayWindow` is the number of recently-seen AEAD nonces the server remembers per session so it can drop replayed request frames (in-session replay defense). FIFO-evicted: a replay older than the last `replayWindow` accepted messages executes again, so the window is narrowed to N, not closed. Cleared on every re-handshake. Set `0` to disable.
@@ -226,7 +228,7 @@ Returns synchronously. The handshake stays lazy: it starts on the first `api` ca
 
 `maxPending` caps concurrent in-flight calls. Past the cap, calls reject with `RPCError("CLIENT", "Too many pending requests")`.
 
-`maxPending` and `maxMessageBytes` (both client and server) must be finite positive integers, and `maxAge` a finite number ≥ 0; a `NaN`/`Infinity` value — easy to produce with `Number(process.env.X)` on an unset variable — is rejected at construction with a `TypeError` rather than silently disabling the limit (`length > NaN` is always false).
+Every numeric option is validated at construction; a value that looks fine in the table above can still throw a synchronous `TypeError`. The full contract: `timeout` — finite number > 0; `sendTimeout` — finite number ≥ 0; `handshakeTimeout` — finite number ≥ **100 ms** (a sub-100 ms budget cannot complete a real handshake and would only produce spurious timeouts); `maxPending` and `maxMessageBytes` — positive integers. `NaN`/`Infinity` — easy to produce with `Number(process.env.X)` on an unset variable — is rejected rather than silently disabling the limit (`length > NaN` is always false).
 
 `timeout` applies to every call. On timeout the client throws `RPCAbortedError("TIMEOUT", "Timed out: <procedure>")` if the frame had already been sent (outcome unknown — do not blind-resend; the session resets and the next call re-handshakes), or plain `RPCError("CHANNEL")` if the frame had not yet left the process (retry freely; no reset). Set `timeout` generously — it is the safety net, not a UX budget; shorten a single call with [`AbortSignal.timeout`](#calloptions--per-call-abort) instead.
 
@@ -243,6 +245,8 @@ type Client<T extends Router> = {
 ```
 
 Each procedure maps to a call whose argument and result are inferred from that procedure. Pass `typeof appRouter` as the type argument — `client<typeof appRouter>(...)` — to get full end-to-end inference. A loose `Router` collapses to `(input: unknown, opts?: CallOptions) => Promise<unknown>`, so untyped usage keeps working.
+
+One route name is **reserved**: `then`. The generated client is a Proxy that must not look thenable — if `api.then` were a function, `await api` and every other Promise-assimilation point would invoke it, so such a route could never be called. `rpc.router()` rejects the name at creation (compile-time and runtime). This is a JS-client reservation, not a wire rule: the protocol and server accept any procedure name, and ports reserve whatever names collide with their own language's implicit member protocols.
 
 ### `CallOptions` — per-call abort
 
@@ -466,7 +470,9 @@ import {
 | `createEd25519ServerAuth({ getPublicKey, validateDevice? })`           | Verifies Ed25519 signature against a device's 32-byte public key.                                                |
 | `createECDSAServerAuth({ getPublicKey, validateEntity? })`             | Verifies ECDSA P-256 signature via WebCrypto.                                                                    |
 
-Auth payloads decode through the hardened msgpack codec: extension types rejected, prototype-pollution keys stripped, recursion depth capped. Returned `auth` data is sanitized before reaching `context`.
+Auth payloads run the full hardened-data pipeline before any field access — the hardened msgpack codec followed by the sanitization gate: extension types rejected, prototype-pollution keys stripped/banned, host objects rejected, recursion depth capped — even in fields a profile ignores. Returned `auth` data is sanitized again before reaching `context`.
+
+`maxAge` (JWT helper, default 30 000 ms) must be a finite number ≥ 0, validated at construction with a `TypeError` — a `NaN` skew budget would silently disable the staleness check.
 
 ---
 
