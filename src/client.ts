@@ -971,8 +971,11 @@ export function client<T extends Router>(
     // msgpack has no `undefined` primitive and would round-trip it as
     // `null`, which a `.optional()` (as opposed to `.nullish()`) Zod schema
     // rejects. A dropped key decodes back to `undefined` on the server.
+    // `input` is already sanitized by the proxy (before the handshake, so a
+    // non-plain value never even emits TAG_HELLO) — do not re-sanitize the
+    // rebuilt tree here.
     const req: Record<string, unknown> = { t: 1, id, p: prop };
-    if (input !== undefined) req["i"] = sanitize(input);
+    if (input !== undefined) req["i"] = input;
     const encrypted = enc(req);
     if (encrypted.length > maxBytes) {
       // The frame is still local: do not hand an oversized ciphertext to the

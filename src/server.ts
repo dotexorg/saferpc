@@ -177,35 +177,46 @@ function execute(
         tip = async function runMiddleware() {
           let called = false;
           let completed = false;
-          const result = await mw({
-            ctx,
-            input,
-            next(extra?: Ctx) {
-              // A continuation that arrives after the middleware promise has
-              // settled cannot be part of this request anymore. Ignore it
-              // rather than launching the handler after an error response.
-              if (completed) return Promise.resolve(undefined);
-              if (called) {
-                throw new RPCError(
-                  "MIDDLEWARE",
-                  "next() called more than once",
-                );
-              }
-              called = true;
-              if (extra !== undefined) {
-                if (typeof extra !== "object" || extra === null) {
+          let result: unknown;
+          try {
+            // try/finally (not `.finally()` on the returned value) so that
+            // `completed` is set on EVERY exit: async settle, sync throw,
+            // and a sync non-promise return. Attaching `.finally()` to the
+            // return value would miss a synchronous throw — a late next()
+            // scheduled before the throw could then run the handler after
+            // the error response — and would TypeError on a sync middleware
+            // that returns a plain value after calling next().
+            result = await mw({
+              ctx,
+              input,
+              next(extra?: Ctx) {
+                // A continuation that arrives after the middleware has
+                // completed (settled, returned, or thrown) cannot be part of
+                // this request anymore. Ignore it rather than launching the
+                // handler after an error response.
+                if (completed) return Promise.resolve(undefined);
+                if (called) {
                   throw new RPCError(
                     "MIDDLEWARE",
-                    "next() extra must be an object",
+                    "next() called more than once",
                   );
                 }
-                ctx = Object.assign(Object.create(null), ctx, extra);
-              }
-              return next();
-            },
-          }).finally(function markMiddlewareCompleted() {
+                called = true;
+                if (extra !== undefined) {
+                  if (typeof extra !== "object" || extra === null) {
+                    throw new RPCError(
+                      "MIDDLEWARE",
+                      "next() extra must be an object",
+                    );
+                  }
+                  ctx = Object.assign(Object.create(null), ctx, extra);
+                }
+                return next();
+              },
+            });
+          } finally {
             completed = true;
-          });
+          }
           // Contract: middleware must call next() exactly once. A middleware
           // that returns without calling next() would silently skip the
           // handler while the client still receives a success reply — reject

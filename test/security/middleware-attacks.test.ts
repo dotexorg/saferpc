@@ -143,6 +143,69 @@ describe("security / middleware pipeline", () => {
     }
   });
 
+  it("late next() cannot run the handler after a synchronous throw", async () => {
+    // The sync-throw variant of the zombie-handler hole: `completed` must be
+    // set even when the middleware never produces a promise at all.
+    const psk = randomBytes(32);
+    const { a, b } = createChannelPair();
+    let invocations = 0;
+    const router: Router = {
+      syncThrow: chain()
+        .use((({ next }: { next: () => Promise<unknown> }) => {
+          setTimeout(() => {
+            void next().catch(() => {});
+          }, 10);
+          throw new Error("sync boom");
+        }) as never)
+        .handler(async () => {
+          invocations++;
+          return "must-not-run";
+        }),
+    };
+    const srv = server(router, a, { auth: { secret: () => psk } });
+    const { api, destroy } = client(b, {
+      auth: { secret: () => psk },
+      timeout: 1000,
+    });
+    try {
+      await expect(api.syncThrow({})).rejects.toMatchObject({
+        code: "INTERNAL",
+      });
+      await new Promise((resolve) => setTimeout(resolve, 30));
+      expect(invocations).toBe(0);
+    } finally {
+      destroy();
+      srv.destroy();
+    }
+  });
+
+  it("sync middleware returning a non-promise after next() is accepted", async () => {
+    // Spec: “an unreturned next() call is accepted by the runtime” — the
+    // middleware's own return value (here a plain, non-thenable string) is
+    // the chain result; the downstream handler may still run concurrently.
+    const psk = randomBytes(32);
+    const { a, b } = createChannelPair();
+    const router: Router = {
+      syncReturn: chain()
+        .use((({ next }: { next: () => Promise<unknown> }) => {
+          void next();
+          return "sync-value";
+        }) as never)
+        .handler(async () => "handler-value"),
+    };
+    const srv = server(router, a, { auth: { secret: () => psk } });
+    const { api, destroy } = client(b, {
+      auth: { secret: () => psk },
+      timeout: 1000,
+    });
+    try {
+      await expect(api.syncReturn({})).resolves.toBe("sync-value");
+    } finally {
+      destroy();
+      srv.destroy();
+    }
+  });
+
   it("middleware-thrown RPCError is not masked as INTERNAL", async () => {
     const psk = randomBytes(32);
     const { a, b } = createChannelPair();
