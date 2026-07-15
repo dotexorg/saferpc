@@ -85,12 +85,12 @@ Every method is immutable and chainable. The handler may be **sync or async**. `
 
 ### Method semantics
 
-| Method            | Effect                                  | Notes                                                                                                                                                                                 |
-| ----------------- | --------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `.use(mw)`        | Adds middleware that can extend context | `mw` may be a plain (non-`async`) function but must **return** `next()` (called exactly once). `next(extra)` merges `extra` into ctx — and its type flows into every downstream step. |
-| `.input(schema)`  | Validates & parses input with Zod       | Handler receives `z.output<S>`; callers send `z.input<S>`. On failure throws `RPCError("INPUT_VALIDATION", ...)`.                                                                     |
-| `.output(schema)` | Validates & parses output with Zod      | Handler returns `z.input<S>` (pre-transform); callers observe `z.output<S>`. On failure throws `RPCError("OUTPUT_VALIDATION", ...)`. Runs _after_ handler.                            |
-| `.handler(fn)`    | Terminates the builder                  | `fn` may be **sync or async**. Returns a frozen `Procedure`. Without `.output()`, the caller-facing output is inferred from `fn`'s (awaited) return.                                  |
+| Method            | Effect                                  | Notes                                                                                                                                                                                                                                                                                    |
+| ----------------- | --------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `.use(mw)`        | Adds middleware that can extend context | `mw` should return/await `next()` (called exactly once). `next(extra)` merges `extra` into ctx — and its type flows into every downstream step. The runtime requires the call before middleware completion; an unreturned call is accepted but does not propagate the downstream result. |
+| `.input(schema)`  | Validates & parses input with Zod       | Handler receives `z.output<S>`; callers send `z.input<S>`. On failure throws `RPCError("INPUT_VALIDATION", ...)`.                                                                                                                                                                        |
+| `.output(schema)` | Validates & parses output with Zod      | Handler returns `z.input<S>` (pre-transform); callers observe `z.output<S>`. On failure throws `RPCError("OUTPUT_VALIDATION", ...)`. Runs _after_ handler.                                                                                                                               |
+| `.handler(fn)`    | Terminates the builder                  | `fn` may be **sync or async**. Returns a frozen `Procedure`. Without `.output()`, the caller-facing output is inferred from `fn`'s (awaited) return.                                                                                                                                     |
 
 `schema` is anything with a `.safeParse()` method (a Zod schema in practice).
 
@@ -270,7 +270,7 @@ Fetch-style. Aborting rejects **that call** with code `ABORTED`. The class depen
 - Aborting after the frame was already sent → `RPCAbortedError("ABORTED")`; `signal.reason` on `.cause`. Outcome on the server is **UNKNOWN** — the handler may have run. Do not blind-resend a non-idempotent call.
 - The session is never touched: `ABORTED` does not trigger the reset path, and a reply arriving after the abort is silently dropped.
 
-There is deliberately **no per-call `timeout` field**: the two-lever model is a *global* timeout (the client-level `timeout` option — the safety net that heals a dead session) plus a *local* abort (`AbortSignal.timeout(ms)` for a shorter single-call budget — gives `ABORTED`, session untouched). A signal can only shrink a call's budget, not extend it past the global timer; procedures slower than the global timeout mean the global value is too small — raise `ClientOptions.timeout` (this is also why the default is a generous 30 s), don't look for a per-call escape hatch.
+There is deliberately **no per-call `timeout` field**: the two-lever model is a _global_ timeout (the client-level `timeout` option — the safety net that heals a dead session) plus a _local_ abort (`AbortSignal.timeout(ms)` for a shorter single-call budget — gives `ABORTED`, session untouched). A signal can only shrink a call's budget, not extend it past the global timer; procedures slower than the global timeout mean the global value is too small — raise `ClientOptions.timeout` (this is also why the default is a generous 30 s), don't look for a per-call escape hatch.
 
 ### Client lifecycle
 
@@ -341,21 +341,21 @@ class RPCAbortedError extends RPCError {}
 
 ### Standard error codes
 
-| Class             | Code                | Thrown when                                                                                           |
-| ----------------- | ------------------- | ----------------------------------------------------------------------------------------------------- |
-| `RPCAbortedError` | `TIMEOUT`           | Global timeout; frame was already sent — outcome unknown                                              |
-| `RPCAbortedError` | `ABORTED`           | Per-call signal fired; frame was already sent — outcome unknown. `signal.reason` on `.cause`          |
-| `RPCAbortedError` | `SESSION`           | `destroy()` called; frame was already sent — outcome unknown                                          |
+| Class             | Code                | Thrown when                                                                                                               |
+| ----------------- | ------------------- | ------------------------------------------------------------------------------------------------------------------------- |
+| `RPCAbortedError` | `TIMEOUT`           | Global timeout; frame was already sent — outcome unknown                                                                  |
+| `RPCAbortedError` | `ABORTED`           | Per-call signal fired; frame was already sent — outcome unknown. `signal.reason` on `.cause`                              |
+| `RPCAbortedError` | `SESSION`           | `destroy()` called; frame was already sent — outcome unknown                                                              |
 | `RPCError`        | `CHANNEL`           | `sendTimeout` or global `timeout` expired while still queued, channel closed, or reset staled a queued frame — never left |
-| `RPCError`        | `ABORTED`           | Signal fired before frame was sent (pre-aborted signal, or abort during handshake wait) — never left  |
-| `RPCError`        | `SESSION`           | `destroy()` before send, or call on a closed client — never left                                     |
-| `RPCError`        | `CLIENT`            | Client-side guardrail tripped (e.g., `maxPending` exceeded)                                           |
-| `RPCError`        | `HANDSHAKE`         | Handshake failed or timed out, auth payload malformed                                                 |
-| `RemoteRPCError`  | `INPUT_VALIDATION`  | `.input(schema)` rejected the input (server-side)                                                     |
-| `RemoteRPCError`  | `OUTPUT_VALIDATION` | `.output(schema)` rejected the handler output (server-side)                                           |
-| `RPCError`        | `INVALID_DATA`      | Wire-level data rejected by `sanitize()`                                                              |
-| `RPCError`        | `INTERNAL`          | Defensive: should not be reachable                                                                    |
-| `RPCError`        | `MIDDLEWARE`        | Middleware misuse (`next()` called twice, completed without calling `next()`, or bad `extra` arg)     |
+| `RPCError`        | `ABORTED`           | Signal fired before frame was sent (pre-aborted signal, or abort during handshake wait) — never left                      |
+| `RPCError`        | `SESSION`           | `destroy()` before send, or call on a closed client — never left                                                          |
+| `RPCError`        | `CLIENT`            | Client-side guardrail tripped (e.g., `maxPending` exceeded)                                                               |
+| `RPCError`        | `HANDSHAKE`         | Handshake failed or timed out, auth payload malformed                                                                     |
+| `RemoteRPCError`  | `INPUT_VALIDATION`  | `.input(schema)` rejected the input (server-side)                                                                         |
+| `RemoteRPCError`  | `OUTPUT_VALIDATION` | `.output(schema)` rejected the handler output (server-side)                                                               |
+| `RPCError`        | `INVALID_DATA`      | Wire-level data rejected by `sanitize()`                                                                                  |
+| `RPCError`        | `INTERNAL`          | Defensive: should not be reachable                                                                                        |
+| `RPCError`        | `MIDDLEWARE`        | Middleware misuse (`next()` called twice, completed without calling `next()`, or bad `extra` arg)                         |
 
 `INPUT_VALIDATION`, `OUTPUT_VALIDATION`, `MIDDLEWARE`, and `NOT_FOUND` are raised **server-side** and always arrive as `RemoteRPCError`. `CHANNEL` is purely client-local. `ABORTED` and `SESSION` appear in both `RPCAbortedError` (frame sent) and `RPCError` (frame unsent); `TIMEOUT` only in `RPCAbortedError` — the class is the retry-safety signal.
 
@@ -406,7 +406,7 @@ server(appRouter, channel, {
 });
 ```
 
-The middleware must **return** `next(...)`, calling it **exactly once**. Calling `next()` twice throws `RPCError("MIDDLEWARE", ...)`; so does passing a non-object `extra`. Completing without calling `next()` at all also throws `MIDDLEWARE` — otherwise the handler would be silently skipped while the caller still observed a success.
+The middleware must call `next(...)` **exactly once** before its returned promise settles; returning/awaiting that promise is the recommended form because it propagates downstream completion and errors. Calling `next()` twice throws `RPCError("MIDDLEWARE", ...)`; so does passing a non-object `extra`. Completing without calling `next()` at all also throws `MIDDLEWARE` — otherwise the handler would be silently skipped while the caller still observed a success. An unreturned `next()` call is accepted by the runtime but its downstream result is not implicitly propagated; a late call after completion is ignored.
 
 The `context` factory runs **per request**, after auth verification, and receives `{ auth }` carrying the data returned by `auth.verify` for that session.
 
@@ -464,11 +464,11 @@ import {
 // Also re-exported from "@dotex/saferpc" and "@dotex/saferpc/auth".
 ```
 
-| Helper                                                                 | Use                                                                                                              |
-| ---------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------- |
-| `createJWTServerAuth({ verifyToken, maxAge? })`                        | Verifies JWT + timestamp (symmetric skew check) + transcript digest. Returns the `verifyToken` result as `auth`. |
-| `createEd25519ServerAuth({ getPublicKey, validateDevice? })`           | Verifies Ed25519 signature against a device's 32-byte public key.                                                |
-| `createECDSAServerAuth({ getPublicKey, validateEntity? })`             | Verifies ECDSA P-256 signature via WebCrypto.                                                                    |
+| Helper                                                       | Use                                                                                                              |
+| ------------------------------------------------------------ | ---------------------------------------------------------------------------------------------------------------- |
+| `createJWTServerAuth({ verifyToken, maxAge? })`              | Verifies JWT + timestamp (symmetric skew check) + transcript digest. Returns the `verifyToken` result as `auth`. |
+| `createEd25519ServerAuth({ getPublicKey, validateDevice? })` | Verifies Ed25519 signature against a device's 32-byte public key.                                                |
+| `createECDSAServerAuth({ getPublicKey, validateEntity? })`   | Verifies ECDSA P-256 signature via WebCrypto.                                                                    |
 
 Auth payloads run the full hardened-data pipeline before any field access — the hardened msgpack codec followed by the sanitization gate: extension types rejected, prototype-pollution keys stripped/banned, host objects rejected, recursion depth capped — even in fields a profile ignores. Returned `auth` data is sanitized again before reaching `context`.
 

@@ -839,15 +839,30 @@ export function client<T extends Router>(
 
         if (msg["t"] !== 2) return;
         const rawId = msg["id"];
-        if (typeof rawId !== "string") return;
+        if (typeof rawId !== "string" || rawId.length === 0) return;
 
-        // Strict discriminator: the protocol defines exactly two response
-        // forms, `ok: true` and `ok: false`. Anything else is a malformed
-        // envelope — silent drop, BEFORE the pending entry is touched, so
-        // the call keeps waiting under its own timer instead of settling
-        // on garbage a strict port would ignore.
+        // Strict discriminator and envelope shape: the protocol defines
+        // exactly two response forms. Validate all required outer fields
+        // BEFORE touching the pending entry, so malformed frames cannot
+        // consume a call that is still waiting for a valid response.
+        const has = Object.prototype.hasOwnProperty;
         const ok = msg["ok"];
         if (ok !== true && ok !== false) return;
+        if (!has.call(msg, "d") || !has.call(msg, "e")) return;
+        if (ok === true) {
+          if (msg["e"] !== null) return;
+        } else {
+          const error = msg["e"];
+          if (
+            msg["d"] !== null ||
+            typeof error !== "object" ||
+            error === null ||
+            Array.isArray(error) ||
+            error instanceof Uint8Array
+          ) {
+            return;
+          }
+        }
 
         const entry = pending.get(rawId);
         if (entry === undefined) return;
@@ -957,8 +972,17 @@ export function client<T extends Router>(
     // `null`, which a `.optional()` (as opposed to `.nullish()`) Zod schema
     // rejects. A dropped key decodes back to `undefined` on the server.
     const req: Record<string, unknown> = { t: 1, id, p: prop };
-    if (input !== undefined) req["i"] = input;
+    if (input !== undefined) req["i"] = sanitize(input);
     const encrypted = enc(req);
+    if (encrypted.length > maxBytes) {
+      // The frame is still local: do not hand an oversized ciphertext to the
+      // adapter, where it would become a sent request that the peer must
+      // silently drop and the caller would only discover by timeout.
+      zero(encrypted);
+      return Promise.reject(
+        new RPCError("CLIENT", "Message exceeds maxMessageBytes"),
+      );
+    }
 
     return new Promise(function rpcExec(res, rej) {
       // Listener hygiene: every settle path (resolve, reject, timeout,
@@ -1106,6 +1130,12 @@ export function client<T extends Router>(
           throw abortError(prop, signal.reason);
         }
 
+        // Validate caller data before starting a lazy handshake. A bad first
+        // input must not even emit TAG_HELLO; sanitize() also canonicalizes
+        // plain objects before the encrypted request is built.
+        const sanitizedInput =
+          input === undefined ? undefined : sanitize(input);
+
         if (signal !== undefined) {
           // Abort rejects THIS call only; the handshake itself is shared
           // state and keeps running for other callers / the next call.
@@ -1122,7 +1152,7 @@ export function client<T extends Router>(
         const sentEpoch = epoch;
 
         try {
-          return await sendRequest(prop, input, signal);
+          return await sendRequest(prop, sanitizedInput, signal);
         } catch (err: unknown) {
           // No auto-retry. An RPCAbortedError leaves the outcome UNKNOWN
           // (the request may have executed — auto-resending it is a silent

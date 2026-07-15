@@ -373,7 +373,7 @@ After decryption, an RPC message is a msgpack-encoded map. Two kinds.
 ```
 {
   t:  1,
-  id: string,   // non-empty, ≤ MAX_ID_LEN, unique within this client session
+  id: string,   // non-empty, ≤ MAX_ID_LEN, never reused by this client instance
   p:  string,   // non-empty procedure name
   i:  any,      // input (validated against procedure's .input schema)
 }
@@ -383,7 +383,9 @@ Nuances a port must reproduce:
 
 - The server **must** drop requests whose `id` is empty or longer than `MAX_ID_LEN` (64), and requests whose `p` is missing, non-string, or empty. Drop means silent drop — no response frame. The `MAX_ID_LEN` bound is a resource guard, not a wire invariant: the reference counts the id in **UTF-16 code units** (JS `String.length`), so a port counting UTF-8 bytes or Unicode scalars may pick a different rejection threshold for a non-ASCII id. Because ids are opaque, client-chosen, and **should** be ASCII (the reference generates a decimal counter), the three counts coincide in practice — a peer **must not** depend on the exact threshold for non-ASCII ids.
 - When the caller supplies no input, the `i` key is **omitted entirely**, never encoded as nil. msgpack has no `undefined`; encoding an absent input as nil would make an "optional" input schema on the server observe an explicit null instead of an absent value. An absent key must decode back to the language's absent-value representation.
-- The reference client generates `id`s from a monotonically increasing per-client counter. This is not normative — any scheme works — but `id`s **must never be reused** within a client instance: uniqueness is what makes response matching (and the client's replay immunity) sound.
+- When input is supplied, the client applies the [sanitization](#sanitization) gate **before** msgpack encoding. A non-plain host value, extension value, or over-deep input fails locally with `INVALID_DATA` and no frame is handed to the channel; plain values are rebuilt according to the sanitizer's rules (including stripping poison keys). `undefined` is the one omission sentinel and is not passed through encoding.
+- An outbound encrypted request whose full frame length exceeds the client's configured `maxMessageBytes` is rejected locally with `RPCError("CLIENT", "Message exceeds maxMessageBytes")`; it is not queued or sent. This is a local guardrail and does not reset a healthy session.
+- The reference client generates `id`s from a monotonically increasing per-client counter. This is not normative — any scheme works — but `id`s **must never be reused during the entire client instance lifetime**, across session resets and re-handshakes. Recreating the client starts a new id namespace. Uniqueness is what makes response matching (and the client's replay immunity) sound.
 
 ### Response (server → client)
 
@@ -415,29 +417,40 @@ The error map's fields:
 | `m`   | Human-readable message. Untrusted from the receiver's perspective.                                                 |
 | `d`   | Optional structured data, sanitized before transmission.                                                           |
 
-The `ok` discriminator itself is **never** coerced: exactly boolean `true` selects the success form and exactly boolean `false` the failure form. A response whose `ok` is anything else (absent, nil, a number, a string) is a malformed envelope — the client **must** drop it silently, before consuming the pending-call entry, so the call keeps waiting for a well-formed response under its own timer.
+The `ok` discriminator itself is **never** coerced: exactly boolean `true` selects the success form and exactly boolean `false` the failure form. The outer envelope has these required shapes:
 
-The receiving client must treat every error field as hostile and coerce defensively: if `e` is not a map, surface code `"UNKNOWN"` with an empty message; if `c` is not a non-empty string, use `"UNKNOWN"`; if `m` is not a string, use `""`. Never `String()`-coerce arbitrary values into codes — a stringified `undefined`/object makes a misleading code.
+- `ok: true` requires both `d` and `e` keys, with `e` exactly `nil` (`null` in the reference encoding); `d` may be any sanitized plain-data value, including `nil` for a handler that returns no value.
+- `ok: false` requires both `d` and `e` keys, with `d` exactly `nil` and `e` a map. The error map's `c`, `m`, and `d` members are read defensively as described below; malformed or absent members do not make the outer envelope invalid.
 
-On the server, a handler throwing the implementation's typed RPC error maps to `{ c: code, m: message, d: sanitize(data) }`. Any other thrown value maps to `{ c: "INTERNAL", m: "Internal error", d: null }` — internal error details **must not** leak to the peer. If sanitizing `d` itself fails, the response is not sent at all (the client times out); handler error `data` must be a plain-data tree.
+A response whose `ok` is anything else (absent, nil, a number, a string), or whose required outer shape is wrong, is a malformed envelope — the client **must** drop it silently, before consuming the pending-call entry, so the call keeps waiting for a well-formed response under its own timer. Unknown fields remain ignored.
+
+The receiving client must treat every error field as hostile and coerce defensively: if `e` is not a map, the envelope is malformed and is dropped; if `c` is not a non-empty string, surface code `"UNKNOWN"`; if `m` is not a string, use `""`; if `e.d` is absent it is exposed as `nil`/`null` (the reference `RPCError` data default). Never `String()`-coerce arbitrary values into codes — a stringified `undefined`/object makes a misleading code.
+
+On the server, a handler, middleware, context factory, or schema operation that throws the implementation's typed RPC error maps to `{ c: code, m: message, d: sanitize(data) }`; the typed error's own code wins over the surrounding pipeline stage. Any other thrown value maps to `{ c: "INTERNAL", m: "Internal error", d: null }` — internal error details **must not** leak to the peer. If sanitizing `d` itself fails, the response is not sent at all (the client times out); handler error `data` must be a plain-data tree.
+
+The `m` field is deliberately **not an exact protocol constant**: it is human-readable, untrusted text and is not used for dispatch or conformance. A port must produce the normative `c` code and the required envelope shape; it may choose equivalent wording. The reference messages are `"Procedure not found"`, `"Input validation failed"`, `"Output validation failed"`, `"Middleware completed without calling next()"`, `"next() called more than once"`, `"next() extra must be an object"`, and `"Internal error"` for the corresponding common paths. Schema-library issue text is not normative.
 
 Messages with wrong `t`, missing/empty `id`, missing/empty `p`, or any unexpected type **must** be dropped silently. The protocol has no provision for "bad message" responses. Those would be useful only to an attacker enumerating implementation behavior.
 
 Silent drop applies to malformed **envelopes** only. A **well-formed** request (`t: 1`, valid `id`, non-empty string `p`) whose `p` does not name a procedure in the router is _not_ silently dropped: the server returns a normal failure response with code `NOT_FOUND`. At that point the peer has already proven key possession, so the enumeration argument no longer applies.
 
-**Protocol-level error codes.** In addition to application-defined codes, the reference server emits: `INPUT_VALIDATION`, `OUTPUT_VALIDATION`, `MIDDLEWARE`, `NOT_FOUND`, `INVALID_DATA`, `INTERNAL`. A behavior-compatible port **should** emit the same codes for the same conditions. The error `d` payload is implementation-defined (the reference puts its schema library's flattened issues there); clients **must not** depend on its shape.
+**Protocol-level error codes.** In addition to application-defined codes, the reference server emits: `INPUT_VALIDATION`, `OUTPUT_VALIDATION`, `MIDDLEWARE`, `NOT_FOUND`, `INVALID_DATA`, `INTERNAL`. A behavior-compatible port **must** emit the same codes for the same conditions. The error `d` payload is implementation-defined (the reference puts its schema library's flattened issues there); clients **must not** depend on its shape.
 
 ### Procedure execution pipeline (server)
 
-The stages between a well-formed decrypted request and its response frame, in order. The stage **order** and the **error code each stage produces** are normative — they are wire-observable; the mechanism (how a port models procedures, schemas, middleware) is not.
+The stages between a well-formed decrypted request and its response frame, in order. The stage **order** and the **error code each stage produces** are normative — they are wire-observable; the mechanism (how a port models procedures, schemas, middleware) is not. The reference client also applies the same plain-data sanitization gate to caller input before encoding; a port **must** reject a non-plain host value locally with `INVALID_DATA` and must not send a frame.
 
 1. **Router lookup.** Unknown `p` ⇒ failure response `NOT_FOUND` (the peer has proven key possession; see above).
 2. **Auth snapshot.** The session's verified auth data is captured **at request arrival**, before any `await` — a re-handshake completing mid-request must not swap the principal under a running handler. (The response of a superseded session is dropped by the epoch guard in step 6 regardless.)
-3. **Context build.** The application `context` factory runs with `{ auth: snapshot }`. If it throws, the request is answered `INTERNAL` with no detail leakage (see [Authorization data flow](#authorization-data-flow)).
+3. **Context build.** If the snapshot exists, the application `context` factory runs with `{ auth: snapshot }`; if no verifier/principal exists, it runs with an empty `{}`. If the factory throws, the request is answered `INTERNAL` with no detail leakage (see [Authorization data flow](#authorization-data-flow)).
 4. **Chain execution.** A procedure is a chain of steps declared in application order — input schema, middleware, output schema interleave **in declaration order**, they are not grouped into fixed phases. Semantics per step kind:
    - **Input schema**: validate the raw `i` value; failure ⇒ `INPUT_VALIDATION`. On success the **parsed** value replaces the raw input for the rest of the chain (schema transforms/defaults apply — the handler sees post-parse data).
-   - **Middleware**: must call its continuation (`next`) **exactly once**. Calling it twice, passing a non-object context extension, or completing without calling it at all ⇒ `MIDDLEWARE`. The completed-without-`next` case is load-bearing: a middleware returning a value while skipping the handler would otherwise surface as a success reply for a handler that never ran.
-   - **Output schema**: validate the handler's return value; failure ⇒ `OUTPUT_VALIDATION`. The **parsed** output is what gets serialized into `d`.
+   - **Middleware**: receives the current `ctx`, the current `input`, and `next(extra?)`. `next` may be called exactly once; a second call, a non-null non-object `extra`, or completion without any call ⇒ `MIDDLEWARE`. A valid `extra` is shallow-merged into a fresh null-prototype context (`ctx` fields first, then `extra` fields), and the continuation returns a promise for the downstream result. The middleware's own returned value — not automatically the downstream result — is the value passed to the preceding step; therefore an output schema declared before this middleware validates that middleware return value. A middleware that calls `next()` without awaiting/returning it is still accepted by the reference once the call occurred; the downstream work may run concurrently, but its result is not implicitly propagated.
+   - **Middleware timing**: the call must happen before the middleware's returned promise settles. If the middleware settles without calling `next`, the request gets `MIDDLEWARE`; a later call is a contract violation and is ignored by the reference (it must not launch the downstream continuation after the response path has completed). If the middleware calls `next` and downstream later fails, the downstream failure is observable only where the continuation promise is awaited/returned; an independent middleware failure wins for that middleware invocation.
+   - **Output schema**: validate the value returned by the remainder of the chain (normally the handler, but a middleware may replace it with its own return value); failure ⇒ `OUTPUT_VALIDATION`. The **parsed** output is what gets serialized into `d`.
+
+   Steps are nested as continuations in declaration order: the first declared step is the outermost call, each step's `next` is all later steps, and the handler is the innermost operation. Thus interleaving is significant; schemas are not regrouped into a fixed input/middleware/output phase order.
+
 5. **Output sanitization.** The final result passes the [sanitization](#sanitization) gate before encoding; a host object that leaked through ⇒ failure response `INVALID_DATA` (typed, instead of an opaque `INTERNAL`). Error `d` payloads are sanitized the same way — and if _that_ fails, no response is sent at all.
 6. **Epoch guard + send.** If a promotion/re-handshake or destroy happened while the handler ran, the response belongs to a superseded session — dropped, not sent. Otherwise it is encrypted under the current live key and sent; a send failure is reported locally (`onError`), never to the peer.
 
@@ -539,7 +552,7 @@ Every decoded msgpack value passes through a sanitization step, inbound and outb
 
 1. Recursion depth greater than 32 ⇒ `INVALID_DATA`.
 2. Any msgpack extension type, **including the built-in Timestamp (type -1)** ⇒ `INVALID_DATA`. The Timestamp extension is explicitly rejected because msgpack libraries hard-code its decoder.
-3. Reject any decoded value whose type is not in the plain-data set: nil, boolean, number/big-integer, string, `bin`, array, string-keyed map. Anything a codec maps to a richer host type (dates, native collections, wrapped ext data) is rejected.
+3. Reject any decoded value whose type is not in the plain-data set: nil, boolean, number/big-integer, string, `bin`, array, string-keyed map. In the reference language realization, `function` and `symbol` are also rejected as `INVALID_DATA` rather than being handed to the msgpack encoder. Anything a codec maps to a richer host type (dates, native collections, wrapped ext data) is rejected.
 
 **JS-specific realization (how the reference implements rule 3 and defends a JS-only attack class):**
 

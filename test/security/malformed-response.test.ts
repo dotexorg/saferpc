@@ -85,6 +85,11 @@ describe("security / malformed response discriminator", () => {
         { t: 2, id: req.id, ok: null, d: "garbage-null", e: null },
         { t: 2, id: req.id, ok: 1, d: "garbage-one", e: null },
         { t: 2, id: req.id, ok: "false", d: null, e: { c: "X", m: "no" } },
+        // Malformed outer shapes: required d/e fields and their pairing.
+        { t: 2, id: req.id, ok: true, e: null },
+        { t: 2, id: req.id, ok: true, d: "wrong", e: {} },
+        { t: 2, id: req.id, ok: false, d: "wrong", e: { c: "X" } },
+        { t: 2, id: req.id, ok: false, d: null, e: [] },
         // Valid: must still find the pending entry and resolve it.
         { t: 2, id: req.id, ok: true, d: "real-answer", e: null },
       ],

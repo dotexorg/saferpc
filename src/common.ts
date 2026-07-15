@@ -147,6 +147,9 @@ export function sanitize(v: unknown, depth: number = 0): unknown {
     throw new RPCError("INVALID_DATA", "Max nesting depth exceeded");
   }
   if (v === null || v === undefined) return v;
+  if (typeof v === "function" || typeof v === "symbol") {
+    throw new RPCError("INVALID_DATA", "Unsupported value type");
+  }
   if (typeof v !== "object") return v;
   if (v instanceof Uint8Array) return v;
   if (Array.isArray(v)) {

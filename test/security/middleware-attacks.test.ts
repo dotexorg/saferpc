@@ -109,6 +109,40 @@ describe("security / middleware pipeline", () => {
     }
   });
 
+  it("late next() cannot run the handler after middleware completion", async () => {
+    const psk = randomBytes(32);
+    const { a, b } = createChannelPair();
+    let invocations = 0;
+    const router: Router = {
+      lateNext: chain()
+        .use(({ next }) => {
+          setTimeout(() => {
+            void next();
+          }, 10);
+          return Promise.resolve("ignored" as never);
+        })
+        .handler(async () => {
+          invocations++;
+          return "must-not-run";
+        }),
+    };
+    const srv = server(router, a, { auth: { secret: () => psk } });
+    const { api, destroy } = client(b, {
+      auth: { secret: () => psk },
+      timeout: 1000,
+    });
+    try {
+      await expect(api.lateNext({})).rejects.toMatchObject({
+        code: "MIDDLEWARE",
+      });
+      await new Promise((resolve) => setTimeout(resolve, 30));
+      expect(invocations).toBe(0);
+    } finally {
+      destroy();
+      srv.destroy();
+    }
+  });
+
   it("middleware-thrown RPCError is not masked as INTERNAL", async () => {
     const psk = randomBytes(32);
     const { a, b } = createChannelPair();

@@ -21,6 +21,75 @@ import {
 } from "../helpers/channels.ts";
 
 describe("security / DoS — framing limits", () => {
+  it("client rejects oversized outbound TAG_MSG locally", async () => {
+    const psk = randomBytes(32);
+    const { a, b } = createChannelPair();
+    let invocations = 0;
+    const router: Router = {
+      ping: chain().handler(async () => {
+        invocations++;
+        return "pong";
+      }),
+    };
+    const srv = server(router, a, { auth: { secret: () => psk } });
+    const { api, destroy } = client(b, {
+      auth: { secret: () => psk },
+      maxMessageBytes: 128,
+      timeout: 500,
+    });
+    try {
+      await expect(api.ping({ data: "x".repeat(500) })).rejects.toMatchObject({
+        code: "CLIENT",
+        message: "Message exceeds maxMessageBytes",
+      });
+      expect(invocations).toBe(0);
+    } finally {
+      destroy();
+      srv.destroy();
+    }
+  });
+
+  it("client sanitizes input before encoding and before handshake", async () => {
+    const psk = randomBytes(32);
+    const { a, b } = createChannelPair();
+    let invocations = 0;
+    let framesSent = 0;
+    const observed = {
+      send(data: Uint8Array) {
+        framesSent++;
+        return b.send(data);
+      },
+      receive: b.receive.bind(b),
+    };
+    const router: Router = {
+      ping: chain().handler(async () => {
+        invocations++;
+        return "pong";
+      }),
+    };
+    const srv = server(router, a, { auth: { secret: () => psk } });
+    const { api, destroy } = client(observed, {
+      auth: { secret: () => psk },
+      timeout: 500,
+    });
+    try {
+      await expect(
+        api.ping(new Date() as unknown as Record<string, unknown>),
+      ).rejects.toMatchObject({ code: "INVALID_DATA" });
+      await expect(api.ping((() => {}) as unknown)).rejects.toMatchObject({
+        code: "INVALID_DATA",
+      });
+      await expect(api.ping(Symbol("bad") as unknown)).rejects.toMatchObject({
+        code: "INVALID_DATA",
+      });
+      expect(invocations).toBe(0);
+      expect(framesSent).toBe(0);
+    } finally {
+      destroy();
+      srv.destroy();
+    }
+  });
+
   it("server drops TAG_MSG larger than maxMessageBytes", async () => {
     const psk = randomBytes(32);
     const { a, b, mitm } = createMitmChannelPair();

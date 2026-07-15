@@ -176,10 +176,15 @@ function execute(
         const mw = step.fn;
         tip = async function runMiddleware() {
           let called = false;
+          let completed = false;
           const result = await mw({
             ctx,
             input,
             next(extra?: Ctx) {
+              // A continuation that arrives after the middleware promise has
+              // settled cannot be part of this request anymore. Ignore it
+              // rather than launching the handler after an error response.
+              if (completed) return Promise.resolve(undefined);
               if (called) {
                 throw new RPCError(
                   "MIDDLEWARE",
@@ -198,6 +203,8 @@ function execute(
               }
               return next();
             },
+          }).finally(function markMiddlewareCompleted() {
+            completed = true;
           });
           // Contract: middleware must call next() exactly once. A middleware
           // that returns without calling next() would silently skip the
