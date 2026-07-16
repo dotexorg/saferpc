@@ -25,6 +25,50 @@ describe("sanitize / primitives", () => {
   });
 });
 
+describe("sanitize / bigint range (#4)", () => {
+  it("passes bigints within the msgpack 64-bit range", () => {
+    expect(sanitize(0n)).toBe(0n);
+    expect(sanitize(-(2n ** 63n))).toBe(-(2n ** 63n)); // int64 min
+    expect(sanitize(2n ** 64n - 1n)).toBe(2n ** 64n - 1n); // uint64 max
+  });
+
+  it("rejects a bigint above uint64 max with INVALID_DATA", () => {
+    // Without the guard, mpEncode(useBigInt64) silently wraps this to 0n.
+    try {
+      sanitize(2n ** 64n);
+      throw new Error("should have thrown");
+    } catch (err) {
+      expect(err).toBeInstanceOf(RPCError);
+      expect((err as RPCError).code).toBe("INVALID_DATA");
+    }
+  });
+
+  it("rejects a bigint below int64 min with INVALID_DATA", () => {
+    expect(() => sanitize(-(2n ** 63n) - 1n)).toThrow(RPCError);
+  });
+});
+
+describe("sanitize / nested undefined (#5)", () => {
+  it("drops undefined-valued object keys (matches top-level omission)", () => {
+    // A nested undefined would otherwise encode as nil and decode to null on
+    // the peer, breaking a `.optional()` (non-nullable) schema field.
+    const out = sanitize({ a: 1, b: undefined, c: "z" }) as Record<
+      string,
+      unknown
+    >;
+    expect(Object.prototype.hasOwnProperty.call(out, "b")).toBe(false);
+    expect(out).toEqual({ a: 1, c: "z" });
+  });
+
+  it("an object with only undefined values sanitizes to an empty object", () => {
+    expect(sanitize({ x: undefined })).toEqual({});
+  });
+
+  it("still returns top-level undefined as undefined", () => {
+    expect(sanitize(undefined)).toBeUndefined();
+  });
+});
+
 describe("sanitize / arrays", () => {
   it("recurses into nested arrays", () => {
     expect(sanitize([1, [2, [3]]])).toEqual([1, [2, [3]]]);

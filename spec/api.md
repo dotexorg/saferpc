@@ -85,12 +85,12 @@ Every method is immutable and chainable. The handler may be **sync or async**. `
 
 ### Method semantics
 
-| Method            | Effect                                  | Notes                                                                                                                                                                                 |
-| ----------------- | --------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `.use(mw)`        | Adds middleware that can extend context | `mw` may be a plain (non-`async`) function but must **return** `next()` (called exactly once). `next(extra)` merges `extra` into ctx — and its type flows into every downstream step. |
-| `.input(schema)`  | Validates & parses input with Zod       | Handler receives `z.output<S>`; callers send `z.input<S>`. On failure throws `RPCError("INPUT_VALIDATION", ...)`.                                                                     |
-| `.output(schema)` | Validates & parses output with Zod      | Handler returns `z.input<S>` (pre-transform); callers observe `z.output<S>`. On failure throws `RPCError("OUTPUT_VALIDATION", ...)`. Runs _after_ handler.                            |
-| `.handler(fn)`    | Terminates the builder                  | `fn` may be **sync or async**. Returns a frozen `Procedure`. Without `.output()`, the caller-facing output is inferred from `fn`'s (awaited) return.                                  |
+| Method            | Effect                                  | Notes                                                                                                                                                                                                                                                                                    |
+| ----------------- | --------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `.use(mw)`        | Adds middleware that can extend context | `mw` must return `next()` (called exactly once) — the type contract; its result type is obtainable only from `next()`. `next(extra)` merges `extra` into ctx — and its type flows into every downstream step. At runtime, a middleware that completes while its `next()` promise is still **pending** yields `MIDDLEWARE`. |
+| `.input(schema)`  | Validates & parses input with Zod       | Handler receives `z.output<S>`; callers send `z.input<S>`. On failure throws `RPCError("INPUT_VALIDATION", ...)`.                                                                                                                                                                        |
+| `.output(schema)` | Validates & parses output with Zod      | Handler returns `z.input<S>` (pre-transform); callers observe `z.output<S>`. On failure throws `RPCError("OUTPUT_VALIDATION", ...)`. Runs _after_ handler.                                                                                                                               |
+| `.handler(fn)`    | Terminates the builder                  | `fn` may be **sync or async**. Returns a frozen `Procedure`. Without `.output()`, the caller-facing output is inferred from `fn`'s (awaited) return.                                                                                                                                     |
 
 `schema` is anything with a `.safeParse()` method (a Zod schema in practice).
 
@@ -141,18 +141,23 @@ Subscribes to `channel` and serves the router. Returns synchronously. The option
 
 ### `ServerOptions`
 
-| Field              | Type                                             | Default     | Required                                                        |
-| ------------------ | ------------------------------------------------ | ----------- | --------------------------------------------------------------- |
-| `auth`             | `AuthOptions`                                    | —           | ✅                                                              |
-| `context`          | `(ctx: { auth?: Ctx }) => TCtx \| Promise<TCtx>` | —           | ✅ when `TCtx` (the router's base context) is non-empty, else — |
-| `handshakeTimeout` | `number` (ms)                                    | `5000`      | —                                                               |
-| `maxMessageBytes`  | `number`                                         | `1_048_576` | —                                                               |
-| `replayWindow`     | `number`                                         | `4096`      | —                                                               |
-| `onError`          | `(err: unknown) => void`                         | —           | —                                                               |
+| Field                  | Type                                             | Default     | Required                                                        |
+| ---------------------- | ------------------------------------------------ | ----------- | --------------------------------------------------------------- |
+| `auth`                 | `AuthOptions`                                    | —           | ✅                                                              |
+| `context`              | `(ctx: { auth?: Ctx }) => TCtx \| Promise<TCtx>` | —           | ✅ when `TCtx` (the router's base context) is non-empty, else — |
+| `handshakeTimeout`     | `number` (ms)                                    | `5000`      | —                                                               |
+| `maxMessageBytes`      | `number`                                         | `1_048_576` | —                                                               |
+| `maxPendingHandshakes` | `number`                                         | `16`        | —                                                               |
+| `replayWindow`         | `number`                                         | `4096`      | —                                                               |
+| `onError`              | `(err: unknown) => void`                         | —           | —                                                               |
+
+Numeric options are validated at construction with a synchronous `TypeError`: `handshakeTimeout` — finite number ≥ **100 ms**; `maxMessageBytes` and `maxPendingHandshakes` — positive integers; `replayWindow` — integer ≥ 0 (`0` disables the seen-nonce set). `NaN`/`Infinity` never silently disables a limit.
 
 `context` runs per request and must return the router's base context `TCtx`. The `auth` argument carries whatever `auth.verify` returned for the current session. When the base context is empty, `context` is optional and the request context falls back to the verified auth data (or `{}` if none).
 
-`replayWindow` is the number of recently-seen AEAD nonces the server remembers per session so it can drop replayed request frames (in-session replay defense). FIFO-evicted: a replay older than the last `replayWindow` accepted messages executes again, so the window is narrowed to N, not closed. Cleared on every re-handshake. Set `0` to disable.
+`replayWindow` is the number of recently-seen AEAD nonces the server remembers per session so it can drop replayed request frames (in-session replay defense). Every authenticated malformed request frame consumes a slot; reflected response frames (`t: 2`) do not. FIFO-evicted: a replay older than the last `replayWindow` accepted messages executes again, so the window is narrowed to N, not closed. Cleared on every re-handshake. Set `0` to disable.
+
+`maxPendingHandshakes` bounds handshake attempts whose async work has not settled. A timed-out attempt remains counted until its `auth` callback settles because an arbitrary JavaScript Promise cannot be cancelled; new hellos are silently dropped at the cap. This trades re-handshake availability for bounded memory under a peer that opens never-settling auth calls. Default: `16`.
 
 `onError` fires on handshake failures and non-fatal internal errors. The server does **not** destroy itself on a failed handshake — it resets and accepts the next hello.
 
@@ -226,9 +231,13 @@ Returns synchronously. The handshake stays lazy: it starts on the first `api` ca
 
 `maxPending` caps concurrent in-flight calls. Past the cap, calls reject with `RPCError("CLIENT", "Too many pending requests")`.
 
+Every numeric option is validated at construction; a value that looks fine in the table above can still throw a synchronous `TypeError`. The full contract: `timeout` — finite number > 0; `sendTimeout` — finite number ≥ 0; `handshakeTimeout` — finite number ≥ **100 ms** (a sub-100 ms budget cannot complete a real handshake and would only produce spurious timeouts); `maxPending` and `maxMessageBytes` — positive integers. `NaN`/`Infinity` — easy to produce with `Number(process.env.X)` on an unset variable — is rejected rather than silently disabling the limit (`length > NaN` is always false).
+
+If a previous client handshake timed out while an auth callback or transport Promise is still unsettled, the next call fails with `RPCError("HANDSHAKE")` instead of starting another handshake operation. Once the stale operation settles, later calls may handshake again. This keeps client-side non-cancellable auth work bounded to one operation.
+
 `timeout` applies to every call. On timeout the client throws `RPCAbortedError("TIMEOUT", "Timed out: <procedure>")` if the frame had already been sent (outcome unknown — do not blind-resend; the session resets and the next call re-handshakes), or plain `RPCError("CHANNEL")` if the frame had not yet left the process (retry freely; no reset). Set `timeout` generously — it is the safety net, not a UX budget; shorten a single call with [`AbortSignal.timeout`](#calloptions--per-call-abort) instead.
 
-`sendTimeout` is the maximum time a frame spends in the core outbound queue waiting for a live channel before the call fails with a definite `RPCError("CHANNEL")` (never sent — retry freely). Default 3 000 ms — fail fast: the error is provably "never left", so retrying at the call site is always safe, and a frame that could not leave for 3 s is usually stale anyway. Raise it for transports with long reconnect cycles. Not a caller-facing UX knob; it is the boundary between the definite and unknown failure paths.
+`sendTimeout` is the maximum time a frame spends in the core outbound queue waiting for a live channel before the call fails with a definite `RPCError("CHANNEL")` (never sent — retry freely). Default 3 000 ms — fail fast: the error is provably "never left", so retrying at the call site is always safe, and a frame that could not leave for 3 s is usually stale anyway. Raise it for transports with long reconnect cycles. Not a caller-facing UX knob; it is the boundary between the definite and unknown failure paths. Note the async edge: an adapter's `send` counts as sent the moment it hands back a pending promise (handoff, not resolution — see [Protocol § Failure handling](protocol.md#failure-handling-no-auto-retry)), so from that point the call is governed by `timeout` and rides the aborted class; a later rejection rolls it back only while the call is still pending and the session is unchanged. If timeout, abort, destroy, or a valid response already settled the call, the late rejection is ignored.
 
 ### `Client<T>`
 
@@ -241,6 +250,8 @@ type Client<T extends Router> = {
 ```
 
 Each procedure maps to a call whose argument and result are inferred from that procedure. Pass `typeof appRouter` as the type argument — `client<typeof appRouter>(...)` — to get full end-to-end inference. A loose `Router` collapses to `(input: unknown, opts?: CallOptions) => Promise<unknown>`, so untyped usage keeps working.
+
+One route name is **reserved**: `then`. The generated client is a Proxy that must not look thenable — if `api.then` were a function, `await api` and every other Promise-assimilation point would invoke it, so such a route could never be called. `rpc.router()` rejects the name at creation (compile-time and runtime). This is a JS-client reservation, not a wire rule: the protocol and server accept any procedure name, and ports reserve whatever names collide with their own language's implicit member protocols.
 
 ### `CallOptions` — per-call abort
 
@@ -264,7 +275,7 @@ Fetch-style. Aborting rejects **that call** with code `ABORTED`. The class depen
 - Aborting after the frame was already sent → `RPCAbortedError("ABORTED")`; `signal.reason` on `.cause`. Outcome on the server is **UNKNOWN** — the handler may have run. Do not blind-resend a non-idempotent call.
 - The session is never touched: `ABORTED` does not trigger the reset path, and a reply arriving after the abort is silently dropped.
 
-There is deliberately **no per-call `timeout` field**: the two-lever model is a *global* timeout (the client-level `timeout` option — the safety net that heals a dead session) plus a *local* abort (`AbortSignal.timeout(ms)` for a shorter single-call budget — gives `ABORTED`, session untouched). A signal can only shrink a call's budget, not extend it past the global timer; procedures slower than the global timeout mean the global value is too small — raise `ClientOptions.timeout` (this is also why the default is a generous 30 s), don't look for a per-call escape hatch.
+There is deliberately **no per-call `timeout` field**: the two-lever model is a _global_ timeout (the client-level `timeout` option — the safety net that heals a dead session) plus a _local_ abort (`AbortSignal.timeout(ms)` for a shorter single-call budget — gives `ABORTED`, session untouched). A signal can only shrink a call's budget, not extend it past the global timer; procedures slower than the global timeout mean the global value is too small — raise `ClientOptions.timeout` (this is also why the default is a generous 30 s), don't look for a per-call escape hatch.
 
 ### Client lifecycle
 
@@ -283,7 +294,7 @@ idle → handshaking → ready
 
 ## Failure handling (no auto-retry)
 
-As of 0.7.0 a call that fails as `RPCAbortedError("TIMEOUT")` — the frame was sent and no reply arrived — resets the session (zeros the key, returns to `idle`) but is **not** resent. The error surfaces so the caller, the only party that knows whether the procedure is idempotent, decides. Resending after a sent-frame timeout would silently double-execute non-idempotent handlers. A call whose frame was still in the core outbound queue when a terminal event fired (`RPCError("CHANNEL")` — either timer — or plain `RPCError("ABORTED")`) provably never left — the session is not reset. `RemoteRPCError` (server answered) and guardrail errors (`CLIENT`) never reset the session. The reset alone keeps a desynced peer from wedging future calls: the next call re-handshakes lazily. Concurrent failures share one re-handshake via an epoch counter. Full state-machine and wire-level semantics in [Protocol § Failure handling](protocol.md#failure-handling-no-auto-retry).
+As of 0.7.0 a call that fails as `RPCAbortedError("TIMEOUT")` — the frame was sent and no reply arrived — resets the session (zeros the key, returns to `idle`) but is **not** resent. The error surfaces so the caller, the only party that knows whether the procedure is idempotent, decides. Resending after a sent-frame timeout would silently double-execute non-idempotent handlers. A call whose frame was still in the core outbound queue when a terminal event fired (`RPCError("CHANNEL")` — either timer — or plain `RPCError("ABORTED")`) provably never left — the session is not reset. `RemoteRPCError` (server answered) and guardrail errors (`CLIENT`) never reset the session. The reset itself does not begin a handshake; it only returns to `idle`. The next call, or another already-pending call that later reaches its own handshake path, starts or joins one shared lazy re-handshake. Concurrent failures share one re-handshake via an epoch counter. Full state-machine and wire-level semantics in [Protocol § Failure handling](protocol.md#failure-handling-no-auto-retry).
 
 As of 0.7.0 **transport death is not a session event**. The session is bound to key material, not to a transport instance; when a socket dies, the client does nothing — keys are kept, pending calls keep waiting under their own timers. A call's outcome is decided by exactly two events: a reply that decrypts, or the call's own timeout. If the adapter's `send` throws (transport down), the core holds the frame in its outbound queue and retries until `sendTimeout` — see [Integrations § adapter contract](integrations.md#adapter-contract-send-or-throw-no-queues-stay-available) and the shipped `@dotex/saferpc/channels`. If the server lost its session with the socket, the first sent call that times out triggers the reset above, and the next call re-handshakes lazily.
 
@@ -335,21 +346,21 @@ class RPCAbortedError extends RPCError {}
 
 ### Standard error codes
 
-| Class             | Code                | Thrown when                                                                                           |
-| ----------------- | ------------------- | ----------------------------------------------------------------------------------------------------- |
-| `RPCAbortedError` | `TIMEOUT`           | Global timeout; frame was already sent — outcome unknown                                              |
-| `RPCAbortedError` | `ABORTED`           | Per-call signal fired; frame was already sent — outcome unknown. `signal.reason` on `.cause`          |
-| `RPCAbortedError` | `SESSION`           | `destroy()` called; frame was already sent — outcome unknown                                          |
+| Class             | Code                | Thrown when                                                                                                               |
+| ----------------- | ------------------- | ------------------------------------------------------------------------------------------------------------------------- |
+| `RPCAbortedError` | `TIMEOUT`           | Global timeout; frame was already sent — outcome unknown                                                                  |
+| `RPCAbortedError` | `ABORTED`           | Per-call signal fired; frame was already sent — outcome unknown. `signal.reason` on `.cause`                              |
+| `RPCAbortedError` | `SESSION`           | `destroy()` called; frame was already sent — outcome unknown                                                              |
 | `RPCError`        | `CHANNEL`           | `sendTimeout` or global `timeout` expired while still queued, channel closed, or reset staled a queued frame — never left |
-| `RPCError`        | `ABORTED`           | Signal fired before frame was sent (pre-aborted signal, or abort during handshake wait) — never left  |
-| `RPCError`        | `SESSION`           | `destroy()` before send, or call on a closed client — never left                                     |
-| `RPCError`        | `CLIENT`            | Client-side guardrail tripped (e.g., `maxPending` exceeded)                                           |
-| `RPCError`        | `HANDSHAKE`         | Handshake failed or timed out, auth payload malformed                                                 |
-| `RemoteRPCError`  | `INPUT_VALIDATION`  | `.input(schema)` rejected the input (server-side)                                                     |
-| `RemoteRPCError`  | `OUTPUT_VALIDATION` | `.output(schema)` rejected the handler output (server-side)                                           |
-| `RPCError`        | `INVALID_DATA`      | Wire-level data rejected by `sanitize()`                                                              |
-| `RPCError`        | `INTERNAL`          | Defensive: should not be reachable                                                                    |
-| `RPCError`        | `MIDDLEWARE`        | Middleware misuse (`next()` called twice, bad `extra` arg)                                            |
+| `RPCError`        | `ABORTED`           | Signal fired before frame was sent (pre-aborted signal, or abort during handshake wait) — never left                      |
+| `RPCError`        | `SESSION`           | `destroy()` before send, or call on a closed client — never left                                                          |
+| `RPCError`        | `CLIENT`            | Client-side guardrail tripped (e.g., `maxPending` exceeded)                                                               |
+| `RPCError`        | `HANDSHAKE`         | Handshake failed or timed out, auth payload malformed                                                                     |
+| `RemoteRPCError`  | `INPUT_VALIDATION`  | `.input(schema)` rejected the input (server-side)                                                                         |
+| `RemoteRPCError`  | `OUTPUT_VALIDATION` | `.output(schema)` rejected the handler output (server-side)                                                               |
+| `RPCError`        | `INVALID_DATA`      | Wire-level data rejected by `sanitize()`                                                                                  |
+| `RPCError`        | `INTERNAL`          | Defensive: should not be reachable                                                                                        |
+| `RPCError`        | `MIDDLEWARE`        | Middleware misuse (`next()` called twice, completed without calling `next()`, or bad `extra` arg)                         |
 
 `INPUT_VALIDATION`, `OUTPUT_VALIDATION`, `MIDDLEWARE`, and `NOT_FOUND` are raised **server-side** and always arrive as `RemoteRPCError`. `CHANNEL` is purely client-local. `ABORTED` and `SESSION` appear in both `RPCAbortedError` (frame sent) and `RPCError` (frame unsent); `TIMEOUT` only in `RPCAbortedError` — the class is the retry-safety signal.
 
@@ -400,7 +411,7 @@ server(appRouter, channel, {
 });
 ```
 
-The middleware must **return** `next(...)`. Calling `next()` twice throws `RPCError("MIDDLEWARE", ...)`; so does passing a non-object `extra`.
+The public contract is: call `next(...)` **exactly once** and return its result — the `MiddlewareResult` type is obtainable only from `next()`, so this is enforced at compile time. The runtime enforces the checkable subset. Calling `next()` twice throws `RPCError("MIDDLEWARE", ...)`; so does passing a non-object `extra`. Completing without calling `next()` at all also throws `MIDDLEWARE` — otherwise the handler would be silently skipped while the caller still observed a success. Completing while the `next()` promise is still **pending** throws `MIDDLEWARE` — otherwise the caller would receive the middleware's own value while the handler outcome is silently dropped. A late call after completion is ignored. Note the exact runtime invariant: the error fires only when the downstream is still pending at middleware completion. A middleware that bypasses the types, lets `next()` settle, and returns a different value (transform/fallback) is observationally indistinguishable from having consumed the settled result; the runtime forwards its return value, but this is a tolerated behavior, not a supported public API — no guarantees are made for it.
 
 The `context` factory runs **per request**, after auth verification, and receives `{ auth }` carrying the data returned by `auth.verify` for that session.
 
@@ -445,6 +456,8 @@ import {
 | `generateEd25519Keypair()`                          | `{ privateKey: Uint8Array, publicKey: Uint8Array }` | Pure JS, works everywhere.                                      |
 | `generateECDSAKeypair()`                            | `{ privateKey: CryptoKey, publicKey: CryptoKey }`   | Non-extractable.                                                |
 
+Each signing helper emits a versioned, normative wire payload (a msgpack map stamped with a profile version `v: 1`) — these are the schemas a cross-language port must reproduce to interoperate, specified in [Protocol § Auth payload profiles](protocol.md#auth-payload-profiles). The matching server helper rejects a payload whose `v` is absent or unknown.
+
 ### Server-side
 
 ```typescript
@@ -452,21 +465,19 @@ import {
   createJWTServerAuth,
   createEd25519ServerAuth,
   createECDSAServerAuth,
-  createCertificateServerAuth,
-  createMultifactorServerAuth,
 } from "@dotex/saferpc/auth/server";
 // Also re-exported from "@dotex/saferpc" and "@dotex/saferpc/auth".
 ```
 
-| Helper                                                                 | Use                                                                                                              |
-| ---------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------- |
-| `createJWTServerAuth({ verifyToken, maxAge? })`                        | Verifies JWT + timestamp (symmetric skew check) + transcript digest. Returns the `verifyToken` result as `auth`. |
-| `createEd25519ServerAuth({ getPublicKey, validateDevice? })`           | Verifies Ed25519 signature against a device's 32-byte public key.                                                |
-| `createECDSAServerAuth({ getPublicKey, validateEntity? })`             | Verifies ECDSA P-256 signature via WebCrypto.                                                                    |
-| `createCertificateServerAuth({ verifyCertificate, validateSubject? })` | Verifies a presented certificate chain + ECDSA P-256 signature.                                                  |
-| `createMultifactorServerAuth({ primary, secondary, combineAuth? })`    | Composes two verifiers; both must pass.                                                                          |
+| Helper                                                       | Use                                                                                                              |
+| ------------------------------------------------------------ | ---------------------------------------------------------------------------------------------------------------- |
+| `createJWTServerAuth({ verifyToken, maxAge? })`              | Verifies JWT + timestamp (symmetric skew check) + transcript digest. Returns the `verifyToken` result as `auth`. |
+| `createEd25519ServerAuth({ getPublicKey, validateDevice? })` | Verifies Ed25519 signature against a device's 32-byte public key.                                                |
+| `createECDSAServerAuth({ getPublicKey, validateEntity? })`   | Verifies ECDSA P-256 signature via WebCrypto.                                                                    |
 
-Auth payloads decode through the hardened msgpack codec: extension types rejected, prototype-pollution keys stripped, recursion depth capped. Returned `auth` data is sanitized before reaching `context`.
+Auth payloads run the full hardened-data pipeline before any field access — the hardened msgpack codec followed by the sanitization gate: extension types rejected, prototype-pollution keys stripped/banned, host objects rejected, recursion depth capped — even in fields a profile ignores. Returned `auth` data is sanitized again before reaching `context`.
+
+`maxAge` (JWT helper, default 30 000 ms) must be a finite number ≥ 0, validated at construction with a `TypeError` — a `NaN` skew budget would silently disable the staleness check.
 
 ---
 

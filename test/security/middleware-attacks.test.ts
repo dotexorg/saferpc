@@ -109,6 +109,271 @@ describe("security / middleware pipeline", () => {
     }
   });
 
+  it("late next() cannot run the handler after middleware completion", async () => {
+    const psk = randomBytes(32);
+    const { a, b } = createChannelPair();
+    let invocations = 0;
+    const router: Router = {
+      lateNext: chain()
+        .use(({ next }) => {
+          setTimeout(() => {
+            void next();
+          }, 10);
+          return Promise.resolve("ignored" as never);
+        })
+        .handler(async () => {
+          invocations++;
+          return "must-not-run";
+        }),
+    };
+    const srv = server(router, a, { auth: { secret: () => psk } });
+    const { api, destroy } = client(b, {
+      auth: { secret: () => psk },
+      timeout: 1000,
+    });
+    try {
+      await expect(api.lateNext({})).rejects.toMatchObject({
+        code: "MIDDLEWARE",
+      });
+      await new Promise((resolve) => setTimeout(resolve, 30));
+      expect(invocations).toBe(0);
+    } finally {
+      destroy();
+      srv.destroy();
+    }
+  });
+
+  it("late next() cannot run the handler after a synchronous throw", async () => {
+    // The sync-throw variant of the zombie-handler hole: `completed` must be
+    // set even when the middleware never produces a promise at all.
+    const psk = randomBytes(32);
+    const { a, b } = createChannelPair();
+    let invocations = 0;
+    const router: Router = {
+      syncThrow: chain()
+        .use((({ next }: { next: () => Promise<unknown> }) => {
+          setTimeout(() => {
+            void next().catch(() => {});
+          }, 10);
+          throw new Error("sync boom");
+        }) as never)
+        .handler(async () => {
+          invocations++;
+          return "must-not-run";
+        }),
+    };
+    const srv = server(router, a, { auth: { secret: () => psk } });
+    const { api, destroy } = client(b, {
+      auth: { secret: () => psk },
+      timeout: 1000,
+    });
+    try {
+      await expect(api.syncThrow({})).rejects.toMatchObject({
+        code: "INTERNAL",
+      });
+      await new Promise((resolve) => setTimeout(resolve, 30));
+      expect(invocations).toBe(0);
+    } finally {
+      destroy();
+      srv.destroy();
+    }
+  });
+
+  it("sync middleware returning a non-promise after fire-and-forget next() is rejected", async () => {
+    // Spec: the next() promise must have settled before the middleware
+    // completes. A middleware that returns its own value while the downstream
+    // is still pending would hand the client a success and silently drop the
+    // handler outcome — rejected as MIDDLEWARE (cf. tRPC's return-next
+    // guard: “did you forget to `return next()`?”). The handler delays so
+    // the downstream is genuinely pending at middleware completion.
+    const psk = randomBytes(32);
+    const { a, b } = createChannelPair();
+    const router: Router = {
+      syncReturn: chain()
+        .use((({ next }: { next: () => Promise<unknown> }) => {
+          void next();
+          return "sync-value";
+        }) as never)
+        .handler(async () => {
+          await new Promise((resolve) => setTimeout(resolve, 20));
+          return "handler-value";
+        }),
+    };
+    const srv = server(router, a, { auth: { secret: () => psk } });
+    const { api, destroy } = client(b, {
+      auth: { secret: () => psk },
+      timeout: 1000,
+    });
+    try {
+      await expect(api.syncReturn({})).rejects.toMatchObject({
+        code: "MIDDLEWARE",
+      });
+    } finally {
+      destroy();
+      srv.destroy();
+    }
+  });
+
+  it("fire-and-forget next() is rejected and does not leak an unhandledRejection (#7)", async () => {
+    // The regression scenario: middleware replies while the downstream is
+    // still pending, and the downstream REJECTS LATER. The request must fail
+    // closed with MIDDLEWARE, and the detached rejection must still be
+    // observed by the runtime — otherwise it surfaces as an
+    // unhandledRejection that can terminate the process.
+    const psk = randomBytes(32);
+    const { a, b } = createChannelPair();
+    const unhandled: unknown[] = [];
+    const onUnhandled = (reason: unknown): void => {
+      unhandled.push(reason);
+    };
+    process.on("unhandledRejection", onUnhandled);
+    const router: Router = {
+      fireForget: chain()
+        .use((({ next }: { next: () => Promise<unknown> }) => {
+          void next(); // fire-and-forget: not awaited, not returned
+          return "outer-success";
+        }) as never)
+        .handler(async () => {
+          await new Promise((resolve) => setTimeout(resolve, 20));
+          throw new Error("downstream-boom");
+        }),
+    };
+    const srv = server(router, a, { auth: { secret: () => psk } });
+    const { api, destroy } = client(b, {
+      auth: { secret: () => psk },
+      timeout: 1000,
+    });
+    try {
+      await expect(api.fireForget({})).rejects.toMatchObject({
+        code: "MIDDLEWARE",
+      });
+      // Let the delayed downstream rejection fire and get a chance to be
+      // reported as unhandled.
+      await new Promise((resolve) => setTimeout(resolve, 50));
+      expect(
+        unhandled.some((r) =>
+          String((r as Error | undefined)?.message ?? r).includes(
+            "downstream-boom",
+          ),
+        ),
+      ).toBe(false);
+    } finally {
+      process.off("unhandledRejection", onUnhandled);
+      destroy();
+      srv.destroy();
+    }
+  });
+
+  it("awaiting next() and returning a transformed value is accepted", async () => {
+    // `return next()` is the public contract; `await next()` + own return is
+    // runtime-tolerated (type-illegal). In both cases the downstream settled
+    // before the middleware completed, so the check must not fire.
+    const psk = randomBytes(32);
+    const { a, b } = createChannelPair();
+    const router: Router = {
+      passThrough: chain()
+        .use(async ({ next }) => next())
+        .handler(async () => "plain"),
+      transform: chain()
+        // Type-illegal on purpose (the phantom MiddlewareResult requires
+        // returning next()'s result) — this asserts the RUNTIME behavior:
+        // downstream settled before completion, own value becomes the reply.
+        .use((async ({ next }: { next: () => Promise<unknown> }) => {
+          const inner = await next();
+          return `wrapped:${String(inner)}`;
+        }) as never)
+        .handler(async () => "plain"),
+    };
+    const srv = server(router, a, { auth: { secret: () => psk } });
+    const { api, destroy } = client(b, {
+      auth: { secret: () => psk },
+      timeout: 1000,
+    });
+    try {
+      await expect(api.passThrough({})).resolves.toBe("plain");
+      await expect(api.transform({})).resolves.toBe("wrapped:plain");
+    } finally {
+      destroy();
+      srv.destroy();
+    }
+  });
+
+  it("catch-fallback survives a synchronous downstream throw", async () => {
+    // A sync input schema failure or a sync-throwing handler throws before
+    // any downstream promise exists. next() must normalize that into a
+    // rejected promise so the settlement flag is still set — otherwise the
+    // middleware catches the error, answers with a fallback, and is then
+    // wrongly rejected as MIDDLEWARE.
+    const psk = randomBytes(32);
+    const { a, b } = createChannelPair();
+    const recoverMw = (async ({ next }: { next: () => Promise<unknown> }) => {
+      try {
+        return await next();
+      } catch {
+        return "fallback";
+      }
+    }) as never;
+    const router: Router = {
+      syncSchema: chain()
+        .use(recoverMw)
+        .input(z.object({ id: z.string() }))
+        .handler(async ({ input }) => (input as { id: string }).id),
+      syncHandler: chain()
+        .use(recoverMw)
+        .handler((() => {
+          throw new Error("sync-handler-boom");
+        }) as never),
+    };
+    const srv = server(router, a, { auth: { secret: () => psk } });
+    const { api, destroy } = client(b, {
+      auth: { secret: () => psk },
+      timeout: 1000,
+    });
+    try {
+      // Input validation throws synchronously inside next().
+      await expect(api.syncSchema({ id: 42 })).resolves.toBe("fallback");
+      // A sync (non-async) handler throwing does the same.
+      await expect(api.syncHandler({})).resolves.toBe("fallback");
+    } finally {
+      destroy();
+      srv.destroy();
+    }
+  });
+
+  it("middleware catching a downstream rejection and returning a fallback is accepted", async () => {
+    // Error-handling middleware: awaits next(), downstream rejects, the
+    // middleware swallows it and answers with its own value. The downstream
+    // HAS settled (rejected), so this remains a supported pattern.
+    const psk = randomBytes(32);
+    const { a, b } = createChannelPair();
+    const router: Router = {
+      recover: chain()
+        // Type-illegal on purpose (see transform above) — asserts runtime
+        // tolerance of the catch-fallback form.
+        .use((async ({ next }: { next: () => Promise<unknown> }) => {
+          try {
+            return await next();
+          } catch {
+            return "fallback";
+          }
+        }) as never)
+        .handler(async () => {
+          throw new Error("handler-boom");
+        }),
+    };
+    const srv = server(router, a, { auth: { secret: () => psk } });
+    const { api, destroy } = client(b, {
+      auth: { secret: () => psk },
+      timeout: 1000,
+    });
+    try {
+      await expect(api.recover({})).resolves.toBe("fallback");
+    } finally {
+      destroy();
+      srv.destroy();
+    }
+  });
+
   it("middleware-thrown RPCError is not masked as INTERNAL", async () => {
     const psk = randomBytes(32);
     const { a, b } = createChannelPair();

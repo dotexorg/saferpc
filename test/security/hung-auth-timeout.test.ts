@@ -17,6 +17,7 @@ import {
   type Router,
 } from "../../src/index.ts";
 import { createChannelPair } from "../helpers/channels.ts";
+import { forgeHello } from "../helpers/protocol.ts";
 
 type LooseApi = Record<
   string,
@@ -138,6 +139,67 @@ describe("handshakeTimeout bounds the async auth phase", () => {
     } finally {
       destroy();
       srv.destroy();
+    }
+  });
+
+  it("caps server attempts whose auth callbacks never settle", async () => {
+    const { a, b } = createChannelPair();
+    let secretCalls = 0;
+    const srv = server(router, a, {
+      auth: {
+        secret: () => {
+          secretCalls++;
+          return new Promise<Uint8Array>(() => {});
+        },
+      },
+      handshakeTimeout: 100,
+      maxPendingHandshakes: 2,
+    });
+
+    try {
+      await b.send(forgeHello());
+      await b.send(forgeHello());
+      await b.send(forgeHello());
+      await sleep(150);
+      expect(secretCalls).toBe(2);
+
+      // Timed-out attempts remain counted until their callbacks settle, so
+      // repeated hellos cannot accumulate an unbounded number of closures.
+      await b.send(forgeHello());
+      expect(secretCalls).toBe(2);
+    } finally {
+      srv.destroy();
+    }
+  });
+
+  it("does not start a second client auth callback while the first is hung", async () => {
+    const { a } = createChannelPair();
+    let signCalls = 0;
+    const { api, destroy } = client(a, {
+      auth: {
+        sign: () => {
+          signCalls++;
+          return new Promise<Uint8Array>(() => {});
+        },
+      },
+      handshakeTimeout: 100,
+      timeout: 300,
+    }) as unknown as { api: LooseApi; destroy: () => void };
+
+    try {
+      const first = api["ping"]!();
+      const firstResult = await first.catch((error: unknown) => error);
+      expect(firstResult).toBeInstanceOf(RPCError);
+      expect((firstResult as RPCError).code).toBe("HANDSHAKE");
+
+      const secondResult = await api["ping"]!().catch(
+        (error: unknown) => error,
+      );
+      expect(secondResult).toBeInstanceOf(RPCError);
+      expect((secondResult as RPCError).code).toBe("HANDSHAKE");
+      expect(signCalls).toBe(1);
+    } finally {
+      destroy();
     }
   });
 });

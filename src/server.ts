@@ -34,7 +34,8 @@ import {
   deriveSessionKey,
   computeProof,
   createEncryptor,
-  createDecryptor,
+  createAeadOpener,
+  decodePlaintext,
   validateAuthConfig,
   EMPTY_SECRET,
   buildHelloTranscript,
@@ -51,6 +52,7 @@ import {
 
 const MAX_ID_LEN = 64;
 const DEFAULT_REPLAY_WINDOW = 4096;
+const DEFAULT_MAX_PENDING_HANDSHAKES = 16;
 
 // ─── Server types ─────────────────────────────────────────
 
@@ -87,7 +89,20 @@ export interface ServerOptionsBase {
    * Default: 5000ms.
    */
   handshakeTimeout?: number;
+  /**
+   * Maximum full TAG_MSG frame size accepted inbound and emitted outbound.
+   * Oversized inbound frames are silently dropped; oversized responses are
+   * reported through `onError` and never handed to the channel. Default:
+   * 1 MiB.
+   */
   maxMessageBytes?: number;
+  /**
+   * Maximum number of handshake attempts whose async work has not settled.
+   * A timed-out attempt remains counted until its auth callback settles,
+   * because JavaScript cannot cancel an arbitrary Promise. New hellos are
+   * silently dropped at the cap. Default: 16.
+   */
+  maxPendingHandshakes?: number;
   /**
    * Size of the per-session replay window: how many recently-seen AEAD
    * nonces the server remembers so it can drop duplicate (replayed)
@@ -173,31 +188,116 @@ function execute(
       }
       case "m": {
         const mw = step.fn;
-        tip = function runMiddleware() {
+        tip = async function runMiddleware() {
           let called = false;
-          return mw({
-            ctx,
-            input,
-            next(extra?: Ctx) {
-              if (called) {
-                throw new RPCError(
-                  "MIDDLEWARE",
-                  "next() called more than once",
-                );
-              }
-              called = true;
-              if (extra !== undefined) {
-                if (typeof extra !== "object" || extra === null) {
+          let completed = false;
+          let downstreamSettled = false;
+          let result: unknown;
+          try {
+            // try/finally (not `.finally()` on the returned value) so that
+            // `completed` is set on EVERY exit: async settle, sync throw,
+            // and a sync non-promise return. Attaching `.finally()` to the
+            // return value would miss a synchronous throw — a late next()
+            // scheduled before the throw could then run the handler after
+            // the error response — and would TypeError on a sync middleware
+            // that returns a plain value after calling next().
+            result = await mw({
+              ctx,
+              input,
+              next(extra?: Ctx) {
+                // A continuation that arrives after the middleware has
+                // completed (settled, returned, or thrown) cannot be part of
+                // this request anymore. Ignore it rather than launching the
+                // handler after an error response.
+                if (completed) return Promise.resolve(undefined);
+                if (called) {
                   throw new RPCError(
                     "MIDDLEWARE",
-                    "next() extra must be an object",
+                    "next() called more than once",
                   );
                 }
-                ctx = Object.assign(Object.create(null), ctx, extra);
-              }
-              return next();
-            },
-          });
+                called = true;
+                if (extra !== undefined) {
+                  if (typeof extra !== "object" || extra === null) {
+                    throw new RPCError(
+                      "MIDDLEWARE",
+                      "next() extra must be an object",
+                    );
+                  }
+                  ctx = Object.assign(Object.create(null), ctx, extra);
+                }
+                // A synchronous throw from the downstream tip (sync input
+                // schema, sync handler) must become a rejected promise BEFORE
+                // the settlement observer is attached — otherwise no promise
+                // exists, the flag stays false, and a middleware that caught
+                // the throw and answered with a fallback would be rejected
+                // as MIDDLEWARE despite the downstream having fully finished.
+                let downstream: Promise<unknown>;
+                try {
+                  downstream = Promise.resolve(next());
+                } catch (error) {
+                  downstream = Promise.reject(error);
+                }
+                // Observe downstream settlement (fulfil OR reject) for two
+                // reasons. (1) The flag feeds the completion check below:
+                // a middleware that settles while its next() is still
+                // PENDING did a fire-and-forget — the client would receive
+                // the middleware's own value while the handler outcome is
+                // silently dropped — so the request is rejected (inspired by
+                // tRPC's return-next guard: "did you forget to `return
+                // next()`?"; tRPC enforces via a runtime envelope/marker,
+                // not settlement tracking). (2) The reaction observes a
+                // rejection, so a dropped downstream promise can never
+                // surface as an unhandledRejection and terminate the process.
+                // Attached before `downstream` is handed to the middleware,
+                // so the flag is set before any await on it resumes (promise
+                // reactions run FIFO) — a middleware that awaits/returns
+                // next() always passes the check deterministically. The
+                // enforced invariant is exactly "no reply while downstream
+                // is still pending": a fire-and-forget whose downstream
+                // happened to settle before the middleware completed is
+                // observationally identical to a catch-fallback and is
+                // tolerated — whether user code looked at the settled value
+                // is not detectable without a tRPC-style envelope API. The
+                // full "must return next()" contract is enforced at the
+                // type level (phantom MiddlewareResult, common.ts).
+                downstream.then(
+                  function markDownstreamSettled() {
+                    downstreamSettled = true;
+                  },
+                  function markDownstreamSettled() {
+                    downstreamSettled = true;
+                  },
+                );
+                return downstream;
+              },
+            });
+          } finally {
+            completed = true;
+          }
+          // Contract: middleware must call next() exactly once. A middleware
+          // that returns without calling next() would silently skip the
+          // handler while the client still receives a success reply — reject
+          // it instead of forwarding its return value.
+          if (!called) {
+            throw new RPCError(
+              "MIDDLEWARE",
+              "Middleware completed without calling next()",
+            );
+          }
+          // Contract: the downstream chain must have settled before the
+          // middleware itself completed — i.e. next() was awaited or
+          // returned. A fire-and-forget next() leaves the handler running
+          // detached while the client already received the middleware's own
+          // value; that pattern is not supported (the detached rejection is
+          // still observed above, so it cannot crash the process).
+          if (!downstreamSettled) {
+            throw new RPCError(
+              "MIDDLEWARE",
+              "Middleware completed before next() settled — return or await next()",
+            );
+          }
+          return result;
         };
         break;
       }
@@ -271,6 +371,18 @@ export function server(
   }
   const maxBytes =
     opts.maxMessageBytes !== undefined ? opts.maxMessageBytes : MAX_MSG_BYTES;
+  // Reject NaN/Infinity/non-integers outright: `data.length > NaN` is false
+  // for every length, which would silently disable the size limit.
+  if (!Number.isInteger(maxBytes) || maxBytes <= 0) {
+    throw new TypeError("server() maxMessageBytes must be an integer > 0");
+  }
+  const maxPendingHandshakes =
+    opts.maxPendingHandshakes !== undefined
+      ? opts.maxPendingHandshakes
+      : DEFAULT_MAX_PENDING_HANDSHAKES;
+  if (!Number.isInteger(maxPendingHandshakes) || maxPendingHandshakes <= 0) {
+    throw new TypeError("server() maxPendingHandshakes must be an integer > 0");
+  }
   const replayWindow =
     opts.replayWindow !== undefined ? opts.replayWindow : DEFAULT_REPLAY_WINDOW;
   if (
@@ -300,15 +412,22 @@ export function server(
   let epoch = 0;
   let attemptEpoch = 0;
   let candidateEpoch = 0;
+  // A timed-out auth callback cannot be cancelled. Keep its attempt counted
+  // until the callback settles, so a hello flood can retain only a bounded
+  // number of attempt closures. New hellos are dropped at the configured cap.
+  let pendingHandshakes = 0;
   // Server ephemeral keys are attempt-local (generated per hello inside the
   // handshake coroutine) and never held at module scope — a failed attempt
   // cannot corrupt an established session's state.
 
   // ── LIVE slot ── the confirmed session. Serves all traffic (encrypt out,
   // decrypt in). May be null before the first handshake completes.
+  // Decrypt slots hold AEAD-only openers (Poly1305 → plaintext); msgpack
+  // decoding happens separately in the TAG_MSG handler, AFTER promotion and
+  // nonce recording, so a junk inner payload cannot mask a proven key.
   let liveKey: Uint8Array | null = null;
   let liveEncrypt: ((data: unknown) => Uint8Array) | null = null;
-  let liveDecrypt: ((payload: Uint8Array) => unknown) | null = null;
+  let liveDecrypt: ((payload: Uint8Array) => Uint8Array) | null = null;
   // Verified auth data from auth.verify (server-only), bound to the live
   // session. Promoted from the candidate; cleared on teardown.
   let liveAuthData: Ctx | null = null;
@@ -319,13 +438,18 @@ export function server(
   // session — the live key is retired only when a frame decrypts under the
   // candidate (proof the counterparty holds the key material).
   let candidateKey: Uint8Array | null = null;
-  let candidateDecrypt: ((payload: Uint8Array) => unknown) | null = null;
+  let candidateDecrypt: ((payload: Uint8Array) => Uint8Array) | null = null;
   let candidateAuthData: Ctx | null = null;
 
   let destroyed = false;
   // Confirmation timer for the pending candidate. On expiry the candidate is
   // dropped; the live session (if any) is untouched.
   let candidateTimer: ReturnType<typeof setTimeout> | null = null;
+  // Absolute wall-clock deadline for the pending candidate (hello receipt +
+  // hsTimeout). The candidate timer is only a wakeup and may fire late if the
+  // loop was busy; the promotion path checks this deadline directly so an
+  // overdue confirming frame cannot promote an expired candidate.
+  let candidateDeadline = 0;
 
   // ── D2: bounded seen-nonce set (in-session replay defense) ────────
   // Ring buffer of the last `replayWindow` accepted nonce keys + a Set for
@@ -454,6 +578,8 @@ export function server(
     // its await guards without touching the session or the candidate.
     if (tag === TAG_HELLO) {
       if (data.length > MAX_HELLO_BYTES) return;
+      if (pendingHandshakes >= maxPendingHandshakes) return;
+      pendingHandshakes++;
 
       attemptEpoch++;
       const myAttempt = attemptEpoch;
@@ -467,10 +593,24 @@ export function server(
       // confirmation timer below, so hello → first-decrypted-frame is
       // bounded by ONE hsTimeout total.
       const attemptStart = Date.now();
+      // Absolute deadline twin of the timer below. The timer alone is not
+      // enough: a SYNCHRONOUS auth callback that blocks past the budget
+      // resumes as a microtask BEFORE the timer macrotask fires, so the
+      // `attemptExpired` flag is still false when the continuation runs.
+      // Every guard therefore also checks wall-clock time.
+      const attemptDeadline = attemptStart + hsTimeout;
       let attemptExpired = false;
+      // One attempt reports at most one onError. The attempt timer, the
+      // candidate timer, and the failure catch all gate on this flag so a
+      // timeout followed by a late async rejection (or reply-send failure)
+      // cannot emit two errors for the same handshake.
+      let reported = false;
+      const attemptDead = (): boolean =>
+        attemptExpired || Date.now() >= attemptDeadline;
       const attemptTimer = setTimeout(function onAttemptTimeout() {
         attemptExpired = true;
-        if (attemptEpoch !== myAttempt || destroyed) return;
+        if (attemptEpoch !== myAttempt || destroyed || reported) return;
+        reported = true;
         if (onError !== null) {
           onError(new RPCError("HANDSHAKE", "Handshake timeout"));
         }
@@ -544,7 +684,7 @@ export function server(
               nonce,
             );
             const verifyResult = await auth.verify(helloAuth, transcript);
-            if (attemptEpoch !== myAttempt || destroyed || attemptExpired) {
+            if (attemptEpoch !== myAttempt || destroyed || attemptDead()) {
               return;
             }
             if (verifyResult && typeof verifyResult === "object") {
@@ -570,7 +710,7 @@ export function server(
 
           const secretBytes =
             auth.secret !== undefined ? await auth.secret() : EMPTY_SECRET;
-          if (attemptEpoch !== myAttempt || destroyed || attemptExpired) {
+          if (attemptEpoch !== myAttempt || destroyed || attemptDead()) {
             return;
           }
 
@@ -609,7 +749,7 @@ export function server(
               myPub,
             );
             const signed = await auth.sign(replyTranscript);
-            if (attemptEpoch !== myAttempt || destroyed || attemptExpired) {
+            if (attemptEpoch !== myAttempt || destroyed || attemptDead()) {
               return;
             }
             if (
@@ -628,7 +768,7 @@ export function server(
           // FINAL install guard. The block below is fully synchronous: it
           // installs the newly-proven session as a CANDIDATE without racing a
           // newer attempt or a request.
-          if (attemptEpoch !== myAttempt || destroyed || attemptExpired) {
+          if (attemptEpoch !== myAttempt || destroyed || attemptDead()) {
             return;
           }
 
@@ -651,8 +791,12 @@ export function server(
           candidateEpoch++;
           candidateKey = localSessionKey;
           localSessionKey = null; // ownership transferred — skip finally zero
-          candidateDecrypt = createDecryptor(candidateKey);
+          candidateDecrypt = createAeadOpener(candidateKey);
           candidateAuthData = localAuthData;
+          // Absolute twin of the confirmation timer below: total budget is
+          // hello receipt + hsTimeout, so the candidate expires at the same
+          // wall-clock instant the timer is scheduled for.
+          candidateDeadline = attemptStart + hsTimeout;
 
           // Arm the confirmation timer for this candidate. On expiry the
           // candidate is dropped and the live session is untouched. Keyed on
@@ -663,6 +807,8 @@ export function server(
           candidateTimer = setTimeout(function onCandidateTimeout() {
             if (candidateEpoch !== myCandEpoch || destroyed) return;
             dropCandidate();
+            if (reported) return;
+            reported = true;
             if (onError !== null) {
               onError(new RPCError("HANDSHAKE", "Handshake timeout"));
             }
@@ -681,7 +827,26 @@ export function server(
           zero(localProof);
           localProof = null;
 
-          await channel.send(reply);
+          try {
+            await channel.send(reply);
+          } catch (sendErr: unknown) {
+            // The reply never reached the wire — this candidate can never be
+            // confirmed. Drop it NOW (if it is still ours) instead of letting
+            // it linger until the confirmation timer fires a second, spurious
+            // "Handshake timeout" on top of the send failure below.
+            if (candidateEpoch === myCandEpoch && !destroyed) {
+              dropCandidate();
+            }
+            // 4th argument: `cause` is constructor options, not `data` —
+            // the original error object rides err.cause per the protocol
+            // ("carrying the transport error as its cause").
+            throw new RPCError(
+              "HANDSHAKE",
+              "Handshake reply send failed",
+              undefined,
+              { cause: sendErr },
+            );
+          }
           if (candidateEpoch !== myCandEpoch || destroyed) return;
 
           // Timer continues running — waiting for first valid TAG_MSG that
@@ -698,18 +863,31 @@ export function server(
           zero(myPriv);
           zero(myPub);
         }
-      })().catch(function onHsError(err: unknown) {
-        // The attempt failed. Under D1 the live session (if any) was never
-        // touched, so there is nothing to reset — only report the failure.
-        if (attemptEpoch !== myAttempt || destroyed) return;
-        if (onError !== null) {
-          onError(
-            err instanceof RPCError
-              ? err
-              : new RPCError("HANDSHAKE", "Handshake failed"),
-          );
-        }
-      });
+      })()
+        .catch(function onHsError(err: unknown) {
+          // The attempt failed. Under D1 the live session (if any) was never
+          // touched, so there is nothing to reset — only report the failure.
+          if (attemptEpoch !== myAttempt || destroyed || reported) return;
+          reported = true;
+          if (onError !== null) {
+            onError(
+              err instanceof RPCError
+                ? err
+                : new RPCError("HANDSHAKE", "Handshake failed"),
+            );
+          }
+        })
+        .then(
+          function onHsSettled() {
+            pendingHandshakes--;
+          },
+          function onHsReportError() {
+            // An application onError callback is allowed to throw. The
+            // attempt slot must still be released without creating an
+            // unhandled rejection.
+            pendingHandshakes--;
+          },
+        );
       return;
     }
 
@@ -735,12 +913,14 @@ export function server(
         // Trial decrypt: LIVE first (steady-state cost = one decrypt), then
         // CANDIDATE. A frame that decrypts under the candidate is proof the
         // counterparty holds the key material — the authority required to
-        // retire the live session (make-before-break).
-        let raw: unknown = undefined;
+        // retire the live session (make-before-break). AEAD verification
+        // ONLY — the inner payload is decoded later, so a junk payload under
+        // a proven key still promotes and still lands in the replay window.
+        let plain: Uint8Array | null = null;
         let decryptedUnder: "live" | "candidate" | null = null;
         if (liveDecrypt !== null) {
           try {
-            raw = liveDecrypt(data);
+            plain = liveDecrypt(data);
             decryptedUnder = "live";
           } catch {
             /* fall through to candidate */
@@ -748,32 +928,70 @@ export function server(
         }
         if (decryptedUnder === null && candidateDecrypt !== null) {
           try {
-            raw = candidateDecrypt(data);
+            plain = candidateDecrypt(data);
             decryptedUnder = "candidate";
           } catch {
             /* neither key */
           }
         }
-        if (decryptedUnder === null) {
+        if (decryptedUnder === null || plain === null) {
           return; // poly1305 failure → silently drop (nonce NOT recorded)
         }
 
         // Promotion advances `epoch`; capture reqEpoch AFTER it so the reply
         // to THIS confirming frame survives the response guard below. The
         // confirming frame is not an in-flight leftover — it is the promoter.
-        if (decryptedUnder === "candidate") promoteCandidate();
+        if (decryptedUnder === "candidate") {
+          // Absolute-deadline check: the candidate timer is only a wakeup and
+          // may fire late if the loop was busy past the budget. If this
+          // confirming frame arrives after the candidate expired, do NOT
+          // promote — leave the (now overdue) candidate timer to drop it and
+          // report the timeout. The nonce is not recorded and the handler is
+          // not run, so an expired candidate cannot execute a request.
+          if (Date.now() >= candidateDeadline) return;
+          promoteCandidate();
+        }
         const reqEpoch = epoch;
 
-        // Poly1305 verified — record the nonce in the (now-current) live
-        // window so a later duplicate of this exact frame is rejected.
-        // Synchronous (runs before any await), so back-to-back duplicates
-        // cannot both slip through.
-        if (nKey !== null) seenAdd(nKey);
+        // Decode the authenticated plaintext. A malformed inner payload is
+        // dropped silently — the session promotion above stands: the key was
+        // proven by Poly1305, not by the payload's shape (spec § Step 4).
+        // It still consumes a replay-window slot: otherwise an attacker who
+        // has obtained one authenticated malformed frame can make the server
+        // repeat decode/sanitize work indefinitely without the normal replay
+        // bound. This happens before any await, so duplicate delivery cannot
+        // race the membership check at the channel boundary.
+        let raw: unknown;
+        try {
+          raw = decodePlaintext(plain);
+        } catch {
+          if (nKey !== null) seenAdd(nKey);
+          return;
+        }
 
-        if (typeof raw !== "object" || raw === null) return;
+        if (typeof raw !== "object" || raw === null) {
+          if (nKey !== null) seenAdd(nKey);
+          return;
+        }
         const msg = raw as Record<string, unknown>;
 
-        if (msg["t"] !== 1) return;
+        // Direction guard: t === 1 marks a REQUEST. Both directions share one
+        // session key, so a genuine server RESPONSE reflected back to the
+        // server also passes Poly1305 — dropping it BEFORE recording its
+        // nonce keeps opposite-direction frames from consuming replay-window
+        // slots (which would shrink the effective window against real
+        // request replays). Other authenticated malformed envelopes consume
+        // their nonce even though they are not dispatched.
+        if (msg["t"] !== 1) {
+          if (msg["t"] !== 2 && nKey !== null) seenAdd(nKey);
+          return;
+        }
+
+        // Request-direction frame, Poly1305-verified — record its nonce in
+        // the (now-current) live window so a later duplicate is rejected.
+        // Still synchronous (no await since decrypt), so back-to-back
+        // duplicates cannot both slip through.
+        if (nKey !== null) seenAdd(nKey);
         const rawId = msg["id"];
         if (
           typeof rawId !== "string" ||
@@ -848,7 +1066,21 @@ export function server(
 
         const enc = liveEncrypt;
         if (enc === null) return;
-        await channel.send(enc(res));
+        const encrypted = enc(res);
+        if (encrypted.length > maxBytes) {
+          // The response is local until handed to the adapter. Never emit an
+          // oversized frame that the peer is required to drop; otherwise a
+          // large handler result turns into an opaque client timeout and also
+          // defeats the server-side framing bound on outbound traffic.
+          zero(encrypted);
+          if (onError !== null) {
+            onError(
+              new RPCError("INVALID_DATA", "Response exceeds maxMessageBytes"),
+            );
+          }
+          return;
+        }
+        await channel.send(encrypted);
       })().catch(function onSendError(err: unknown) {
         if (onError !== null) onError(err);
       });

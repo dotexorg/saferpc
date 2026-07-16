@@ -22,7 +22,7 @@ npm install @dotex/saferpc
 - **Typed procedures** with Zod input/output validation
 - **End-to-end encryption.** X25519 ECDH, XSalsa20-Poly1305 AEAD, HKDF-SHA-256, with forward secrecy by design
 - **Lazy handshake** on the first call. Lazy re-handshake on the next call when the session drops — failures surface with a typed code, never silently resent
-- **Three auth modes:** pre-shared secret, asymmetric (Ed25519 / ECDSA / JWT / cert / multifactor), or both for defense-in-depth
+- **Three auth modes:** pre-shared secret, asymmetric (Ed25519 / ECDSA / JWT), or both for defense-in-depth
 - **Synchronous** `client()` and `server()`. Runs in Node.js, browsers, Service Workers, React Native, Vercel Edge, Cloudflare Workers, Deno Deploy
 - **Tiny surface.** `@noble/*` crypto, `@msgpack/msgpack`, `zod`, and nothing else
 - **Pure ESM + CJS dual build**, side-effect-free, tree-shakeable
@@ -102,7 +102,7 @@ auth: {
 }
 ```
 
-Built-in helpers cover Ed25519, ECDSA P-256, JWT, certificate-based, and multifactor auth. All bind their proof to the handshake transcript, so a captured payload cannot be replayed into a new session. The full threat model lives in [spec/security.md](./spec/security.md).
+Built-in helpers cover Ed25519, ECDSA P-256, and JWT auth. All bind their proof to the handshake transcript, so a captured payload cannot be replayed into a new session. Certificate-based and multi-factor schemes are composed from `sign`/`verify` directly — recipes and the full threat model live in [spec/security.md](./spec/security.md).
 
 ## Errors
 
@@ -137,7 +137,7 @@ src/
   auth/
     index.ts      : combined re-exports (deriveSessionSecret + client + server)
     client.ts     : Ed25519, ECDSA, JWT client helpers
-    server.ts     : Ed25519, ECDSA, JWT, certificate, multifactor server helpers
+    server.ts     : Ed25519, ECDSA, JWT server helpers
   index.ts        : public entry point
 ```
 
@@ -158,7 +158,7 @@ import { createEd25519ServerAuth } from "@dotex/saferpc/auth/server";
 
 ## Compatibility
 
-Node.js 18+, modern browsers, Service / Web / Shared Workers, React Native, Vercel Edge, Cloudflare Workers, Deno Deploy. WebCrypto is required only for the ECDSA and certificate helpers.
+Node.js 20.19+ (the `@noble/*` dependencies require `>=20.19.0`; older 18.x / 20.18 fail to load the ESM-only crypto packages under CommonJS), modern browsers, Service / Web / Shared Workers, React Native, Vercel Edge, Cloudflare Workers, Deno Deploy. WebCrypto is required only for the ECDSA helpers.
 
 ## Project status
 
@@ -166,13 +166,14 @@ Node.js 18+, modern browsers, Service / Web / Shared Workers, React Native, Verc
 
 ## Releasing
 
-One command bumps the version, publishes to npm, and pushes the tag:
+Two commands: bump the version, then publish (which also pushes the tag):
 
 ```bash
 npm version patch    # or: minor / major / 1.2.3-beta.0
+npm publish
 ```
 
-`prepublishOnly` runs lint, tests, and build before publishing. The `postversion` hook then runs `npm publish && git push --follow-tags`. The pushed `vX.Y.Z` tag triggers `.github/workflows/release.yml`, which verifies the version is live on npm and creates a GitHub Release with auto-generated changelog notes since the previous tag.
+The `version` hook syncs and stages `jsr.json` into the version commit. `prepublishOnly` runs lint, tests, and build before publishing; `postpublish` runs `git push --follow-tags`. The pushed `vX.Y.Z` tag triggers `.github/workflows/release.yml`, which verifies the version is live on npm and creates a GitHub Release with auto-generated changelog notes since the previous tag.
 
 If `npm publish` fails, the tag exists locally but is not pushed. Fix the issue and re-run `npm publish && git push --follow-tags`. To abort, run `git tag -d vX.Y.Z && git reset --hard HEAD~1`.
 

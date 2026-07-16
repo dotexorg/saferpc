@@ -26,7 +26,7 @@ The `auth` callbacks close that gap by binding the ephemeral keys to something t
 - **`secret`** mixes a pre-shared 32-byte value into HKDF as the salt (see [Protocol § Key derivation](protocol.md#key-derivation)). A peer without the secret derives a different `session_key`, and the HMAC proof in the reply fails to verify.
 - **`sign` / `verify`** signs the [hello/reply transcript](#transcript-format) with a long-term key the peer can verify. The transcript covers the epoch and both ephemeral public keys, so a signature captured from one handshake will not validate in another.
 
-Without one of those configured, `client()` / `server()` throws a `TypeError` at construction. There is no anonymous fallback, and a `secret()` callback that returns 32 zero bytes is also rejected at runtime — a typo cannot silently downgrade an intended PSK deployment into asymmetric-only mode.
+Without one of those configured, `client()` / `server()` throws a `TypeError` at construction. There is no anonymous fallback, and a `secret()` callback that returns all-zero bytes of any length is also rejected at runtime — a typo cannot silently downgrade an intended PSK deployment into asymmetric-only mode.
 
 ### Transport encryption is not a substitute
 
@@ -158,9 +158,11 @@ For the full wire layout of the frames that carry these signatures, see [Protoco
 
 ## Auth processing order
 
-Auth runs **before** any session key is materialized, so a failed verification never leaks ECDH artifacts. Step-by-step in [Protocol § Handshake](protocol.md#handshake).
+Client-auth **verification** (the server's `verify` callback) runs **before** ECDH and key derivation, so a failed verification never materializes session-key state and never leaks ECDH artifacts. The server's **`sign`** step runs _after_ key derivation in the normative step order (step 9; the reply transcript binds both ephemeral pubs, the client nonce, and the epoch), but a failed `sign` publishes nothing: no candidate is installed and no reply is sent. Step-by-step in [Protocol § Handshake](protocol.md#handshake).
 
-A throw at any auth step rejects the handshake. The client resets to `idle`, the server resets to `waiting`. Failed verification never silently downgrades into an unauthenticated session.
+A throw at any auth step rejects the handshake **attempt**. On the client a failed attempt returns to `idle`. On the server, under make-before-break, only the attempt is discarded — an established live session is never disturbed by a failed attempt and keeps serving. Failed verification never silently downgrades into an unauthenticated session.
+
+Auth callbacks are application-owned Promises and cannot be forcibly cancelled by the library. The server therefore bounds unsettled attempts with `maxPendingHandshakes` (default 16); timed-out attempts retain a slot until their callback settles, and hellos at the cap are silently dropped. The client retains one timed-out unsettled handshake operation and rejects a new attempt until it settles, preventing repeated retries from accumulating closures.
 
 ## Ephemeral key validity
 
@@ -201,9 +203,10 @@ auth: { secret: () => new TextEncoder().encode("secret123") }
 auth: { secret: () => deriveSessionSecret("user-123", secret) }
 
 // ❌ All-zero or weak derivation material: no security at all.
-// Safe RPC refuses an all-zero secret at runtime: `HANDSHAKE` is thrown with
-// "Application returned an all-zero secret" so this mistake fails loudly
-// instead of silently degrading into the asymmetric-only mode.
+// `deriveSessionSecret` rejects all-zero input material outright, and the
+// handshake refuses an all-zero secret of ANY length at runtime ("Application
+// returned an all-zero secret") — either way this mistake fails loudly instead
+// of silently degrading into the asymmetric-only mode.
 auth: { secret: () => deriveSessionSecret(sessionId, new Uint8Array(32)) }
 
 // ❌ Secret material in client-side bundle
@@ -232,15 +235,22 @@ Against a random 32-byte key this is 2²⁵⁶ work — infeasible. Against a pa
 // ✅ Real random key from a CSPRNG
 import { randomBytes } from "@noble/ciphers/utils.js";
 const key = randomBytes(32);
-auth: { secret: () => key }
+auth: {
+  secret: () => key;
+}
 
 // ❌ Password / passphrase used directly — offline-bruteforceable via the proof
-auth: { secret: () => new TextEncoder().encode("correct horse battery staple") }
+auth: {
+  secret: () => new TextEncoder().encode("correct horse battery staple");
+}
 
 // ⚠️ If you MUST start from a human password, stretch it with a slow KDF first
 //     (scrypt / argon2) — this raises the per-guess cost but does not make a
 //     weak password strong; prefer a real random key wherever possible.
-auth: { secret: async () => await scrypt(password, salt, { N: 2**17, r: 8, p: 1, dkLen: 32 }) }
+auth: {
+  secret: async () =>
+    await scrypt(password, salt, { N: 2 ** 17, r: 8, p: 1, dkLen: 32 });
+}
 ```
 
 ## Built-in signature helpers
@@ -255,8 +265,6 @@ import {
   createECDSAServerAuth,
   createJWTClientAuth,
   createJWTServerAuth,
-  createCertificateServerAuth,
-  createMultifactorServerAuth,
   generateEd25519Keypair,
   generateECDSAKeypair,
 } from "@dotex/saferpc";
@@ -317,36 +325,20 @@ The JWT helper does **not** sign the transcript. JWTs are bearer tokens. Instead
 
 The transcript digest prevents replay of a captured auth payload into a different handshake — the digest was computed over the old transcript and will not match the new one. It does **not** prevent an attacker who has obtained the JWT itself from mounting a fresh handshake with their own ephemeral key and recomputing the digest. JWTs are bearer credentials: anyone holding one can authenticate until it expires. Combine with PSK or a real signature mode when this matters.
 
-### Certificate-based
+**The token is wire-visible.** The hello frame is not yet encrypted — it carries the ephemeral public key that establishes the session — so the JWT rides it in cleartext. A passive observer of the transport (already in scope in the threat model above) reads the token directly off the opening frame; obtaining it does not require any out-of-band access. JWT-only mode therefore assumes a **confidential transport** (TLS / DTLS) or a second factor (PSK or a signature mode). Over an untrusted transport the token is disclosed on every handshake. Signature modes (`ed25519` / `ecdsa`) do not have this property: their payload is a signature over the transcript, not a reusable secret.
 
-```typescript
-const serverAuth = createCertificateServerAuth({
-  verifyCertificate: async (certBytes) => {
-    return { subject, publicKey }; // your chain verification
-  },
-});
-```
+### Custom schemes (certificates, multiple factors)
 
-The client embeds `{ cert, sig }` where `sig` is an ECDSA P-256 signature over the transcript using the cert's key.
+There are no built-in helpers for certificate-based or multi-factor auth: in both cases the security-critical logic (chain verification; asserting that all factors resolve to the _same_ principal) depends on application knowledge the library does not have, so a generic helper would only wrap the trivial part while its name suggested it handles the hard part. Implement `sign`/`verify` directly instead:
 
-### Multifactor
-
-Compose two verifiers. Both must pass.
-
-```typescript
-const serverAuth = createMultifactorServerAuth({
-  primary: createEd25519ServerAuth({ getPublicKey: ... }),
-  secondary: createJWTServerAuth({ verifyToken: ... }),
-});
-```
-
-The client embeds `{ primary, secondary }`: two pre-encoded sub-payloads.
+- **Certificates** — client `sign` returns an encoded `{ cert, sig }` where `sig` is a signature over the transcript with the cert's key; server `verify` runs your chain verification, then checks the signature (the checking step is exactly what `createECDSAServerAuth` does — reuse it for the signature half if the key is P-256).
+- **Multiple factors** — client `sign` encodes both sub-proofs; server `verify` decodes them, runs each sub-verifier against the same transcript, and **must reject unless both factors resolve to the same principal** (e.g. the JWT's `sub` owns the signing `deviceId` per your own store). Only then combine them into one explicit principal. Never merge two independently verified principals blindly: a stolen bearer token plus the attacker's _own_ validly registered second factor would otherwise pass as "multi-factor" for the victim's identity.
 
 ## Replay within a session
 
 Safe RPC uses random 24-byte nonces (not counters) for XSalsa20-Poly1305. The collision probability is negligible. A captured ciphertext could otherwise be replayed by an attacker who can inject into a live channel, and the replayed message would decrypt and execute again.
 
-As of 0.7.0 the server keeps a **bounded seen-nonce set** per session (`replayWindow`, default 4096): it records the nonce of every frame that passes Poly1305 and silently drops any later frame carrying a nonce it has already seen. This closes the replay window for the last `replayWindow` messages of a session, with no wire change and no ordering requirement (so lossy / reordering transports stay supported). The set is cleared on every re-handshake, and only the server needs it — the client already matches responses to a monotonic request `id` that is never reused.
+As of 0.7.0 the server keeps a **bounded seen-nonce set** per session (`replayWindow`, default 4096): after Poly1305 verification it records malformed envelopes and request frames, then silently drops later duplicates. Reflected response frames (`t: 2`) are dropped without consuming request replay-window capacity. This closes the replay window for the last `replayWindow` request-side messages of a session, with no wire change and no ordering requirement (so lossy / reordering transports stay supported). The set is cleared on every re-handshake, and only the server needs it — the client already matches responses to a monotonic request `id` that is never reused.
 
 The window is **narrowed to N, not closed**: a replay older than the last `replayWindow` accepted messages still executes. For non-idempotent operations on long-lived sessions, still add an idempotency key inside the procedure input, or keep a request-ID set keyed by the verified principal. Set `replayWindow: 0` to disable the defense. Counter-based nonces would close the window fully but require strict transport ordering and directional keys (keystream reuse otherwise on the single shared key); that is deferred to a future protocol version.
 
@@ -360,7 +352,7 @@ auth: {
 }
 ```
 
-**Mobile app ↔ backend:** device certificates or platform attestation.
+**Mobile app ↔ backend:** device keys (`createEd25519ClientAuth` / `createECDSAClientAuth`) or platform attestation.
 
 ```typescript
 auth: {
@@ -385,6 +377,12 @@ auth: {
   verify: (p, t) => verifyWithPKI(p, t),
 }
 ```
+
+### Authentication is directional
+
+`sign` / `verify` authenticate one direction at a time, and the examples above (client `sign`, server `verify`) are **one-directional**: they prove the _client's_ identity to the server. They do **not** prove the _server's_ identity to the client — a client configured with only `sign` learns nothing about the peer beyond "it completed the key exchange". Under an empty secret the reply proof only demonstrates that the peer derived the same session key, which any endpoint reachable on the wire can do; a client with a real device key will therefore complete a handshake with any server that accepts it.
+
+For **mutual** authentication configure both directions — the server also `sign`s and the client also `verify`s (as in the high-security block above) — or bind both peers to a shared `secret` (PSK), which authenticates symmetrically. Choose one-directional only when the unauthenticated side is genuinely untrusted (a public server serving anonymous clients, for instance).
 
 ## Constants and limits
 

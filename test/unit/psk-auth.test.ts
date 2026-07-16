@@ -53,6 +53,18 @@ describe("deriveSessionSecret", () => {
     expect(() => deriveSessionSecret("", randomBytes(32))).toThrow(TypeError);
   });
 
+  it("rejects all-zero secret material (#8)", () => {
+    // HKDF of zeros is non-zero, so the runtime empty-secret guard cannot
+    // catch it downstream — reject the zero input here, as the security
+    // guide documents.
+    expect(() => deriveSessionSecret("s", new Uint8Array(32))).toThrow(
+      TypeError,
+    );
+    expect(() => deriveSessionSecret("s", new Uint8Array(64))).toThrow(
+      TypeError,
+    );
+  });
+
   it("rejects a non-string sessionId", () => {
     expect(() =>
       // @ts-expect-error — deliberately bad shape
@@ -103,10 +115,20 @@ describe("isEmptySecret", () => {
     expect(isEmptySecret(buf)).toBe(false);
   });
 
-  it("returns false for wrong-length buffers regardless of contents", () => {
-    expect(isEmptySecret(new Uint8Array(0))).toBe(false);
-    expect(isEmptySecret(new Uint8Array(16))).toBe(false);
-    expect(isEmptySecret(new Uint8Array(64))).toBe(false);
+  it("returns true for an all-zero buffer of any length", () => {
+    // An all-zero secret is empty regardless of size — a caller returning
+    // zeros must fail loudly, not slip through on a non-32 length.
+    expect(isEmptySecret(new Uint8Array(0))).toBe(true);
+    expect(isEmptySecret(new Uint8Array(16))).toBe(true);
+    expect(isEmptySecret(new Uint8Array(33))).toBe(true);
+    expect(isEmptySecret(new Uint8Array(64))).toBe(true);
+    expect(isEmptySecret(new Uint8Array(65))).toBe(true);
+  });
+
+  it("returns false for a non-zero buffer of a non-32 length", () => {
+    const buf = new Uint8Array(64);
+    buf[40] = 1;
+    expect(isEmptySecret(buf)).toBe(false);
   });
 });
 

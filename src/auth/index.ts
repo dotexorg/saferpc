@@ -28,11 +28,7 @@ export {
   createJWTServerAuth,
   createEd25519ServerAuth,
   createECDSAServerAuth,
-  createCertificateServerAuth,
-  createMultifactorServerAuth,
   type JWTServerConfig,
   type Ed25519ServerConfig,
   type ECDSAServerConfig,
-  type CertificateServerConfig,
-  type MultifactorServerConfig,
 } from "./server.ts";

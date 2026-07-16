@@ -64,6 +64,15 @@ describe("saferpc() — runtime shape", () => {
     expect(() => rpc.router("nope" as unknown as Router)).toThrow(TypeError);
   });
 
+  it('rpc.router() rejects the reserved route name "then"', () => {
+    // The client proxy hides `then` so it never looks thenable to `await`;
+    // a route by that name would be typed but uncallable. Reserved at
+    // creation instead.
+    expect(() => rpc.router({ then: greet } as unknown as Router)).toThrow(
+      /reserved/,
+    );
+  });
+
   it("rpc.middleware() returns the function and rejects non-functions", () => {
     const fn = async ({ next }: { next: () => Promise<never> }) => next();
     expect(rpc.middleware(fn as never)).toBe(fn);

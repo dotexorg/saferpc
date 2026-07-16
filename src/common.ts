@@ -23,6 +23,11 @@ export { concatBytes } from "@noble/ciphers/utils.js";
 
 export const NONCE_LEN = 24;
 export const KEY_LEN = 32;
+// msgpack `useBigInt64` encodes a bigint as int64 (down to -2^63) or uint64
+// (up to 2^64-1). Anything outside that range silently wraps, so the sanitizer
+// rejects it up front instead of shipping a changed value.
+export const BIGINT_MIN: bigint = -(2n ** 63n);
+export const BIGINT_MAX: bigint = 2n ** 64n - 1n;
 export const TAG_HELLO = 0x00;
 export const TAG_MSG = 0x01;
 export const MAX_MSG_BYTES = 1_048_576;
@@ -62,15 +67,15 @@ const TRANSCRIPT_REPLY_MAGIC = new TextEncoder().encode(
 );
 
 /**
- * Hardened ExtensionCodec — rejects ALL msgpack extension types including
- * the built-in Timestamp (type -1). This prevents type-confusion attacks
- * where a malicious payload uses ext types to inject Date / Map / Set /
- * other non-plain host objects that would surprise handlers.
+ * Hardened msgpack extension handling. The built-in Timestamp extension
+ * (type -1) is explicitly rejected by the codec; any other unregistered
+ * extension decodes as ExtData and is rejected by the full sanitize() gate.
+ * This prevents type-confusion attacks where a malicious payload uses ext
+ * types to inject Date / Map / Set / other non-plain host objects that would
+ * surprise handlers.
  *
  * Implementation: msgpack-javascript hard-codes the Timestamp decoder, so
  * we explicitly register a throwing decoder for type -1 to override it.
- * Unregistered ext types bypass our codec and surface as ExtData; sanitize()
- * rejects those via its non-plain-object check.
  */
 const SAFE_CODEC = new ExtensionCodec();
 SAFE_CODEC.register({
@@ -127,14 +132,17 @@ export function toPlainBytes(v: Uint8Array): Uint8Array {
 }
 
 /**
- * Constant-time check that a buffer is the protocol's "no secret" sentinel:
- * 32 zero bytes. Returns false for any other length. Safe RPC's internal flow
- * uses `EMPTY_SECRET` as the HKDF salt when `auth.secret` is absent — but if a
- * user-provided `secret()` returns 32 zeros (e.g. `new Uint8Array(32)`), the
- * resulting session has no secret authentication. Refuse it at runtime.
+ * Constant-time check for an all-zero secret. `EMPTY_SECRET` is the protocol's
+ * 32-byte "no secret" sentinel, but a configured secret of any all-zero length
+ * would likewise provide no secret authentication. Refuse it at runtime.
  */
 export function isEmptySecret(buf: Uint8Array): boolean {
-  if (buf.length !== KEY_LEN) return false;
+  // An all-zero secret of ANY length is treated as empty. A caller that
+  // returns zeros (forgot to set the secret, or derived it from all-zero
+  // material) must fail loudly rather than silently degrade to asymmetric-only
+  // mode. The earlier guard only inspected exactly KEY_LEN bytes, so 33 / 64 /
+  // 65 zero bytes slipped through.
+  if (buf.length === 0) return true;
   let acc = 0;
   for (let i = 0; i < buf.length; i++) acc |= buf[i]!;
   return acc === 0;
@@ -143,35 +151,73 @@ export function isEmptySecret(buf: Uint8Array): boolean {
 const POISON = new Set(["__proto__", "constructor", "prototype"]);
 
 export function sanitize(v: unknown, depth: number = 0): unknown {
+  return sanitizeValue(v, depth, new WeakSet<object>());
+}
+
+function sanitizeValue(
+  v: unknown,
+  depth: number,
+  active: WeakSet<object>,
+): unknown {
   if (depth > MAX_DEPTH) {
     throw new RPCError("INVALID_DATA", "Max nesting depth exceeded");
   }
   if (v === null || v === undefined) return v;
+  if (typeof v === "function" || typeof v === "symbol") {
+    throw new RPCError("INVALID_DATA", "Unsupported value type");
+  }
+  if (typeof v === "bigint") {
+    if (v < BIGINT_MIN || v > BIGINT_MAX) {
+      throw new RPCError(
+        "INVALID_DATA",
+        "BigInt out of encodable range (-2^63 .. 2^64-1)",
+      );
+    }
+    return v;
+  }
   if (typeof v !== "object") return v;
   if (v instanceof Uint8Array) return v;
-  if (Array.isArray(v)) {
-    const out: unknown[] = [];
-    for (let i = 0; i < v.length; i++) {
-      out[i] = sanitize(v[i], depth + 1);
+  if (active.has(v)) {
+    throw new RPCError("INVALID_DATA", "Cyclic data rejected");
+  }
+  active.add(v);
+  try {
+    if (Array.isArray(v)) {
+      const out: unknown[] = [];
+      for (let i = 0; i < v.length; i++) {
+        out[i] = sanitizeValue(v[i], depth + 1, active);
+      }
+      return out;
+    }
+    // Reject non-plain objects (Date, Map, Set, ExtData, etc.). Any object
+    // whose prototype is neither Object.prototype nor null is suspicious —
+    // it likely came in via a msgpack ext type or a JS host object that
+    // could surprise downstream handlers.
+    const proto = Object.getPrototypeOf(v);
+    if (proto !== Object.prototype && proto !== null) {
+      throw new RPCError("INVALID_DATA", "Non-plain object rejected");
+    }
+    const out: Record<string, unknown> = Object.create(null);
+    const keys = Object.keys(v as Record<string, unknown>);
+    for (let i = 0; i < keys.length; i++) {
+      const k = keys[i]!;
+      if (POISON.has(k)) continue;
+      const sv = sanitizeValue(
+        (v as Record<string, unknown>)[k],
+        depth + 1,
+        active,
+      );
+      // Drop undefined-valued keys so a nested `undefined` matches the
+      // top-level omission semantics. Otherwise msgpack encodes it as nil,
+      // which decodes to null on the peer and fails a `.optional()`
+      // (non-nullable) schema field the inferred type says should be absent.
+      if (sv === undefined) continue;
+      out[k] = sv;
     }
     return out;
+  } finally {
+    active.delete(v);
   }
-  // Reject non-plain objects (Date, Map, Set, ExtData, etc.). Any object
-  // whose prototype is neither Object.prototype nor null is suspicious —
-  // it likely came in via a msgpack ext type or a JS host object that
-  // could surprise downstream handlers.
-  const proto = Object.getPrototypeOf(v);
-  if (proto !== Object.prototype && proto !== null) {
-    throw new RPCError("INVALID_DATA", "Non-plain object rejected");
-  }
-  const out: Record<string, unknown> = Object.create(null);
-  const keys = Object.keys(v as Record<string, unknown>);
-  for (let i = 0; i < keys.length; i++) {
-    const k = keys[i]!;
-    if (POISON.has(k)) continue;
-    out[k] = sanitize((v as Record<string, unknown>)[k], depth + 1);
-  }
-  return out;
 }
 
 // ─── Safe msgpack wrappers ──────────────────────────────
@@ -223,6 +269,14 @@ export function deriveSessionSecret(
   if (!(secret instanceof Uint8Array) || secret.length < KEY_LEN) {
     throw new TypeError(`secret must be at least ${KEY_LEN} bytes`);
   }
+  // All-zero input material derives to a non-zero but publicly reproducible
+  // key that the empty-secret runtime guard cannot catch (it inspects the
+  // derived output, which HKDF makes non-zero). Reject it here so
+  // `deriveSessionSecret(id, new Uint8Array(32))` fails loudly, as the
+  // security guide documents.
+  if (isEmptySecret(secret)) {
+    throw new TypeError("secret must not be all-zero");
+  }
   const sessionBytes = new TextEncoder().encode(sessionId);
   const info = new TextEncoder().encode("saferpc-session-v1");
   return hkdf(sha256, secret, sessionBytes, info, KEY_LEN);
@@ -246,23 +300,47 @@ export function createEncryptor(
   };
 }
 
-export function createDecryptor(
+/**
+ * AEAD-only opener: verifies Poly1305 and returns the raw plaintext.
+ * Throws ONLY on authentication failure — the plaintext is returned as-is,
+ * without msgpack decoding. This split matters on the server: successful
+ * AEAD verification under a candidate key is the proof that promotes the
+ * candidate (make-before-break), regardless of whether the inner payload
+ * is a well-formed RPC message. Decode failures are a separate, later step
+ * (`decodePlaintext`) and must not be conflated with crypto failures.
+ */
+export function createAeadOpener(
   sessionKey: Uint8Array,
-): (payload: Uint8Array) => unknown {
-  return function decrypt(payload: Uint8Array): unknown {
+): (payload: Uint8Array) => Uint8Array {
+  return function open(payload: Uint8Array): Uint8Array {
     const nonce = payload.slice(1, 1 + NONCE_LEN);
     const ct = payload.slice(1 + NONCE_LEN);
     const cipher = xsalsa20poly1305(sessionKey, nonce);
     const encoded = cipher.decrypt(ct);
-    const data = mpDecode(encoded);
-    // NOTE: msgpack-javascript v3 returns Uint8Array (bin) fields as
-    // zero-copy views into `encoded`. Zeroing `encoded` or `payload` here
-    // would clobber any binary field on the returned object. The plaintext
-    // remains in the caller's hands; callers that need stricter memory
-    // hygiene should sanitize and zero their own buffers after use.
     zero(nonce);
     zero(ct);
-    return sanitize(data);
+    return encoded;
+  };
+}
+
+/**
+ * Decode + sanitize an already-authenticated plaintext.
+ * NOTE: msgpack-javascript v3 returns Uint8Array (bin) fields as
+ * zero-copy views into the plaintext buffer. Zeroing it here would
+ * clobber any binary field on the returned object. The plaintext
+ * remains in the caller's hands; callers that need stricter memory
+ * hygiene should sanitize and zero their own buffers after use.
+ */
+export function decodePlaintext(encoded: Uint8Array): unknown {
+  return sanitize(mpDecode(encoded));
+}
+
+export function createDecryptor(
+  sessionKey: Uint8Array,
+): (payload: Uint8Array) => unknown {
+  const open = createAeadOpener(sessionKey);
+  return function decrypt(payload: Uint8Array): unknown {
+    return decodePlaintext(open(payload));
   };
 }
 
@@ -491,8 +569,10 @@ export type RouterContext<T extends Router> = UnionToIntersection<
  * boundary. A channel SHOULD try to stay available (reopen its transport
  * eagerly when it dies, hold it open as long as possible) — availability
  * is the channel's job, delivery bookkeeping is the core's. An async
- * `send` must reject, never resolve-then-error: a resolved promise is
- * counted as "frame left the process" and is never resent by any layer.
+ * `send` must reject, never resolve-then-error: the core counts the frame
+ * as sent at handoff (a pending promise may already be on the wire), and a
+ * rejection is the only proof that rolls it back to "never left" — a
+ * resolve-then-error would freeze a lost frame in the sent class forever.
  * Shipped reference implementations: `@dotex/saferpc/channels`
  * (`wsChannel`, `socketChannel`).
  */
@@ -760,12 +840,19 @@ export interface SafeRPC<TCtx = {}> extends ProcedureBuilder<
   unknown
 > {
   /**
-   * Assemble a router. An identity function at runtime; its job is to
-   * preserve each procedure's precise input/output types so
-   * `Client<typeof appRouter>` infers a typed call for every route.
-   * Equivalent to `{ ... } satisfies Router` — use whichever reads better.
+   * Assemble a router. An identity function at runtime (plus one reserved
+   * name); its job is to preserve each procedure's precise input/output
+   * types so `Client<typeof appRouter>` infers a typed call for every
+   * route. Equivalent to `{ ... } satisfies Router` — use whichever reads
+   * better.
+   *
+   * The route name `then` is **reserved** (JS-specific): the generated
+   * client is a Proxy that must not look thenable — if `client.then` were
+   * a function, `await client` (and every Promise-assimilation point)
+   * would call it, so a `then` route could never be invoked. Rejected here
+   * at creation instead of failing silently at call time.
    */
-  router<R extends Router>(routes: R): R;
+  router<R extends Router>(routes: R & { then?: never }): R;
 
   /**
    * Author a reusable middleware bound to `TCtx`. Plugs into `.use(...)`;
@@ -793,11 +880,20 @@ export interface SafeRPC<TCtx = {}> extends ProcedureBuilder<
  * ```
  */
 export function saferpc<TCtx = {}>(): SafeRPC<TCtx> {
-  const router = function router<R extends Router>(routes: R): R {
+  const router = function router<R extends Router>(
+    routes: R & { then?: never },
+  ): R {
     if (typeof routes !== "object" || routes === null) {
       throw new TypeError("router() requires an object of procedures");
     }
-    return routes;
+    if ("then" in routes) {
+      throw new TypeError(
+        'router() rejects a route named "then": the client proxy must not ' +
+          "look thenable, so that route could never be called " +
+          "(reserved, JS-specific)",
+      );
+    }
+    return routes as R;
   };
   const middleware = function middleware<TExtra>(
     mw: Middleware<TCtx, TExtra>,

@@ -13,8 +13,8 @@
  * the adapter's job — see the Channel jsdoc in common.ts and the shipped
  * adapters in channels/. Delivery bookkeeping is OURS: a frame whose
  * `channel.send` throws enters the core outbound queue and is retried
- * until `sendTimeout`; the sent boundary (send returned / promise
- * resolved) decides every rejection's class — `RPCAbortedError` = the
+ * until `sendTimeout`; the sent boundary (handoff to `channel.send`, not
+ * promise resolution) decides every rejection's class — `RPCAbortedError` = the
  * request left, outcome UNKNOWN; plain local `RPCError` = it provably
  * never left, safe to resend. Per-call AbortSignal cancels waiting
  * without touching the session.
@@ -157,6 +157,10 @@ export interface ClientOptions {
    * Max time (ms) to complete the handshake from when the client hello
    * is sent. Triggered lazily by the first RPC call, or on retry after
    * a previous handshake failure / reset. Default: 5000ms.
+   *
+   * If an auth callback or transport Promise is still unsettled after the
+   * timeout, a new handshake is rejected until that operation settles; this
+   * prevents non-cancellable work from accumulating across retries.
    */
   handshakeTimeout?: number;
   maxMessageBytes?: number;
@@ -190,6 +194,11 @@ export function client<T extends Router>(
   }
   const maxPending =
     opts.maxPending !== undefined ? opts.maxPending : MAX_PENDING;
+  // Reject NaN/Infinity/non-integers outright: `pending.size >= NaN` is
+  // false for every size, which would silently disable the cap.
+  if (!Number.isInteger(maxPending) || maxPending <= 0) {
+    throw new TypeError("client() maxPending must be an integer > 0");
+  }
   const sendTimeout =
     opts.sendTimeout !== undefined ? opts.sendTimeout : DEFAULT_SEND_TIMEOUT;
   if (
@@ -212,6 +221,10 @@ export function client<T extends Router>(
   }
   const maxBytes =
     opts.maxMessageBytes !== undefined ? opts.maxMessageBytes : MAX_MSG_BYTES;
+  // Same NaN guard as maxPending: `data.length > NaN` is always false.
+  if (!Number.isInteger(maxBytes) || maxBytes <= 0) {
+    throw new TypeError("client() maxMessageBytes must be an integer > 0");
+  }
 
   // ── State machine: idle → handshaking → ready, or closed ──
   // idle:        no session. Next RPC call triggers handshake.
@@ -245,6 +258,27 @@ export function client<T extends Router>(
   let handshakeResolve: (() => void) | null = null;
   let handshakeReject: ((err: unknown) => void) | null = null;
   let hsTimer: ReturnType<typeof setTimeout> | null = null;
+  // A timed-out auth callback cannot be cancelled. Keep one handshake
+  // operation occupied until its async work settles, rather than starting a
+  // new callback on every retry and accumulating closures indefinitely.
+  let handshakeBusy = false;
+  let handshakeBuildInFlight = false;
+  let handshakeReplyInFlight = false;
+  let handshakeAwaitingReply = false;
+  function maybeReleaseHandshake(): void {
+    if (
+      !handshakeBuildInFlight &&
+      !handshakeReplyInFlight &&
+      !handshakeAwaitingReply
+    ) {
+      handshakeBusy = false;
+    }
+  }
+  // Absolute wall-clock deadline of the current handshake attempt. Twin of
+  // hsTimer: the timer alone cannot bound a SYNCHRONOUS auth callback that
+  // blocks past the budget — its continuation resumes as a microtask BEFORE
+  // the timer macrotask fires. Guards after every await also check this.
+  let hsDeadline = 0;
 
   // Pending RPC responses. `sent` is the wire boundary: true once
   // `channel.send` returned without throwing (or its promise was handed
@@ -513,12 +547,14 @@ export function client<T extends Router>(
 
   function failHandshake(err: unknown): void {
     clearHsTimer();
+    handshakeAwaitingReply = false;
     const rej = handshakeReject;
     handshakePromise = null;
     handshakeResolve = null;
     handshakeReject = null;
     zeroKeys();
     state = "idle";
+    maybeReleaseHandshake();
     if (rej !== null) {
       rej(
         err instanceof RPCError
@@ -529,9 +565,49 @@ export function client<T extends Router>(
   }
 
   function startHandshake(): Promise<void> {
-    privateKey = x25519.utils.randomSecretKey();
-    publicKey = x25519.getPublicKey(privateKey);
-    clientNonce = randomBytes(KEY_LEN);
+    if (handshakeBusy) {
+      return Promise.reject(
+        new RPCError(
+          "HANDSHAKE",
+          "Previous handshake is still settling; retry later",
+        ),
+      );
+    }
+    // The epoch is a uint32 on the wire (the server rejects anything larger),
+    // and it never wraps — wrapping would let an old session's frames alias a
+    // new epoch. `epoch++` below would push it past the ceiling, so exhaustion
+    // is a terminal client error (mirrors the request-id counter guard): the
+    // alternative is every subsequent hello being silently dropped server-side
+    // as `Invalid epoch`, which surfaces only as opaque handshake timeouts.
+    if (epoch >= 0xffffffff) {
+      return Promise.reject(
+        new RPCError(
+          "CLIENT",
+          "Handshake epoch exhausted; destroy and recreate client",
+        ),
+      );
+    }
+    // Generate before occupying the slot so an unexpected crypto/RNG throw
+    // cannot leave the client permanently marked as busy.
+    const nextPrivateKey = x25519.utils.randomSecretKey();
+    let nextPublicKey: Uint8Array | null = null;
+    let nextClientNonce: Uint8Array | null = null;
+    try {
+      nextPublicKey = x25519.getPublicKey(nextPrivateKey);
+      nextClientNonce = randomBytes(KEY_LEN);
+    } catch (err: unknown) {
+      zero(nextPrivateKey);
+      if (nextPublicKey !== null) zero(nextPublicKey);
+      if (nextClientNonce !== null) zero(nextClientNonce);
+      throw err;
+    }
+    handshakeBusy = true;
+    handshakeBuildInFlight = true;
+    handshakeReplyInFlight = false;
+    handshakeAwaitingReply = false;
+    privateKey = nextPrivateKey;
+    publicKey = nextPublicKey;
+    clientNonce = nextClientNonce;
     epoch++;
     state = "handshaking";
 
@@ -554,6 +630,7 @@ export function client<T extends Router>(
     // `await` can attach its own handler.
     promise.catch(() => {});
 
+    hsDeadline = Date.now() + hsTimeout;
     hsTimer = setTimeout(function onHsTimeout() {
       if (state !== "handshaking" || epoch !== currentEpoch) return;
       failHandshake(new RPCError("HANDSHAKE", "Handshake timeout"));
@@ -567,7 +644,13 @@ export function client<T extends Router>(
       if (auth.sign !== undefined) {
         const transcript = buildHelloTranscript(currentEpoch, myPub, myNonce);
         const signed = await auth.sign(transcript);
-        if (state !== "handshaking" || epoch !== currentEpoch) return;
+        if (
+          state !== "handshaking" ||
+          epoch !== currentEpoch ||
+          Date.now() >= hsDeadline
+        ) {
+          return;
+        }
         if (
           !(signed instanceof Uint8Array) ||
           signed.length === 0 ||
@@ -588,6 +671,10 @@ export function client<T extends Router>(
       const helloPayload = mpEncode(helloMsg);
       const hello = concatBytes(new Uint8Array([TAG_HELLO]), helloPayload);
       zero(helloPayload);
+      // From this handoff onward the operation is waiting for the matching
+      // reply. Set this before send because synchronous transports can
+      // deliver and process the reply re-entrantly.
+      handshakeAwaitingReply = true;
       try {
         await channel.send(hello);
       } catch {
@@ -601,10 +688,21 @@ export function client<T extends Router>(
         outbound.push({ kind: "hello", frame: hello, epoch: currentEpoch });
         startFlushTimer();
       }
-    })().catch(function onProduceError(err: unknown) {
-      if (state !== "handshaking" || epoch !== currentEpoch) return;
-      failHandshake(err);
-    });
+    })()
+      .catch(function onProduceError(err: unknown) {
+        if (state !== "handshaking" || epoch !== currentEpoch) return;
+        failHandshake(err);
+      })
+      .then(
+        function onHelloBuildSettled() {
+          handshakeBuildInFlight = false;
+          maybeReleaseHandshake();
+        },
+        function onHelloBuildReportError() {
+          handshakeBuildInFlight = false;
+          maybeReleaseHandshake();
+        },
+      );
 
     return promise;
   }
@@ -644,6 +742,8 @@ export function client<T extends Router>(
       const priv = privateKey.slice();
       const pub = publicKey.slice();
       const nonce = clientNonce.slice();
+      handshakeAwaitingReply = false;
+      handshakeReplyInFlight = true;
 
       // auth.verify can be async (e.g. WebCrypto.verify) so
       // run the entire reply path in a coroutine. The epoch guard
@@ -707,8 +807,16 @@ export function client<T extends Router>(
             );
             await auth.verify(replyAuth, transcript);
             // Epoch guard: handshake might have been reset / destroyed
-            // while verify was awaiting (e.g. user destroy()).
-            if (state !== "handshaking" || epoch !== currentEpoch) return;
+            // while verify was awaiting (e.g. user destroy()). Deadline
+            // guard: a sync verify that blocked past the budget must not
+            // publish a session the timer already condemned.
+            if (
+              state !== "handshaking" ||
+              epoch !== currentEpoch ||
+              Date.now() >= hsDeadline
+            ) {
+              return;
+            }
           }
 
           rawShared = x25519.getSharedSecret(priv, serverPub);
@@ -716,7 +824,13 @@ export function client<T extends Router>(
 
           const secretBytes =
             auth.secret !== undefined ? await auth.secret() : EMPTY_SECRET;
-          if (state !== "handshaking" || epoch !== currentEpoch) return;
+          if (
+            state !== "handshaking" ||
+            epoch !== currentEpoch ||
+            Date.now() >= hsDeadline
+          ) {
+            return;
+          }
 
           if (
             !(secretBytes instanceof Uint8Array) ||
@@ -747,7 +861,13 @@ export function client<T extends Router>(
 
           // Final guard before publishing module-level state. The block
           // below is synchronous; no further awaits can race against us.
-          if (state !== "handshaking" || epoch !== currentEpoch) return;
+          if (
+            state !== "handshaking" ||
+            epoch !== currentEpoch ||
+            Date.now() >= hsDeadline
+          ) {
+            return;
+          }
 
           sessionKey = localSessionKey;
           localSessionKey = null; // ownership transferred — finally won't zero
@@ -767,6 +887,8 @@ export function client<T extends Router>(
           zero(priv);
           zero(pub);
           zero(nonce);
+          handshakeReplyInFlight = false;
+          maybeReleaseHandshake();
         }
       })().catch(function onReplyError(err: unknown) {
         // Only fail the handshake if we're STILL actively handshaking this
@@ -798,7 +920,30 @@ export function client<T extends Router>(
 
         if (msg["t"] !== 2) return;
         const rawId = msg["id"];
-        if (typeof rawId !== "string") return;
+        if (typeof rawId !== "string" || rawId.length === 0) return;
+
+        // Strict discriminator and envelope shape: the protocol defines
+        // exactly two response forms. Validate all required outer fields
+        // BEFORE touching the pending entry, so malformed frames cannot
+        // consume a call that is still waiting for a valid response.
+        const has = Object.prototype.hasOwnProperty;
+        const ok = msg["ok"];
+        if (ok !== true && ok !== false) return;
+        if (!has.call(msg, "d") || !has.call(msg, "e")) return;
+        if (ok === true) {
+          if (msg["e"] !== null) return;
+        } else {
+          const error = msg["e"];
+          if (
+            msg["d"] !== null ||
+            typeof error !== "object" ||
+            error === null ||
+            Array.isArray(error) ||
+            error instanceof Uint8Array
+          ) {
+            return;
+          }
+        }
 
         const entry = pending.get(rawId);
         if (entry === undefined) return;
@@ -806,7 +951,7 @@ export function client<T extends Router>(
         pending.delete(rawId);
         clearTimeout(entry.timer);
 
-        if (msg["ok"] === true) {
+        if (ok === true) {
           entry.resolve(msg["d"]);
         } else {
           const e = msg["e"];
@@ -907,9 +1052,21 @@ export function client<T extends Router>(
     // msgpack has no `undefined` primitive and would round-trip it as
     // `null`, which a `.optional()` (as opposed to `.nullish()`) Zod schema
     // rejects. A dropped key decodes back to `undefined` on the server.
+    // `input` is already sanitized by the proxy (before the handshake, so a
+    // non-plain value never even emits TAG_HELLO) — do not re-sanitize the
+    // rebuilt tree here.
     const req: Record<string, unknown> = { t: 1, id, p: prop };
     if (input !== undefined) req["i"] = input;
     const encrypted = enc(req);
+    if (encrypted.length > maxBytes) {
+      // The frame is still local: do not hand an oversized ciphertext to the
+      // adapter, where it would become a sent request that the peer must
+      // silently drop and the caller would only discover by timeout.
+      zero(encrypted);
+      return Promise.reject(
+        new RPCError("CLIENT", "Message exceeds maxMessageBytes"),
+      );
+    }
 
     return new Promise(function rpcExec(res, rej) {
       // Listener hygiene: every settle path (resolve, reject, timeout,
@@ -1057,6 +1214,12 @@ export function client<T extends Router>(
           throw abortError(prop, signal.reason);
         }
 
+        // Validate caller data before starting a lazy handshake. A bad first
+        // input must not even emit TAG_HELLO; sanitize() also canonicalizes
+        // plain objects before the encrypted request is built.
+        const sanitizedInput =
+          input === undefined ? undefined : sanitize(input);
+
         if (signal !== undefined) {
           // Abort rejects THIS call only; the handshake itself is shared
           // state and keeps running for other callers / the next call.
@@ -1073,7 +1236,7 @@ export function client<T extends Router>(
         const sentEpoch = epoch;
 
         try {
-          return await sendRequest(prop, input, signal);
+          return await sendRequest(prop, sanitizedInput, signal);
         } catch (err: unknown) {
           // No auto-retry. An RPCAbortedError leaves the outcome UNKNOWN
           // (the request may have executed — auto-resending it is a silent
