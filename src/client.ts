@@ -13,8 +13,8 @@
  * the adapter's job — see the Channel jsdoc in common.ts and the shipped
  * adapters in channels/. Delivery bookkeeping is OURS: a frame whose
  * `channel.send` throws enters the core outbound queue and is retried
- * until `sendTimeout`; the sent boundary (send returned / promise
- * resolved) decides every rejection's class — `RPCAbortedError` = the
+ * until `sendTimeout`; the sent boundary (handoff to `channel.send`, not
+ * promise resolution) decides every rejection's class — `RPCAbortedError` = the
  * request left, outcome UNKNOWN; plain local `RPCError` = it provably
  * never left, safe to resend. Per-call AbortSignal cancels waiting
  * without touching the session.

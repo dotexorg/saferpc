@@ -88,6 +88,12 @@ export interface ServerOptionsBase {
    * Default: 5000ms.
    */
   handshakeTimeout?: number;
+  /**
+   * Maximum full TAG_MSG frame size accepted inbound and emitted outbound.
+   * Oversized inbound frames are silently dropped; oversized responses are
+   * reported through `onError` and never handed to the channel. Default:
+   * 1 MiB.
+   */
   maxMessageBytes?: number;
   /**
    * Size of the per-session replay window: how many recently-seen AEAD
@@ -872,14 +878,23 @@ export function server(
         // Decode the authenticated plaintext. A malformed inner payload is
         // dropped silently — the session promotion above stands: the key was
         // proven by Poly1305, not by the payload's shape (spec § Step 4).
+        // It still consumes a replay-window slot: otherwise an attacker who
+        // has obtained one authenticated malformed frame can make the server
+        // repeat decode/sanitize work indefinitely without the normal replay
+        // bound. This happens before any await, so duplicate delivery cannot
+        // race the membership check at the channel boundary.
         let raw: unknown;
         try {
           raw = decodePlaintext(plain);
         } catch {
+          if (nKey !== null) seenAdd(nKey);
           return;
         }
 
-        if (typeof raw !== "object" || raw === null) return;
+        if (typeof raw !== "object" || raw === null) {
+          if (nKey !== null) seenAdd(nKey);
+          return;
+        }
         const msg = raw as Record<string, unknown>;
 
         // Direction guard: t === 1 marks a REQUEST. Both directions share one
@@ -887,8 +902,12 @@ export function server(
         // server also passes Poly1305 — dropping it BEFORE recording its
         // nonce keeps opposite-direction frames from consuming replay-window
         // slots (which would shrink the effective window against real
-        // request replays).
-        if (msg["t"] !== 1) return;
+        // request replays). Other authenticated malformed envelopes consume
+        // their nonce even though they are not dispatched.
+        if (msg["t"] !== 1) {
+          if (msg["t"] !== 2 && nKey !== null) seenAdd(nKey);
+          return;
+        }
 
         // Request-direction frame, Poly1305-verified — record its nonce in
         // the (now-current) live window so a later duplicate is rejected.
@@ -969,7 +988,21 @@ export function server(
 
         const enc = liveEncrypt;
         if (enc === null) return;
-        await channel.send(enc(res));
+        const encrypted = enc(res);
+        if (encrypted.length > maxBytes) {
+          // The response is local until handed to the adapter. Never emit an
+          // oversized frame that the peer is required to drop; otherwise a
+          // large handler result turns into an opaque client timeout and also
+          // defeats the server-side framing bound on outbound traffic.
+          zero(encrypted);
+          if (onError !== null) {
+            onError(
+              new RPCError("INVALID_DATA", "Response exceeds maxMessageBytes"),
+            );
+          }
+          return;
+        }
+        await channel.send(encrypted);
       })().catch(function onSendError(err: unknown) {
         if (onError !== null) onError(err);
       });

@@ -154,7 +154,7 @@ Numeric options are validated at construction with a synchronous `TypeError`: `h
 
 `context` runs per request and must return the router's base context `TCtx`. The `auth` argument carries whatever `auth.verify` returned for the current session. When the base context is empty, `context` is optional and the request context falls back to the verified auth data (or `{}` if none).
 
-`replayWindow` is the number of recently-seen AEAD nonces the server remembers per session so it can drop replayed request frames (in-session replay defense). FIFO-evicted: a replay older than the last `replayWindow` accepted messages executes again, so the window is narrowed to N, not closed. Cleared on every re-handshake. Set `0` to disable.
+`replayWindow` is the number of recently-seen AEAD nonces the server remembers per session so it can drop replayed request frames (in-session replay defense). Every authenticated malformed request frame consumes a slot; reflected response frames (`t: 2`) do not. FIFO-evicted: a replay older than the last `replayWindow` accepted messages executes again, so the window is narrowed to N, not closed. Cleared on every re-handshake. Set `0` to disable.
 
 `onError` fires on handshake failures and non-fatal internal errors. The server does **not** destroy itself on a failed handshake — it resets and accepts the next hello.
 

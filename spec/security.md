@@ -26,7 +26,7 @@ The `auth` callbacks close that gap by binding the ephemeral keys to something t
 - **`secret`** mixes a pre-shared 32-byte value into HKDF as the salt (see [Protocol § Key derivation](protocol.md#key-derivation)). A peer without the secret derives a different `session_key`, and the HMAC proof in the reply fails to verify.
 - **`sign` / `verify`** signs the [hello/reply transcript](#transcript-format) with a long-term key the peer can verify. The transcript covers the epoch and both ephemeral public keys, so a signature captured from one handshake will not validate in another.
 
-Without one of those configured, `client()` / `server()` throws a `TypeError` at construction. There is no anonymous fallback, and a `secret()` callback that returns 32 zero bytes is also rejected at runtime — a typo cannot silently downgrade an intended PSK deployment into asymmetric-only mode.
+Without one of those configured, `client()` / `server()` throws a `TypeError` at construction. There is no anonymous fallback, and a `secret()` callback that returns all-zero bytes of any length is also rejected at runtime — a typo cannot silently downgrade an intended PSK deployment into asymmetric-only mode.
 
 ### Transport encryption is not a substitute
 
@@ -329,7 +329,7 @@ There are no built-in helpers for certificate-based or multi-factor auth: in bot
 
 Safe RPC uses random 24-byte nonces (not counters) for XSalsa20-Poly1305. The collision probability is negligible. A captured ciphertext could otherwise be replayed by an attacker who can inject into a live channel, and the replayed message would decrypt and execute again.
 
-As of 0.7.0 the server keeps a **bounded seen-nonce set** per session (`replayWindow`, default 4096): it records the nonce of every frame that passes Poly1305 and silently drops any later frame carrying a nonce it has already seen. This closes the replay window for the last `replayWindow` messages of a session, with no wire change and no ordering requirement (so lossy / reordering transports stay supported). The set is cleared on every re-handshake, and only the server needs it — the client already matches responses to a monotonic request `id` that is never reused.
+As of 0.7.0 the server keeps a **bounded seen-nonce set** per session (`replayWindow`, default 4096): after Poly1305 verification it records malformed envelopes and request frames, then silently drops later duplicates. Reflected response frames (`t: 2`) are dropped without consuming request replay-window capacity. This closes the replay window for the last `replayWindow` request-side messages of a session, with no wire change and no ordering requirement (so lossy / reordering transports stay supported). The set is cleared on every re-handshake, and only the server needs it — the client already matches responses to a monotonic request `id` that is never reused.
 
 The window is **narrowed to N, not closed**: a replay older than the last `replayWindow` accepted messages still executes. For non-idempotent operations on long-lived sessions, still add an idempotency key inside the procedure input, or keep a request-ID set keyed by the verified principal. Set `replayWindow: 0` to disable the defense. Counter-based nonces would close the window fully but require strict transport ordering and directional keys (keystream reuse otherwise on the single shared key); that is deferred to a future protocol version.
 

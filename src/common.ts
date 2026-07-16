@@ -67,15 +67,15 @@ const TRANSCRIPT_REPLY_MAGIC = new TextEncoder().encode(
 );
 
 /**
- * Hardened ExtensionCodec — rejects ALL msgpack extension types including
- * the built-in Timestamp (type -1). This prevents type-confusion attacks
- * where a malicious payload uses ext types to inject Date / Map / Set /
- * other non-plain host objects that would surprise handlers.
+ * Hardened msgpack extension handling. The built-in Timestamp extension
+ * (type -1) is explicitly rejected by the codec; any other unregistered
+ * extension decodes as ExtData and is rejected by the full sanitize() gate.
+ * This prevents type-confusion attacks where a malicious payload uses ext
+ * types to inject Date / Map / Set / other non-plain host objects that would
+ * surprise handlers.
  *
  * Implementation: msgpack-javascript hard-codes the Timestamp decoder, so
  * we explicitly register a throwing decoder for type -1 to override it.
- * Unregistered ext types bypass our codec and surface as ExtData; sanitize()
- * rejects those via its non-plain-object check.
  */
 const SAFE_CODEC = new ExtensionCodec();
 SAFE_CODEC.register({
@@ -132,11 +132,9 @@ export function toPlainBytes(v: Uint8Array): Uint8Array {
 }
 
 /**
- * Constant-time check that a buffer is the protocol's "no secret" sentinel:
- * 32 zero bytes. Returns false for any other length. Safe RPC's internal flow
- * uses `EMPTY_SECRET` as the HKDF salt when `auth.secret` is absent — but if a
- * user-provided `secret()` returns 32 zeros (e.g. `new Uint8Array(32)`), the
- * resulting session has no secret authentication. Refuse it at runtime.
+ * Constant-time check for an all-zero secret. `EMPTY_SECRET` is the protocol's
+ * 32-byte "no secret" sentinel, but a configured secret of any all-zero length
+ * would likewise provide no secret authentication. Refuse it at runtime.
  */
 export function isEmptySecret(buf: Uint8Array): boolean {
   // An all-zero secret of ANY length is treated as empty. A caller that
