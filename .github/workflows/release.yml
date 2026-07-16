@@ -80,7 +80,18 @@ jobs:
           TAG="${{ steps.tag.outputs.name }}"
           VERSION="${{ steps.tag.outputs.version }}"
           NPM_LINK="Published to npm: https://www.npmjs.com/package/@dotex/saferpc/v/${VERSION}"
-          ARTICLE=$(git show --name-only --pretty=format: "$TAG" -- 'changelog/*.md' | grep -v '^$' | head -1 || true)
+
+          # Pick the newest changelog/*.md file not yet used by an earlier release:
+          # diff against the previous tag rather than requiring the file to land in
+          # this exact tag's commit, since changelog articles are typically authored
+          # (and committed) before `npm version` cuts the release commit.
+          PREV_TAG=$(git describe --tags --abbrev=0 "${TAG}^" 2>/dev/null || true)
+          if [ -n "$PREV_TAG" ]; then
+            ARTICLE=$(git diff --name-only --diff-filter=A "$PREV_TAG" "$TAG" -- 'changelog/*.md' | sort | tail -1 || true)
+          else
+            ARTICLE=$(git ls-tree -r --name-only "$TAG" -- 'changelog/*.md' | sort | tail -1 || true)
+          fi
+
           if [ -n "$ARTICLE" ] && [ -f "$ARTICLE" ]; then
             echo "generate=false" >> "$GITHUB_OUTPUT"
             {
