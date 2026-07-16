@@ -157,6 +157,10 @@ export interface ClientOptions {
    * Max time (ms) to complete the handshake from when the client hello
    * is sent. Triggered lazily by the first RPC call, or on retry after
    * a previous handshake failure / reset. Default: 5000ms.
+   *
+   * If an auth callback or transport Promise is still unsettled after the
+   * timeout, a new handshake is rejected until that operation settles; this
+   * prevents non-cancellable work from accumulating across retries.
    */
   handshakeTimeout?: number;
   maxMessageBytes?: number;
@@ -254,6 +258,22 @@ export function client<T extends Router>(
   let handshakeResolve: (() => void) | null = null;
   let handshakeReject: ((err: unknown) => void) | null = null;
   let hsTimer: ReturnType<typeof setTimeout> | null = null;
+  // A timed-out auth callback cannot be cancelled. Keep one handshake
+  // operation occupied until its async work settles, rather than starting a
+  // new callback on every retry and accumulating closures indefinitely.
+  let handshakeBusy = false;
+  let handshakeBuildInFlight = false;
+  let handshakeReplyInFlight = false;
+  let handshakeAwaitingReply = false;
+  function maybeReleaseHandshake(): void {
+    if (
+      !handshakeBuildInFlight &&
+      !handshakeReplyInFlight &&
+      !handshakeAwaitingReply
+    ) {
+      handshakeBusy = false;
+    }
+  }
   // Absolute wall-clock deadline of the current handshake attempt. Twin of
   // hsTimer: the timer alone cannot bound a SYNCHRONOUS auth callback that
   // blocks past the budget — its continuation resumes as a microtask BEFORE
@@ -527,12 +547,14 @@ export function client<T extends Router>(
 
   function failHandshake(err: unknown): void {
     clearHsTimer();
+    handshakeAwaitingReply = false;
     const rej = handshakeReject;
     handshakePromise = null;
     handshakeResolve = null;
     handshakeReject = null;
     zeroKeys();
     state = "idle";
+    maybeReleaseHandshake();
     if (rej !== null) {
       rej(
         err instanceof RPCError
@@ -543,9 +565,35 @@ export function client<T extends Router>(
   }
 
   function startHandshake(): Promise<void> {
-    privateKey = x25519.utils.randomSecretKey();
-    publicKey = x25519.getPublicKey(privateKey);
-    clientNonce = randomBytes(KEY_LEN);
+    if (handshakeBusy) {
+      return Promise.reject(
+        new RPCError(
+          "HANDSHAKE",
+          "Previous handshake is still settling; retry later",
+        ),
+      );
+    }
+    // Generate before occupying the slot so an unexpected crypto/RNG throw
+    // cannot leave the client permanently marked as busy.
+    const nextPrivateKey = x25519.utils.randomSecretKey();
+    let nextPublicKey: Uint8Array | null = null;
+    let nextClientNonce: Uint8Array | null = null;
+    try {
+      nextPublicKey = x25519.getPublicKey(nextPrivateKey);
+      nextClientNonce = randomBytes(KEY_LEN);
+    } catch (err: unknown) {
+      zero(nextPrivateKey);
+      if (nextPublicKey !== null) zero(nextPublicKey);
+      if (nextClientNonce !== null) zero(nextClientNonce);
+      throw err;
+    }
+    handshakeBusy = true;
+    handshakeBuildInFlight = true;
+    handshakeReplyInFlight = false;
+    handshakeAwaitingReply = false;
+    privateKey = nextPrivateKey;
+    publicKey = nextPublicKey;
+    clientNonce = nextClientNonce;
     epoch++;
     state = "handshaking";
 
@@ -609,6 +657,10 @@ export function client<T extends Router>(
       const helloPayload = mpEncode(helloMsg);
       const hello = concatBytes(new Uint8Array([TAG_HELLO]), helloPayload);
       zero(helloPayload);
+      // From this handoff onward the operation is waiting for the matching
+      // reply. Set this before send because synchronous transports can
+      // deliver and process the reply re-entrantly.
+      handshakeAwaitingReply = true;
       try {
         await channel.send(hello);
       } catch {
@@ -622,10 +674,21 @@ export function client<T extends Router>(
         outbound.push({ kind: "hello", frame: hello, epoch: currentEpoch });
         startFlushTimer();
       }
-    })().catch(function onProduceError(err: unknown) {
-      if (state !== "handshaking" || epoch !== currentEpoch) return;
-      failHandshake(err);
-    });
+    })()
+      .catch(function onProduceError(err: unknown) {
+        if (state !== "handshaking" || epoch !== currentEpoch) return;
+        failHandshake(err);
+      })
+      .then(
+        function onHelloBuildSettled() {
+          handshakeBuildInFlight = false;
+          maybeReleaseHandshake();
+        },
+        function onHelloBuildReportError() {
+          handshakeBuildInFlight = false;
+          maybeReleaseHandshake();
+        },
+      );
 
     return promise;
   }
@@ -665,6 +728,8 @@ export function client<T extends Router>(
       const priv = privateKey.slice();
       const pub = publicKey.slice();
       const nonce = clientNonce.slice();
+      handshakeAwaitingReply = false;
+      handshakeReplyInFlight = true;
 
       // auth.verify can be async (e.g. WebCrypto.verify) so
       // run the entire reply path in a coroutine. The epoch guard
@@ -808,6 +873,8 @@ export function client<T extends Router>(
           zero(priv);
           zero(pub);
           zero(nonce);
+          handshakeReplyInFlight = false;
+          maybeReleaseHandshake();
         }
       })().catch(function onReplyError(err: unknown) {
         // Only fail the handshake if we're STILL actively handshaking this

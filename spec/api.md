@@ -141,20 +141,23 @@ Subscribes to `channel` and serves the router. Returns synchronously. The option
 
 ### `ServerOptions`
 
-| Field              | Type                                             | Default     | Required                                                        |
-| ------------------ | ------------------------------------------------ | ----------- | --------------------------------------------------------------- |
-| `auth`             | `AuthOptions`                                    | —           | ✅                                                              |
-| `context`          | `(ctx: { auth?: Ctx }) => TCtx \| Promise<TCtx>` | —           | ✅ when `TCtx` (the router's base context) is non-empty, else — |
-| `handshakeTimeout` | `number` (ms)                                    | `5000`      | —                                                               |
-| `maxMessageBytes`  | `number`                                         | `1_048_576` | —                                                               |
-| `replayWindow`     | `number`                                         | `4096`      | —                                                               |
-| `onError`          | `(err: unknown) => void`                         | —           | —                                                               |
+| Field                  | Type                                             | Default     | Required                                                        |
+| ---------------------- | ------------------------------------------------ | ----------- | --------------------------------------------------------------- |
+| `auth`                 | `AuthOptions`                                    | —           | ✅                                                              |
+| `context`              | `(ctx: { auth?: Ctx }) => TCtx \| Promise<TCtx>` | —           | ✅ when `TCtx` (the router's base context) is non-empty, else — |
+| `handshakeTimeout`     | `number` (ms)                                    | `5000`      | —                                                               |
+| `maxMessageBytes`      | `number`                                         | `1_048_576` | —                                                               |
+| `maxPendingHandshakes` | `number`                                         | `16`        | —                                                               |
+| `replayWindow`         | `number`                                         | `4096`      | —                                                               |
+| `onError`              | `(err: unknown) => void`                         | —           | —                                                               |
 
-Numeric options are validated at construction with a synchronous `TypeError`: `handshakeTimeout` — finite number ≥ **100 ms**; `maxMessageBytes` — positive integer; `replayWindow` — integer ≥ 0 (`0` disables the seen-nonce set). `NaN`/`Infinity` never silently disables a limit.
+Numeric options are validated at construction with a synchronous `TypeError`: `handshakeTimeout` — finite number ≥ **100 ms**; `maxMessageBytes` and `maxPendingHandshakes` — positive integers; `replayWindow` — integer ≥ 0 (`0` disables the seen-nonce set). `NaN`/`Infinity` never silently disables a limit.
 
 `context` runs per request and must return the router's base context `TCtx`. The `auth` argument carries whatever `auth.verify` returned for the current session. When the base context is empty, `context` is optional and the request context falls back to the verified auth data (or `{}` if none).
 
 `replayWindow` is the number of recently-seen AEAD nonces the server remembers per session so it can drop replayed request frames (in-session replay defense). Every authenticated malformed request frame consumes a slot; reflected response frames (`t: 2`) do not. FIFO-evicted: a replay older than the last `replayWindow` accepted messages executes again, so the window is narrowed to N, not closed. Cleared on every re-handshake. Set `0` to disable.
+
+`maxPendingHandshakes` bounds handshake attempts whose async work has not settled. A timed-out attempt remains counted until its `auth` callback settles because an arbitrary JavaScript Promise cannot be cancelled; new hellos are silently dropped at the cap. This trades re-handshake availability for bounded memory under a peer that opens never-settling auth calls. Default: `16`.
 
 `onError` fires on handshake failures and non-fatal internal errors. The server does **not** destroy itself on a failed handshake — it resets and accepts the next hello.
 
@@ -229,6 +232,8 @@ Returns synchronously. The handshake stays lazy: it starts on the first `api` ca
 `maxPending` caps concurrent in-flight calls. Past the cap, calls reject with `RPCError("CLIENT", "Too many pending requests")`.
 
 Every numeric option is validated at construction; a value that looks fine in the table above can still throw a synchronous `TypeError`. The full contract: `timeout` — finite number > 0; `sendTimeout` — finite number ≥ 0; `handshakeTimeout` — finite number ≥ **100 ms** (a sub-100 ms budget cannot complete a real handshake and would only produce spurious timeouts); `maxPending` and `maxMessageBytes` — positive integers. `NaN`/`Infinity` — easy to produce with `Number(process.env.X)` on an unset variable — is rejected rather than silently disabling the limit (`length > NaN` is always false).
+
+If a previous client handshake timed out while an auth callback or transport Promise is still unsettled, the next call fails with `RPCError("HANDSHAKE")` instead of starting another handshake operation. Once the stale operation settles, later calls may handshake again. This keeps client-side non-cancellable auth work bounded to one operation.
 
 `timeout` applies to every call. On timeout the client throws `RPCAbortedError("TIMEOUT", "Timed out: <procedure>")` if the frame had already been sent (outcome unknown — do not blind-resend; the session resets and the next call re-handshakes), or plain `RPCError("CHANNEL")` if the frame had not yet left the process (retry freely; no reset). Set `timeout` generously — it is the safety net, not a UX budget; shorten a single call with [`AbortSignal.timeout`](#calloptions--per-call-abort) instead.
 

@@ -29,13 +29,13 @@ Non-goals: streaming RPCs in-protocol, multiplexing over a single channel, forma
 
 ## Primitives
 
-| Primitive            | Algorithm                   | Notes                                               |
-| -------------------- | --------------------------- | --------------------------------------------------- |
-| Key exchange         | X25519                      | 32-byte keys                                        |
-| Symmetric encryption | XSalsa20-Poly1305 (AEAD)    | 24-byte nonce, 32-byte key, 16-byte tag             |
-| Hash                 | SHA-256                     | —                                                   |
-| Key derivation       | HKDF-Extract+Expand-SHA-256 | RFC 5869                                            |
-| MAC                  | HMAC-SHA-256                | RFC 2104                                            |
+| Primitive            | Algorithm                   | Notes                                                       |
+| -------------------- | --------------------------- | ----------------------------------------------------------- |
+| Key exchange         | X25519                      | 32-byte keys                                                |
+| Symmetric encryption | XSalsa20-Poly1305 (AEAD)    | 24-byte nonce, 32-byte key, 16-byte tag                     |
+| Hash                 | SHA-256                     | —                                                           |
+| Key derivation       | HKDF-Extract+Expand-SHA-256 | RFC 5869                                                    |
+| MAC                  | HMAC-SHA-256                | RFC 2104                                                    |
 | Serialization        | msgpack                     | Extension types rejected at the codec/sanitization boundary |
 
 All wire numbers are network-byte-order (big-endian) unless explicitly noted.
@@ -184,7 +184,7 @@ The client then sends:
 
 ### Step 2: server processes hello
 
-The server processes the hello as an **attempt**, on state local to that attempt — a fresh ephemeral pair `(s_priv, s_pub)` generated for this hello. An established session, if any, keeps serving while the attempt runs and is **not** replaced at step 10 — the attempt is installed as a _candidate_ that is promoted only when a frame decrypts under it (step 4, make-before-break). A failure at any step discards the attempt's local state and leaves the established session untouched.
+The server processes the hello as an **attempt**, on state local to that attempt — a fresh ephemeral pair `(s_priv, s_pub)` generated for this hello. An established session, if any, keeps serving while the attempt runs and is **not** replaced at step 10 — the attempt is installed as a _candidate_ that is promoted only when a frame decrypts under it (step 4, make-before-break). A failure at any step discards the attempt's local state and leaves the established session untouched. The reference also bounds the number of attempts whose async work has not settled (`maxPendingHandshakes`, default 16). A timed-out attempt remains counted until its auth callback settles because arbitrary JavaScript Promises cannot be cancelled; hellos received at the cap are dropped silently.
 
 > **Invariant (load-bearing).** `(s_priv, s_pub)` is generated fresh per attempt and is never held at module/connection scope. A duplicate hello therefore derives a _different_ `raw` and a _different_ candidate key than the live session, so replayed traffic can never decrypt under the candidate. Moving this pair to a shared scope would silently turn the duplicate-hello nuisance below into a full session-traffic replay. See [make-before-break](#re-handshake).
 
@@ -704,11 +704,11 @@ A new-language port that ticks every item is conformant:
 - [ ] The response-guard epoch is captured **after** promotion (not at frame arrival), so the reply to the confirming frame is not dropped by the guard.
 - [ ] Client epoch increments per handshake attempt (and per session reset) and is echoed verbatim in the reply; it is validated as a uint32 on the wire and never wraps (exhaustion is a terminal client error). The server does NOT bump a single mirror counter — under make-before-break it keeps three internal counters: `attemptEpoch` (per incoming hello; invalidates older attempt coroutines), `candidateEpoch` (per candidate install; guards the confirmation timer), and `epoch` (per promotion; guards TAG_MSG responses).
 - [ ] The attempt counter is bumped for **every** incoming hello, including ones that arrive while a previous attempt is still suspended at an `await`. In-flight stale attempts detect themselves via the guard and abandon all writes.
-- [ ] Every `await` in the handshake path is followed by an attempt + destroyed guard before any session state is written. The candidate install happens under a final guard inside a single synchronous block.
+- [ ] Every `await` in the handshake path is followed by an attempt + destroyed guard before any session state is written. The candidate install happens under a final guard inside a single synchronous block. Unsettled server attempts are capped by `maxPendingHandshakes`; a timed-out non-cancellable callback retains one bounded slot until it settles, and does not permit an unbounded hello-flood accumulation.
 - [ ] The handshake budget is enforced by an **absolute wall-clock deadline**, checked after every suspension point, not only by a timer/flag. A synchronous auth callback (`sign`/`verify`/`secret`) that blocks the event loop past the budget resumes before a timer macrotask can fire; a flag-only guard is still unset at that point and would install a candidate + send a reply after expiry. The deadline check (both sides) rejects that.
 - [ ] A reply-send failure on the server drops the just-installed candidate (guarded on the candidate counter) and reports a single handshake error; it does not leave the candidate to expire into a second timeout.
 - [ ] Inbound `TAG_MSG` promotion is gated on **AEAD verification only**. Decoding/sanitizing the inner payload happens _after_ promotion; malformed inner payloads under a proven key still promote and consume their nonce, while reflected `t: 2` responses are dropped without consuming request replay-window capacity. Conflating decode failure with Poly1305 failure would strand the candidate.
-- [ ] Numeric limits (`maxPending`, `maxMessageBytes`, JWT `maxAge`) are validated at construction: a non-finite or non-positive value is rejected with an error, never accepted (a `NaN` bound silently disables the check, since `x > NaN` is always false).
+- [ ] Numeric limits (`maxPending`, `maxPendingHandshakes`, `maxMessageBytes`, JWT `maxAge`) are validated at construction: a non-finite or non-positive value is rejected with an error, never accepted (a `NaN` bound silently disables the check, since `x > NaN` is always false).
 - [ ] Shipped auth helpers stamp a profile version `v` and verifiers reject an absent/unknown `v` (see [Auth payload profiles](#auth-payload-profiles)); the three profile schemas are reproduced byte-for-byte.
 - [ ] A separate counter guards the candidate confirmation timer, bumped only when a candidate is installed — so a later hello that bumps the attempt counter but then fails validation cannot disarm an existing candidate's timeout.
 - [ ] Hello processing runs on **attempt-local** state; an established session keeps serving during the attempt and is retired only on promotion. An invalid hello (malformed, oversized, failed `verify`, bad secret), a byte-for-byte replayed hello, or a well-formed forged hello never disturbs an established session — at most it creates a candidate that expires unconfirmed.
@@ -716,7 +716,7 @@ A new-language port that ticks every item is conformant:
 - [ ] The X25519 raw shared secret is zeroed in a try/finally so a thrown `psk()` does not leak it.
 - [ ] Ephemeral private keys captured for the duration of an `await` are owned by the in-flight attempt (copied, not aliased), so a concurrent reset that zeroes the live buffer does not corrupt the in-flight derivation.
 - [ ] Server accepts new hellos in any state (including `ready`).
-- [ ] Client does **not** auto-retry. On a sent-call reply timeout (`RPCAbortedError("TIMEOUT")`) while `ready` it resets the session (zeros the key, state → `idle`) **without resending**, then surfaces the error; the caller decides whether to retry. It never resets on `RemoteRPCError`, guardrail errors (`maxPending`, counter exhaustion), or unsent-frame failures — those reject the call and leave the session intact.
+- [ ] Client does **not** auto-retry. On a sent-call reply timeout (`RPCAbortedError("TIMEOUT")`) while `ready` it resets the session (zeros the key, state → `idle`) **without resending**, then surfaces the error; the caller decides whether to retry. It never resets on `RemoteRPCError`, guardrail errors (`maxPending`, counter exhaustion), or unsent-frame failures — those reject the call and leave the session intact. If a timed-out handshake still has a non-cancellable auth or transport Promise, the client retains one occupied handshake slot and rejects a new attempt until that operation settles.
 - [ ] The application's secret buffer is never mutated or zeroed by the protocol; only protocol-owned copies and derived material are zeroed.
 - [ ] Request `id` is validated: non-empty string, ≤ `MAX_ID_LEN`; `p` non-empty string; violations are silent drops. A well-formed request naming an unknown procedure gets a `NOT_FOUND` error response, not a silent drop.
 - [ ] The candidate confirmation timer is armed with the **remaining** handshake budget, so one attempt's hello→confirmation window never exceeds a single `handshakeTimeout`.

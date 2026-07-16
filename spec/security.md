@@ -158,9 +158,11 @@ For the full wire layout of the frames that carry these signatures, see [Protoco
 
 ## Auth processing order
 
-Client-auth **verification** (the server's `verify` callback) runs **before** ECDH and key derivation, so a failed verification never materializes session-key state and never leaks ECDH artifacts. The server's **`sign`** step runs *after* key derivation in the normative step order (step 9; the reply transcript binds both ephemeral pubs, the client nonce, and the epoch), but a failed `sign` publishes nothing: no candidate is installed and no reply is sent. Step-by-step in [Protocol § Handshake](protocol.md#handshake).
+Client-auth **verification** (the server's `verify` callback) runs **before** ECDH and key derivation, so a failed verification never materializes session-key state and never leaks ECDH artifacts. The server's **`sign`** step runs _after_ key derivation in the normative step order (step 9; the reply transcript binds both ephemeral pubs, the client nonce, and the epoch), but a failed `sign` publishes nothing: no candidate is installed and no reply is sent. Step-by-step in [Protocol § Handshake](protocol.md#handshake).
 
 A throw at any auth step rejects the handshake **attempt**. On the client a failed attempt returns to `idle`. On the server, under make-before-break, only the attempt is discarded — an established live session is never disturbed by a failed attempt and keeps serving. Failed verification never silently downgrades into an unauthenticated session.
+
+Auth callbacks are application-owned Promises and cannot be forcibly cancelled by the library. The server therefore bounds unsettled attempts with `maxPendingHandshakes` (default 16); timed-out attempts retain a slot until their callback settles, and hellos at the cap are silently dropped. The client retains one timed-out unsettled handshake operation and rejects a new attempt until it settles, preventing repeated retries from accumulating closures.
 
 ## Ephemeral key validity
 
@@ -233,15 +235,22 @@ Against a random 32-byte key this is 2²⁵⁶ work — infeasible. Against a pa
 // ✅ Real random key from a CSPRNG
 import { randomBytes } from "@noble/ciphers/utils.js";
 const key = randomBytes(32);
-auth: { secret: () => key }
+auth: {
+  secret: () => key;
+}
 
 // ❌ Password / passphrase used directly — offline-bruteforceable via the proof
-auth: { secret: () => new TextEncoder().encode("correct horse battery staple") }
+auth: {
+  secret: () => new TextEncoder().encode("correct horse battery staple");
+}
 
 // ⚠️ If you MUST start from a human password, stretch it with a slow KDF first
 //     (scrypt / argon2) — this raises the per-guess cost but does not make a
 //     weak password strong; prefer a real random key wherever possible.
-auth: { secret: async () => await scrypt(password, salt, { N: 2**17, r: 8, p: 1, dkLen: 32 }) }
+auth: {
+  secret: async () =>
+    await scrypt(password, salt, { N: 2 ** 17, r: 8, p: 1, dkLen: 32 });
+}
 ```
 
 ## Built-in signature helpers
@@ -320,10 +329,10 @@ The transcript digest prevents replay of a captured auth payload into a differen
 
 ### Custom schemes (certificates, multiple factors)
 
-There are no built-in helpers for certificate-based or multi-factor auth: in both cases the security-critical logic (chain verification; asserting that all factors resolve to the *same* principal) depends on application knowledge the library does not have, so a generic helper would only wrap the trivial part while its name suggested it handles the hard part. Implement `sign`/`verify` directly instead:
+There are no built-in helpers for certificate-based or multi-factor auth: in both cases the security-critical logic (chain verification; asserting that all factors resolve to the _same_ principal) depends on application knowledge the library does not have, so a generic helper would only wrap the trivial part while its name suggested it handles the hard part. Implement `sign`/`verify` directly instead:
 
 - **Certificates** — client `sign` returns an encoded `{ cert, sig }` where `sig` is a signature over the transcript with the cert's key; server `verify` runs your chain verification, then checks the signature (the checking step is exactly what `createECDSAServerAuth` does — reuse it for the signature half if the key is P-256).
-- **Multiple factors** — client `sign` encodes both sub-proofs; server `verify` decodes them, runs each sub-verifier against the same transcript, and **must reject unless both factors resolve to the same principal** (e.g. the JWT's `sub` owns the signing `deviceId` per your own store). Only then combine them into one explicit principal. Never merge two independently verified principals blindly: a stolen bearer token plus the attacker's *own* validly registered second factor would otherwise pass as "multi-factor" for the victim's identity.
+- **Multiple factors** — client `sign` encodes both sub-proofs; server `verify` decodes them, runs each sub-verifier against the same transcript, and **must reject unless both factors resolve to the same principal** (e.g. the JWT's `sub` owns the signing `deviceId` per your own store). Only then combine them into one explicit principal. Never merge two independently verified principals blindly: a stolen bearer token plus the attacker's _own_ validly registered second factor would otherwise pass as "multi-factor" for the victim's identity.
 
 ## Replay within a session
 

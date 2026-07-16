@@ -52,6 +52,7 @@ import {
 
 const MAX_ID_LEN = 64;
 const DEFAULT_REPLAY_WINDOW = 4096;
+const DEFAULT_MAX_PENDING_HANDSHAKES = 16;
 
 // ─── Server types ─────────────────────────────────────────
 
@@ -95,6 +96,13 @@ export interface ServerOptionsBase {
    * 1 MiB.
    */
   maxMessageBytes?: number;
+  /**
+   * Maximum number of handshake attempts whose async work has not settled.
+   * A timed-out attempt remains counted until its auth callback settles,
+   * because JavaScript cannot cancel an arbitrary Promise. New hellos are
+   * silently dropped at the cap. Default: 16.
+   */
+  maxPendingHandshakes?: number;
   /**
    * Size of the per-session replay window: how many recently-seen AEAD
    * nonces the server remembers so it can drop duplicate (replayed)
@@ -323,6 +331,13 @@ export function server(
   if (!Number.isInteger(maxBytes) || maxBytes <= 0) {
     throw new TypeError("server() maxMessageBytes must be an integer > 0");
   }
+  const maxPendingHandshakes =
+    opts.maxPendingHandshakes !== undefined
+      ? opts.maxPendingHandshakes
+      : DEFAULT_MAX_PENDING_HANDSHAKES;
+  if (!Number.isInteger(maxPendingHandshakes) || maxPendingHandshakes <= 0) {
+    throw new TypeError("server() maxPendingHandshakes must be an integer > 0");
+  }
   const replayWindow =
     opts.replayWindow !== undefined ? opts.replayWindow : DEFAULT_REPLAY_WINDOW;
   if (
@@ -352,6 +367,10 @@ export function server(
   let epoch = 0;
   let attemptEpoch = 0;
   let candidateEpoch = 0;
+  // A timed-out auth callback cannot be cancelled. Keep its attempt counted
+  // until the callback settles, so a hello flood can retain only a bounded
+  // number of attempt closures. New hellos are dropped at the configured cap.
+  let pendingHandshakes = 0;
   // Server ephemeral keys are attempt-local (generated per hello inside the
   // handshake coroutine) and never held at module scope — a failed attempt
   // cannot corrupt an established session's state.
@@ -514,6 +533,8 @@ export function server(
     // its await guards without touching the session or the candidate.
     if (tag === TAG_HELLO) {
       if (data.length > MAX_HELLO_BYTES) return;
+      if (pendingHandshakes >= maxPendingHandshakes) return;
+      pendingHandshakes++;
 
       attemptEpoch++;
       const myAttempt = attemptEpoch;
@@ -797,19 +818,31 @@ export function server(
           zero(myPriv);
           zero(myPub);
         }
-      })().catch(function onHsError(err: unknown) {
-        // The attempt failed. Under D1 the live session (if any) was never
-        // touched, so there is nothing to reset — only report the failure.
-        if (attemptEpoch !== myAttempt || destroyed || reported) return;
-        reported = true;
-        if (onError !== null) {
-          onError(
-            err instanceof RPCError
-              ? err
-              : new RPCError("HANDSHAKE", "Handshake failed"),
-          );
-        }
-      });
+      })()
+        .catch(function onHsError(err: unknown) {
+          // The attempt failed. Under D1 the live session (if any) was never
+          // touched, so there is nothing to reset — only report the failure.
+          if (attemptEpoch !== myAttempt || destroyed || reported) return;
+          reported = true;
+          if (onError !== null) {
+            onError(
+              err instanceof RPCError
+                ? err
+                : new RPCError("HANDSHAKE", "Handshake failed"),
+            );
+          }
+        })
+        .then(
+          function onHsSettled() {
+            pendingHandshakes--;
+          },
+          function onHsReportError() {
+            // An application onError callback is allowed to throw. The
+            // attempt slot must still be released without creating an
+            // unhandled rejection.
+            pendingHandshakes--;
+          },
+        );
       return;
     }
 
