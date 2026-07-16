@@ -165,4 +165,4 @@ security pass below.
   (Node 22.22.1).
 - Every finding re-verified in shipped code (not on commit-message trust) and
   mapped to a regression test; KAT vectors byte-identical across spec/tests/impl.
-- Full audit trail: `review-release-verdict-0.8.0.md`.
+- Full audit trail: `review/0.8/review-release-verdict-0.8.0.md`.
