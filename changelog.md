@@ -4,6 +4,7 @@ One file per sync round. Newest first. Each entry is dated and named by the main
 
 | Date | What landed |
 |------|-------------|
+| 2026-07-16 | v0.8.0 (0.7 + 0.8 work): no-auto-retry + deferred-reset + replay-window + abortPending, make-before-break + reconnecting ws/socket channels, sendTimeout 10s→3s, port-complete spec+KAT vectors; handshake absolute deadlines + maxPendingHandshakes + epoch-exhaustion guard, normative JWT/Ed25519/ECDSA auth profiles, cert+MFA helpers removed, bigint/cyclic/NaN input validation, all-zero-secret + replay-slot + directionality fixes, Node ≥20.19 |
 
 ---
 
