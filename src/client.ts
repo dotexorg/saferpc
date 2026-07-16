@@ -573,6 +573,20 @@ export function client<T extends Router>(
         ),
       );
     }
+    // The epoch is a uint32 on the wire (the server rejects anything larger),
+    // and it never wraps — wrapping would let an old session's frames alias a
+    // new epoch. `epoch++` below would push it past the ceiling, so exhaustion
+    // is a terminal client error (mirrors the request-id counter guard): the
+    // alternative is every subsequent hello being silently dropped server-side
+    // as `Invalid epoch`, which surfaces only as opaque handshake timeouts.
+    if (epoch >= 0xffffffff) {
+      return Promise.reject(
+        new RPCError(
+          "CLIENT",
+          "Handshake epoch exhausted; destroy and recreate client",
+        ),
+      );
+    }
     // Generate before occupying the slot so an unexpected crypto/RNG throw
     // cannot leave the client permanently marked as busy.
     const nextPrivateKey = x25519.utils.randomSecretKey();
