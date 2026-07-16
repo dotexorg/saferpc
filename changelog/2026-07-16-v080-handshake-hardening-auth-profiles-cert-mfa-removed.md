@@ -9,7 +9,7 @@ two neutral security passes), every finding re-verified in shipped code and pinn
 by a regression test.
 
 Do **not** assume wire compatibility with pre-0.8.0 tags — only 0.8.0 is
-spec-conformant. Test suite grown to 295.
+spec-conformant. Test suite grown to 298.
 
 ## Client & transport semantics (0.7)
 
@@ -102,12 +102,15 @@ security pass below.
   ("MIDDLEWARE", ...)`) — previously skipped the handler but returned success.
   Completion guarded on synchronous throw and bare return.
 - **Fire-and-forget `next()` is no longer a supported pattern** — a middleware
-  that completes before its `next()` settled fails closed with
+  that completes while its `next()` promise is still pending fails closed with
   `RPCError("MIDDLEWARE", ...)` instead of replying with the middleware's own
-  value while the handler outcome is silently dropped (aligned with tRPC's
-  "did you forget to `return next()`?"). The detached downstream promise is
-  still observed internally, so its rejection can never surface as an
-  `unhandledRejection` and terminate the process.
+  value while the handler outcome is silently dropped (inspired by tRPC's
+  return-next guard — "did you forget to `return next()`?" — which uses a
+  runtime envelope/marker rather than settlement tracking). A synchronous
+  downstream throw is normalized into a rejected `next()` promise so a
+  catch-fallback middleware is not misclassified. The detached downstream
+  promise is still observed internally, so its rejection can never surface as
+  an `unhandledRejection` and terminate the process.
 
 ### Auth payloads
 
@@ -166,7 +169,7 @@ security pass below.
 
 ## Verification
 
-- Full gate green: 39 files, 295 tests; lint, typecheck, ESM+CJS build clean
+- Full gate green: 39 files, 298 tests; lint, typecheck, ESM+CJS build clean
   (Node 22.22.1).
 - Every finding re-verified in shipped code (not on commit-message trust) and
   mapped to a regression test; KAT vectors byte-identical across spec/tests/impl.

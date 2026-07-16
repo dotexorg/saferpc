@@ -226,26 +226,41 @@ function execute(
                   }
                   ctx = Object.assign(Object.create(null), ctx, extra);
                 }
-                const downstream = Promise.resolve(next());
+                // A synchronous throw from the downstream tip (sync input
+                // schema, sync handler) must become a rejected promise BEFORE
+                // the settlement observer is attached — otherwise no promise
+                // exists, the flag stays false, and a middleware that caught
+                // the throw and answered with a fallback would be rejected
+                // as MIDDLEWARE despite the downstream having fully finished.
+                let downstream: Promise<unknown>;
+                try {
+                  downstream = Promise.resolve(next());
+                } catch (error) {
+                  downstream = Promise.reject(error);
+                }
                 // Observe downstream settlement (fulfil OR reject) for two
                 // reasons. (1) The flag feeds the completion check below:
-                // a middleware that settles before its next() settled did a
-                // fire-and-forget — the client would receive the middleware's
-                // own value while the handler outcome is silently dropped —
-                // so the request is rejected (tRPC does the same: "did you
-                // forget to `return next()`?"). (2) The reaction observes a
+                // a middleware that settles while its next() is still
+                // PENDING did a fire-and-forget — the client would receive
+                // the middleware's own value while the handler outcome is
+                // silently dropped — so the request is rejected (inspired by
+                // tRPC's return-next guard: "did you forget to `return
+                // next()`?"; tRPC enforces via a runtime envelope/marker,
+                // not settlement tracking). (2) The reaction observes a
                 // rejection, so a dropped downstream promise can never
                 // surface as an unhandledRejection and terminate the process.
                 // Attached before `downstream` is handed to the middleware,
                 // so the flag is set before any await on it resumes (promise
                 // reactions run FIFO) — a middleware that awaits/returns
                 // next() always passes the check deterministically. The
-                // enforced invariant is "no reply while downstream is still
-                // pending": a fire-and-forget whose downstream happened to
-                // settle before the middleware completed is observationally
-                // identical to the supported catch-fallback form and is
-                // accepted — whether user code looked at the settled value
-                // is not detectable without a tRPC-style envelope API.
+                // enforced invariant is exactly "no reply while downstream
+                // is still pending": a fire-and-forget whose downstream
+                // happened to settle before the middleware completed is
+                // observationally identical to a catch-fallback and is
+                // tolerated — whether user code looked at the settled value
+                // is not detectable without a tRPC-style envelope API. The
+                // full "must return next()" contract is enforced at the
+                // type level (phantom MiddlewareResult, common.ts).
                 downstream.then(
                   function markDownstreamSettled() {
                     downstreamSettled = true;

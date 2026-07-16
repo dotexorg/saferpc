@@ -183,9 +183,9 @@ describe("security / middleware pipeline", () => {
     // Spec: the next() promise must have settled before the middleware
     // completes. A middleware that returns its own value while the downstream
     // is still pending would hand the client a success and silently drop the
-    // handler outcome — rejected as MIDDLEWARE (tRPC: “did you forget to
-    // `return next()`?”). The handler delays so the downstream is genuinely
-    // pending at middleware completion.
+    // handler outcome — rejected as MIDDLEWARE (cf. tRPC's return-next
+    // guard: “did you forget to `return next()`?”). The handler delays so
+    // the downstream is genuinely pending at middleware completion.
     const psk = randomBytes(32);
     const { a, b } = createChannelPair();
     const router: Router = {
@@ -265,9 +265,9 @@ describe("security / middleware pipeline", () => {
   });
 
   it("awaiting next() and returning a transformed value is accepted", async () => {
-    // The supported forms: `return next()` and `await next()` + own return.
-    // The downstream settled before the middleware completed, so the check
-    // must not fire.
+    // `return next()` is the public contract; `await next()` + own return is
+    // runtime-tolerated (type-illegal). In both cases the downstream settled
+    // before the middleware completed, so the check must not fire.
     const psk = randomBytes(32);
     const { a, b } = createChannelPair();
     const router: Router = {
@@ -292,6 +292,48 @@ describe("security / middleware pipeline", () => {
     try {
       await expect(api.passThrough({})).resolves.toBe("plain");
       await expect(api.transform({})).resolves.toBe("wrapped:plain");
+    } finally {
+      destroy();
+      srv.destroy();
+    }
+  });
+
+  it("catch-fallback survives a synchronous downstream throw", async () => {
+    // A sync input schema failure or a sync-throwing handler throws before
+    // any downstream promise exists. next() must normalize that into a
+    // rejected promise so the settlement flag is still set — otherwise the
+    // middleware catches the error, answers with a fallback, and is then
+    // wrongly rejected as MIDDLEWARE.
+    const psk = randomBytes(32);
+    const { a, b } = createChannelPair();
+    const recoverMw = (async ({ next }: { next: () => Promise<unknown> }) => {
+      try {
+        return await next();
+      } catch {
+        return "fallback";
+      }
+    }) as never;
+    const router: Router = {
+      syncSchema: chain()
+        .use(recoverMw)
+        .input(z.object({ id: z.string() }))
+        .handler(async ({ input }) => (input as { id: string }).id),
+      syncHandler: chain()
+        .use(recoverMw)
+        .handler((() => {
+          throw new Error("sync-handler-boom");
+        }) as never),
+    };
+    const srv = server(router, a, { auth: { secret: () => psk } });
+    const { api, destroy } = client(b, {
+      auth: { secret: () => psk },
+      timeout: 1000,
+    });
+    try {
+      // Input validation throws synchronously inside next().
+      await expect(api.syncSchema({ id: 42 })).resolves.toBe("fallback");
+      // A sync (non-async) handler throwing does the same.
+      await expect(api.syncHandler({})).resolves.toBe("fallback");
     } finally {
       destroy();
       srv.destroy();
