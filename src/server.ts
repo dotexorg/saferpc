@@ -191,6 +191,7 @@ function execute(
         tip = async function runMiddleware() {
           let called = false;
           let completed = false;
+          let downstreamSettled = false;
           let result: unknown;
           try {
             // try/finally (not `.finally()` on the returned value) so that
@@ -225,17 +226,34 @@ function execute(
                   }
                   ctx = Object.assign(Object.create(null), ctx, extra);
                 }
-                const downstream = next();
-                // The spec permits an unreturned (fire-and-forget) next(). If
-                // the middleware neither awaits nor returns this promise and
-                // the downstream step later rejects, that rejection would
-                // surface as an unhandledRejection and can terminate the
-                // process. Attach a swallowing reaction so an unobserved
-                // rejection is never unhandled; a middleware that DOES
-                // await/return this still receives the rejection through its
-                // own await (this extra reaction only covers the nobody-
-                // observed case).
-                void Promise.resolve(downstream).catch(() => {});
+                const downstream = Promise.resolve(next());
+                // Observe downstream settlement (fulfil OR reject) for two
+                // reasons. (1) The flag feeds the completion check below:
+                // a middleware that settles before its next() settled did a
+                // fire-and-forget — the client would receive the middleware's
+                // own value while the handler outcome is silently dropped —
+                // so the request is rejected (tRPC does the same: "did you
+                // forget to `return next()`?"). (2) The reaction observes a
+                // rejection, so a dropped downstream promise can never
+                // surface as an unhandledRejection and terminate the process.
+                // Attached before `downstream` is handed to the middleware,
+                // so the flag is set before any await on it resumes (promise
+                // reactions run FIFO) — a middleware that awaits/returns
+                // next() always passes the check deterministically. The
+                // enforced invariant is "no reply while downstream is still
+                // pending": a fire-and-forget whose downstream happened to
+                // settle before the middleware completed is observationally
+                // identical to the supported catch-fallback form and is
+                // accepted — whether user code looked at the settled value
+                // is not detectable without a tRPC-style envelope API.
+                downstream.then(
+                  function markDownstreamSettled() {
+                    downstreamSettled = true;
+                  },
+                  function markDownstreamSettled() {
+                    downstreamSettled = true;
+                  },
+                );
                 return downstream;
               },
             });
@@ -250,6 +268,18 @@ function execute(
             throw new RPCError(
               "MIDDLEWARE",
               "Middleware completed without calling next()",
+            );
+          }
+          // Contract: the downstream chain must have settled before the
+          // middleware itself completed — i.e. next() was awaited or
+          // returned. A fire-and-forget next() leaves the handler running
+          // detached while the client already received the middleware's own
+          // value; that pattern is not supported (the detached rejection is
+          // still observed above, so it cannot crash the process).
+          if (!downstreamSettled) {
+            throw new RPCError(
+              "MIDDLEWARE",
+              "Middleware completed before next() settled — return or await next()",
             );
           }
           return result;

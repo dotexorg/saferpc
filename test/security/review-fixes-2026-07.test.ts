@@ -28,7 +28,11 @@ import {
   type Router,
 } from "../../src/index.ts";
 import { createChannelPair } from "../helpers/channels.ts";
-import { manualHandshake, forgeHello, encryptRaw } from "../helpers/protocol.ts";
+import {
+  manualHandshake,
+  forgeHello,
+  encryptRaw,
+} from "../helpers/protocol.ts";
 
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 const router: Router = { ping: chain().handler(async () => "pong") };
@@ -149,7 +153,9 @@ describe("review-fixes 2026-07", () => {
       expect(err).toBeInstanceOf(RPCError);
       expect((err as RPCError).code).toBe("HANDSHAKE");
       // The server never reported success and never leaked crypto state.
-      expect(errors.every((e) => !(e instanceof RPCError) || e.code === "HANDSHAKE")).toBe(true);
+      expect(
+        errors.every((e) => !(e instanceof RPCError) || e.code === "HANDSHAKE"),
+      ).toBe(true);
     } finally {
       destroy();
       srv.destroy();

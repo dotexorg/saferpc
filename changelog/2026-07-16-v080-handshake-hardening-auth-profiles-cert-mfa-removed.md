@@ -101,8 +101,13 @@ security pass below.
 - **Middleware returning without calling `next()` fails closed** (`RPCError
   ("MIDDLEWARE", ...)`) — previously skipped the handler but returned success.
   Completion guarded on synchronous throw and bare return.
-- **Unhandled rejection from fire-and-forget `next()` closed** (`void
-  Promise.resolve(downstream).catch(() => {})`).
+- **Fire-and-forget `next()` is no longer a supported pattern** — a middleware
+  that completes before its `next()` settled fails closed with
+  `RPCError("MIDDLEWARE", ...)` instead of replying with the middleware's own
+  value while the handler outcome is silently dropped (aligned with tRPC's
+  "did you forget to `return next()`?"). The detached downstream promise is
+  still observed internally, so its rejection can never surface as an
+  `unhandledRejection` and terminate the process.
 
 ### Auth payloads
 
