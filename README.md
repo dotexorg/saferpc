@@ -20,12 +20,12 @@ npm install @dotex/saferpc
 ## Highlights
 
 - **Typed procedures** with Zod input/output validation
-- **End-to-end encryption.** X25519 ECDH, XSalsa20-Poly1305 AEAD, HKDF-SHA-256, with forward secrecy by design
-- **Lazy handshake** on the first call. Lazy re-handshake on the next call when the session drops — failures surface with a typed code, never silently resent
+- **End-to-end encryption:** X25519 ECDH, XSalsa20-Poly1305 AEAD, HKDF-SHA-256, with forward secrecy by design
+- **Lazy handshake** on the first call. Lazy re-handshake on the next call when the session drops. Failures surface with a typed code, never silently resent
 - **Three auth modes:** pre-shared secret, asymmetric (Ed25519 / ECDSA / JWT), or both for defense-in-depth
 - **Synchronous** `client()` and `server()`. Runs in Node.js, browsers, Service Workers, React Native, Vercel Edge, Cloudflare Workers, Deno Deploy
-- **Tiny surface.** `@noble/*` crypto, `@msgpack/msgpack`, `zod`, and nothing else
-- **Pure ESM + CJS dual build**, side-effect-free, tree-shakeable
+- **Tiny surface:** `@noble/*` crypto, `@msgpack/msgpack`, `zod`, and nothing else
+- Pure ESM + CJS dual build, side-effect-free, tree-shakeable
 
 ## Quick start
 
@@ -65,7 +65,9 @@ const { api, destroy: stopClient } = client<AppRouter>(clientChannel, { auth });
 const { message } = await api.greet({ name: "World" }); // input & output typed
 ```
 
-`client()` and `server()` are synchronous. No top-level `await`. The handshake runs lazily on the first procedure call. If the session drops, the first sent call to hit its reply-timeout surfaces `RPCAbortedError("TIMEOUT")` and resets the session — the next call re-handshakes lazily. A call that provably never left surfaces a plain `RPCError` and resets nothing: never-left is a transport event, the keys are fine, retrying is safe. The client never silently resends either way (that would double-execute non-idempotent handlers). Transport death alone doesn't touch the session: a reconnecting adapter (see `@dotex/saferpc/channels`) lets in-flight calls complete across a socket blip. Per-call `AbortSignal` (`api.thing(input, { signal })`) cancels waiting without tearing anything down.
+`client()` and `server()` are synchronous. No top-level `await`. The handshake runs lazily on the first procedure call. If the session drops, the first sent call to hit its reply-timeout surfaces `RPCAbortedError("TIMEOUT")` and resets the session; the next call re-handshakes lazily.
+
+A call that provably never left surfaces a plain `RPCError` and resets nothing: never-left is a transport event, the keys are fine, retrying is safe. The client never silently resends either way (that would double-execute non-idempotent handlers). Transport death alone doesn't touch the session: a reconnecting adapter (see `@dotex/saferpc/channels`) lets in-flight calls complete across a socket blip. Per-call `AbortSignal` (`api.thing(input, { signal })`) cancels waiting without tearing anything down.
 
 Because `rpc` carries `Context`, procedures can be authored in any file with a fully-typed `ctx`, and `server()` requires a `context()` that returns the type your procedures expect.
 
@@ -102,7 +104,7 @@ auth: {
 }
 ```
 
-Built-in helpers cover Ed25519, ECDSA P-256, and JWT auth. All bind their proof to the handshake transcript, so a captured payload cannot be replayed into a new session. Certificate-based and multi-factor schemes are composed from `sign`/`verify` directly — recipes and the full threat model live in [spec/security.md](./spec/security.md).
+Built-in helpers cover Ed25519, ECDSA P-256, and JWT auth. All bind their proof to the handshake transcript, so a captured payload cannot be replayed into a new session. Certificate-based and multi-factor schemes are composed from `sign`/`verify` directly. Recipes and the full threat model live in [spec/security.md](./spec/security.md).
 
 ## Errors
 
@@ -162,7 +164,7 @@ Node.js 20.19+ (the `@noble/*` dependencies require `>=20.19.0`; older 18.x / 20
 
 ## Project status
 
-`0.x` with a stable wire protocol (`saferpc-v1` HKDF info, `saferpc-hs-{hello,reply}-v1` transcript prefixes). Test coverage for handshake attacks, replay, tampering, type confusion, prototype pollution, middleware misuse, and DoS limits lives in `test/security/`. An internal line-by-line security review — including the honest list of residual risks and open issues — is published in [spec/assessment.md](./spec/assessment.md). A 1.0 release will lock the public API surface.
+`0.x` with a stable wire protocol (`saferpc-v1` HKDF info, `saferpc-hs-{hello,reply}-v1` transcript prefixes). Test coverage for handshake attacks, replay, tampering, type confusion, prototype pollution, middleware misuse, and DoS limits lives in `test/security/`. An internal line-by-line security review — including residual risks and open issues — is published in [spec/assessment.md](./spec/assessment.md). A 1.0 release will lock the public API surface.
 
 ## Releasing
 
